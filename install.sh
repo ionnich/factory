@@ -28,7 +28,7 @@ for d in "$here"/hermes/skills/*/; do
   cp -R "$d". "$hermes_home/skills/factory/$name/"
 done
 # Plugin: default profile serves the dashboard tab; the `factory` chat profile gets the tool (profile config:
-# plugins.enabled [factory], platform_toolsets.cli [factory], deepseek) — created once by hand, see README.
+# plugins.enabled [factory], platform_toolsets.cli [factory], deepseek) — created once by hand, see README.md.
 for dest in "$hermes_home" "$hermes_home/profiles/factory"; do
   [ -d "$dest" ] || continue
   rm -rf "$dest/plugins/factory" && mkdir -p "$dest/plugins" && cp -R "$here/hermes/plugins/factory" "$dest/plugins/factory"
