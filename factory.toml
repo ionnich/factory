@@ -12,6 +12,9 @@ env_files = ["~/.config/secrets/agents.env", "~/.config/secrets/dagster-cloud.en
 [linear]
 teams = ["FIN"]
 active_state_types = ["unstarted", "started"]   # triage and backlog excluded
+# Only tickets whose canonical Domain: project is led by this Linear user are the factory's
+# concern (niko = aaron.gumapac@finks.ai). Everything else is ignored: no verdict, no write-back.
+lead = "aaron.gumapac@finks.ai"
 
 # Per-team workflow names, confirmed against Linear 2026-09-29.
 # FIN has no "In Review": the started-type review state is "Ready for QA".
@@ -38,13 +41,9 @@ batch = 2
 trunk = "main"
 [repos."Finks-ai/finks-api"]
 trunk = "main"
-[repos."Finks-ai/finks-clustering-service"]
-trunk = "main"
 [repos."Finks-ai/finks-prism"]
 trunk = "main"
 [repos."Finks-ai/finks-insights-service"]
-trunk = "main"
-[repos."Finks-ai/finks-personalization-service"]
 trunk = "main"
 [repos."Finks-ai/finks-overwatch"]
 trunk = "main"
@@ -61,7 +60,7 @@ trunk = "main"
 name = "sec-filings"
 repo = "Finks-ai/finks-dagster"
 domains = ["SEC Filings"]
-witnesses = ["dagster-prod"]
+witnesses = ["dagster-prod", "clickhouse-serving"]
 
 [[context]]
 name = "sec-filings-compute"
@@ -74,19 +73,10 @@ repo = "Finks-ai/finks-api"
 domains = ["Search API"]
 
 [[context]]
-name = "news-clustering"
-repo = "Finks-ai/finks-clustering-service"
-domains = ["News Clustering"]
-
-[[context]]
 name = "insights"
 repo = "Finks-ai/finks-insights-service"
 domains = ["Insights"]
-
-[[context]]
-name = "personalization-profile"
-repo = "Finks-ai/finks-personalization-service"
-domains = ["Personalization Profile"]
+witnesses = ["clickhouse-serving"]
 
 [[context]]
 name = "observability"
@@ -100,10 +90,12 @@ readonly = true
 url = "https://finks.dagster.cloud/prod/graphql"
 token_env = "DAGSTER_CLOUD_API_TOKEN"
 
-# Pending a read-only ClickHouse user on the serving cluster (put the values in factory.env):
-# [witness.clickhouse-serving]
-# kind = "clickhouse"
-# readonly = true
-# url = "https://<host>:8443"
-# user_env = "FACTORY_CH_USER"
-# password_env = "FACTORY_CH_PASSWORD"
+# User factory_witness (created 2026-09-29 via /finks/prod/clickhouse-uri `default`): settings profile
+# readonly=2, max_execution_time<=5, max_result_rows<=200; SELECT only on system.{tables,parts,columns},
+# filings.*, evidence_fabric.*, insights.*. One Cloud service holds every env's databases.
+[witness.clickhouse-serving]
+kind = "clickhouse"
+readonly = true
+url = "https://zqlprdmaw4.us-east-1.aws.clickhouse.cloud:8443"
+user_env = "FACTORY_CH_USER"
+password_env = "FACTORY_CH_PASSWORD"

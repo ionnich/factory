@@ -27,6 +27,15 @@ CREATE TABLE sync_cursor (
   last_count    INTEGER NOT NULL
 );
 
+-- Linear projects = canonical Domain projects (finks-ddd). lead_email scopes what the factory owns.
+CREATE TABLE linear_project (
+  id         TEXT PRIMARY KEY,
+  slug_id    TEXT NOT NULL UNIQUE,            -- trailing id in the project URL
+  name       TEXT NOT NULL,
+  lead_email TEXT,
+  fetched_at TEXT NOT NULL
+);
+
 CREATE TABLE repo_trunk (
   repo       TEXT PRIMARY KEY,               -- OWNER/NAME
   branch     TEXT NOT NULL,

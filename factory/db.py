@@ -4,7 +4,14 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
+MIGRATIONS = {
+    2: """CREATE TABLE linear_project (
+  id TEXT PRIMARY KEY, slug_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+  lead_email TEXT, fetched_at TEXT NOT NULL);""",
+}
 
 
 def now() -> str:
@@ -22,8 +29,11 @@ def connect(path: Path) -> sqlite3.Connection:
     if version == 0:
         conn.executescript("BEGIN;\n" + files("factory").joinpath("schema.sql").read_text()
                            + f"\nPRAGMA user_version={SCHEMA_VERSION};\nCOMMIT;")
-    elif version != SCHEMA_VERSION:
-        raise RuntimeError(f"factory.db schema v{version}, code expects v{SCHEMA_VERSION}")
+    elif version < SCHEMA_VERSION:
+        for v in range(version + 1, SCHEMA_VERSION + 1):
+            conn.executescript(f"BEGIN;\n{MIGRATIONS[v]}\nPRAGMA user_version={v};\nCOMMIT;")
+    elif version > SCHEMA_VERSION:
+        raise RuntimeError(f"factory.db schema v{version} is newer than code v{SCHEMA_VERSION}")
     return conn
 
 

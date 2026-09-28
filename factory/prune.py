@@ -17,6 +17,39 @@ class VerdictError(Exception):
 
 _DOMAIN = re.compile(r"^\s*\**Domain\**:\**\s*(?:\[([^\]]+)\]|(.+?))(?:\(.*)?\s*$", re.M)
 _REPO = re.compile(r"^\s*\**Repos?:?\**:?\s*(.+)$", re.M)
+_DOMAIN_URL = re.compile(r"^\s*\**Domain\**:[^\n]*?linear\.app/[^/\s]+/project/([\w-]+)", re.M)
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+class NotOwned(Exception):
+    pass
+
+
+def domain_project(conn, snapshot):
+    """The canonical Domain project row (linear_project), resolved from the Domain: link, else its name."""
+    body = json.loads(snapshot["raw_json"]).get("description") or ""
+    m = _DOMAIN_URL.search(body)
+    if m:
+        tail = m.group(1)
+        u = _UUID.search(tail)
+        row = conn.execute("SELECT * FROM linear_project WHERE " + ("id=?" if u else "slug_id=?"),
+                           (u.group(0) if u else tail.rsplit("-", 1)[-1],)).fetchone()
+        if row:
+            return row
+    domain = issue_fields(snapshot)[0]
+    return conn.execute("SELECT * FROM linear_project WHERE name=?", (domain,)).fetchone() if domain else None
+
+
+def owned(cfg: Config, conn, snapshot) -> bool:
+    """Only tickets whose Domain project is led by linear.lead are the factory's concern."""
+    p = domain_project(conn, snapshot)
+    return p is not None and p["lead_email"] == cfg.linear["lead"]
+
+
+def owned_in_scope(cfg: Config, conn) -> list:
+    if not conn.execute("SELECT 1 FROM linear_project LIMIT 1").fetchone():
+        raise NotOwned("linear_project is empty; run factory ingest")
+    return [s for s in conn.execute("SELECT * FROM linear_latest WHERE in_scope=1") if owned(cfg, conn, s)]
 
 
 def issue_fields(snapshot) -> tuple[str | None, list[str], list[str]]:
@@ -71,13 +104,11 @@ def staleness(cfg: Config, conn, snapshot, ctx: Context | None) -> str | None:
 
 
 def gate(cfg: Config, conn) -> dict:
-    """Hermes pre-check: auto-verdict unmapped tickets, list the rest that need the agent."""
-    batch = cfg.raw.get("prune", {}).get("batch", 10)
+    """Hermes pre-check over owned tickets: auto-verdict unmapped ones, list the rest for the agent."""
+    batch = cfg.raw.get("prune", {}).get("batch", 2)
     todo, auto = [], 0
-    rows = conn.execute(
-        "SELECT * FROM linear_latest WHERE in_scope=1 ORDER BY "
-        "CASE json_extract(raw_json,'$.priority') WHEN 0 THEN 5 ELSE json_extract(raw_json,'$.priority') END, "
-        "updated_at DESC").fetchall()
+    rows = sorted(owned_in_scope(cfg, conn), key=lambda s: s["updated_at"], reverse=True)
+    rows.sort(key=lambda s: json.loads(s["raw_json"])["priority"] or 5)  # stable: priority, then newest
     for s in rows:
         ctx, why = map_context(cfg, s)
         reason = staleness(cfg, conn, s, ctx)
@@ -144,6 +175,8 @@ def put(cfg: Config, conn, identifier: str, kind: str, reason: str, evidence: li
         raise VerdictError("reason is required")
     with db.tx(conn):
         s = latest(conn, identifier)
+        if not owned(cfg, conn, s):
+            raise VerdictError(f"{identifier}: Domain project is not led by {cfg.linear['lead']}; not the factory's concern")
         ctx, why = map_context(cfg, s)
         if ctx is None and kind != "needs-clarification":
             raise VerdictError(f"{identifier}: {why}; only needs-clarification is allowed")

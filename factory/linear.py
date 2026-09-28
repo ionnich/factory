@@ -64,6 +64,32 @@ def fetch(cfg: Config, flt: dict):
         after = page["pageInfo"]["endCursor"]
 
 
+PROJECTS_QUERY = """
+query($after: String) {
+  projects(first: 100, after: $after, includeArchived: true) {
+    nodes { id slugId name lead { email } }
+    pageInfo { hasNextPage endCursor }
+  }
+}"""
+
+
+def sync_projects(cfg: Config, conn) -> int:
+    """Replace linear_project with Linear's current projects (~150 rows, 2 pages)."""
+    rows, after = [], None
+    while True:
+        page = gql(cfg, PROJECTS_QUERY, {"after": after})["projects"]
+        rows += page["nodes"]
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        after = page["pageInfo"]["endCursor"]
+    at = db.now()
+    with db.tx(conn):
+        conn.execute("DELETE FROM linear_project")
+        conn.executemany("INSERT INTO linear_project VALUES (?,?,?,?,?)",
+                         [(p["id"], p["slugId"], p["name"], (p["lead"] or {}).get("email"), at) for p in rows])
+    return len(rows)
+
+
 CURSOR = "linear:issues"
 SKEW = 120  # seconds of overlap for clock skew; upsert makes the overlap free
 

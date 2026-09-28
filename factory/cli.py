@@ -13,6 +13,7 @@ def out(obj) -> None:
 
 def cmd_ingest(cfg, conn, a):
     res = linear.ingest(cfg, conn, full=a.full)
+    res["projects"] = linear.sync_projects(cfg, conn)
     with db.tx(conn):
         res["trunks"] = {r: sha[:12] for r, sha in repos.sync_all(cfg, conn).items()}
     out(res)
@@ -28,16 +29,20 @@ def cmd_status(cfg, conn, a):
         return out(dispatch_status(cfg, conn, a.run_id))
     q = lambda sql, *p: [dict(r) for r in conn.execute(sql, p)]
     fresh = {"fresh": 0, "stale": 0, "unverified": 0}
-    for s in conn.execute("SELECT * FROM linear_latest WHERE in_scope=1"):
+    owned = prune.owned_in_scope(cfg, conn)
+    for s in owned:
         ctx, _ = prune.map_context(cfg, s)
         why = prune.staleness(cfg, conn, s, ctx)
         fresh["fresh" if why is None else "unverified" if why == "new" else "stale"] += 1
+    ids = [s["issue_id"] for s in owned]
     out({
         "sync": q("SELECT * FROM sync_cursor"),
         "trunks": q("SELECT repo, branch, substr(sha,1,12) sha, fetched_at FROM repo_trunk"),
-        "tickets_in_scope": fresh,
-        "verdicts": q("SELECT kind, count(*) n FROM verdict v JOIN linear_latest s USING(issue_id) "
-                      "WHERE v.superseded_at IS NULL AND s.in_scope=1 GROUP BY kind"),
+        "lead": cfg.linear["lead"],
+        "owned_tickets_in_scope": fresh,
+        "ignored_other_leads": conn.execute("SELECT count(*) FROM linear_latest WHERE in_scope=1").fetchone()[0] - len(owned),
+        "verdicts": q("SELECT kind, count(*) n FROM verdict WHERE superseded_at IS NULL AND issue_id IN "
+                      "(SELECT value FROM json_each(?)) GROUP BY kind", json.dumps(ids)),
         "dispatches": q("SELECT run_id, state, staged_at, executing_at, done_at FROM dispatch "
                         "WHERE state <> 'archived' ORDER BY created_at"),
         "open_flags": q("SELECT id, run_id, issue_id, kind FROM flag WHERE resolved_at IS NULL"),
@@ -73,6 +78,8 @@ def cmd_ticket(cfg, conn, a):
         "identifier": raw["identifier"], "title": raw["title"], "url": raw["url"],
         "state": raw["state"]["name"], "assignee": (raw["assignee"] or {}).get("email"),
         "domain": prune.issue_fields(s)[0], "repo_lines": prune.issue_fields(s)[2],
+        "domain_lead": (prune.domain_project(conn, s) or {"lead_email": None})["lead_email"],
+        "owned": prune.owned(cfg, conn, s),
         "project": (raw["project"] or {}).get("name"), "milestone": (raw["projectMilestone"] or {}).get("name"),
         "labels": [x["name"] for x in raw["labels"]["nodes"]], "updated_at": s["updated_at"],
         "attachments": [x["url"] for x in raw["attachments"]["nodes"]],
@@ -139,7 +146,7 @@ def main(argv=None):
         cfg = config.load()
         conn = db.connect(cfg.db)
         sys.exit(a.fn(cfg, conn, a) or 0)
-    except (prune.VerdictError, witness.WitnessError) as e:
+    except (prune.VerdictError, prune.NotOwned, witness.WitnessError) as e:
         print(f"factory: refused: {e}", file=sys.stderr)
         sys.exit(1)
     except config.ConfigError as e:
