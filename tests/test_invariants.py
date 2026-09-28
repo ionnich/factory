@@ -74,6 +74,35 @@ class Invariants(unittest.TestCase):
         self.assertFalse(graphql_read_ok("mutation { launchRun { ok } }"))
         self.assertTrue(graphql_read_ok("{ version }"))
 
+class Ownership(unittest.TestCase):
+    """Only tickets whose Domain: project is led by linear.lead are in scope; other leads' tickets are never touched."""
+
+    def test_domain_link_resolution(self):
+        import json
+        from factory import prune
+        from factory.config import Config
+        c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
+        uuid = "5e876ee6-5818-4a40-9af1-e45e15a49231"
+        c.executemany("INSERT INTO linear_project VALUES (?,?,?,?,?)", [
+            ("p1", "44941f276414", "Entity Graph", "me@x", SNAP),
+            (uuid, "aaaaaaaaaaaa", "Discover", "other@x", SNAP),
+            ("p3", "bbbbbbbbbbbb", "Insights", "me@x", SNAP)])
+        cfg = Config(raw={"linear": {"lead": "me@x"}}, db=Path("x"), mirrors=Path("x"), dispatches=Path("x"),
+                     contexts=[], repos={}, witnesses={})
+
+        def snap(body):
+            return {"raw_json": json.dumps({"description": body, "labels": {"nodes": []}})}
+        cases = [
+            ("Domain: [Entity Graph](https://linear.app/j/project/entity-graph-44941f276414)", True),  # slug id
+            (f"Domain: [Discover](<https://linear.app/j/project/discover-{uuid}>)", False),           # uuid, other lead
+            ("**Domain:** Insights", True),                                                           # name fallback
+            ("Domain: [Renamed](https://linear.app/j/project/x-44941f276414)", True),                 # link beats name
+            ("no domain line", False),
+        ]
+        for body, want in cases:
+            self.assertEqual(prune.owned(cfg, c, snap(body)), want, body)
+
+
 
 if __name__ == "__main__":
     unittest.main()
