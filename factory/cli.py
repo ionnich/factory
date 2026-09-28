@@ -5,7 +5,7 @@ import json
 import sqlite3
 import sys
 
-from . import config, db, dispatch, linear, prune, repos, witness
+from . import config, db, dispatch, linear, prune, reconcile, repos, witness
 
 
 def out(obj) -> None:
@@ -39,6 +39,30 @@ def cmd_card(cfg, conn, a):
 
 def cmd_execute(cfg, conn, a):
     out(dispatch.execute(cfg, conn, a.run_id, a.actor))
+
+
+def cmd_reconcile(cfg, conn, a):
+    if a.rcmd == "plan":
+        ingest(cfg, conn)  # Linear + trunk as they are now
+        return out(reconcile.plan(cfg, conn, a.run_id))
+    if a.rcmd == "resolve":
+        return out(reconcile.resolve(conn, a.run_id, a.identifier, a.op, a.body, a.flag))
+    if a.rcmd == "apply":
+        res = reconcile.apply(cfg, conn, a.run_id)
+        out(res)
+        return 1 if res["unfinished"] else 0
+    # gate: plan every done dispatch + a verdict sweep; wake the agent for runs with unsent rows.
+    ingest(cfg, conn)
+    for (run_id,) in conn.execute("SELECT run_id FROM dispatch WHERE state='done'").fetchall():
+        reconcile.plan(cfg, conn, run_id)
+    reconcile.plan(cfg, conn, None)
+    runs = [reconcile.show(conn, r) for (r,) in conn.execute(
+        "SELECT DISTINCT run_id FROM writeback WHERE status <> 'confirmed' ORDER BY run_id").fetchall()]
+    print(json.dumps({"wakeAgent": bool(runs), "context": {"runs": runs}}, default=str))
+
+
+def cmd_archive(cfg, conn, a):
+    out(dispatch.archive(cfg, conn, a.run_id))
 
 
 def cmd_sync(cfg, conn, a):
@@ -195,6 +219,22 @@ def main(argv=None):
     s.add_argument("--pr", help="PR URL in the ticket's repo (required for done; CI must be green)")
     s.add_argument("--actor", default="executor")
     s.set_defaults(fn=cmd_card)
+    r = sub.add_parser("reconcile", help="write results back to Linear").add_subparsers(dest="rcmd", required=True)
+    s = r.add_parser("plan", help="ingest, then plan writes for a done dispatch, or a verdict sweep without run_id")
+    s.add_argument("run_id", nargs="?")
+    s = r.add_parser("resolve", help="agent: rewrite comment/description prose, or downgrade apply -> flag")
+    s.add_argument("run_id")
+    s.add_argument("identifier")
+    s.add_argument("--op", required=True, choices=("state", "comment", "description"))
+    s.add_argument("--body", help="new prose; must keep every URL, commit and ticket id of the draft")
+    s.add_argument("--flag", help="downgrade this write to a flag for the user, with the reason")
+    s = r.add_parser("apply", help="send planned writes (gates re-checked live), raise flags, close the run")
+    s.add_argument("run_id")
+    r.add_parser("gate", help="Hermes pre-check for the reconcile job (last line = wakeAgent JSON)")
+    sub.choices["reconcile"].set_defaults(fn=cmd_reconcile)
+    s = sub.add_parser("archive", help="reconciled -> archived; move to _archived/ and commit")
+    s.add_argument("run_id")
+    s.set_defaults(fn=cmd_archive)
     v = sub.add_parser("verdict").add_subparsers(dest="vcmd", required=True)
     s = v.add_parser("put", help="record a verdict with evidence (JSON list from file or -)")
     s.add_argument("identifier")

@@ -4,13 +4,25 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
     2: """CREATE TABLE linear_project (
   id TEXT PRIMARY KEY, slug_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
   lead_email TEXT, fetched_at TEXT NOT NULL);""",
+    3: """DROP TABLE writeback;
+CREATE TABLE writeback (
+  run_id TEXT NOT NULL, issue_id TEXT NOT NULL,
+  op TEXT NOT NULL CHECK (op IN ('state', 'comment', 'description')),
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+  decision TEXT NOT NULL CHECK (decision IN ('apply', 'skip', 'flag')),
+  rule TEXT NOT NULL, reason TEXT,
+  status TEXT NOT NULL CHECK (status IN ('planned', 'sent', 'confirmed', 'failed')),
+  linear_ref TEXT, PRIMARY KEY (run_id, issue_id, op));
+CREATE TRIGGER writeback_no_upgrade BEFORE UPDATE OF decision ON writeback
+WHEN NEW.decision IS NOT OLD.decision AND NOT (OLD.decision = 'apply' AND NEW.decision = 'flag')
+BEGIN SELECT RAISE(ABORT, 'writeback decision may only be downgraded apply -> flag'); END;""",
 }
 
 

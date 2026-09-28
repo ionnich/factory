@@ -47,4 +47,9 @@ have_job factory-prune || hermes cron create "every 20m" "$(cat "$here/hermes/pr
   --provider "$provider" --model "$model" --reasoning-effort medium \
   --name factory-prune --deliver local
 
+have_job factory-reconcile || hermes cron create "every 20m" "$(cat "$here/hermes/prompts/reconcile.md")" \
+  --script factory-reconcile-gate.sh --skill factory-reconcile --workdir "$hermes_home/factory" \
+  --provider "$provider" --model "$model" --reasoning-effort low \
+  --name factory-reconcile --deliver local
+
 hermes cron list

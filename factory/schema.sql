@@ -207,10 +207,12 @@ CREATE TRIGGER card_event_append_only BEFORE UPDATE ON card_event
 BEGIN SELECT RAISE(ABORT, 'card_event is append-only'); END;
 
 -- ---------------------------------------------------------------- reconcile
+-- One row per planned Linear write. Only `factory reconcile apply` sends; the reconcile agent may edit
+-- comment/description prose and downgrade apply -> flag, nothing else.
 CREATE TABLE writeback (
-  run_id       TEXT NOT NULL,
+  run_id       TEXT NOT NULL,               -- dispatch run_id, or sweep-<ts> for verdict write-backs
   issue_id     TEXT NOT NULL,
-  op           TEXT NOT NULL CHECK (op IN ('state', 'comment', 'label')),
+  op           TEXT NOT NULL CHECK (op IN ('state', 'comment', 'description')),
   payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
   decision     TEXT NOT NULL CHECK (decision IN ('apply', 'skip', 'flag')),
   rule         TEXT NOT NULL,
@@ -219,6 +221,9 @@ CREATE TABLE writeback (
   linear_ref   TEXT,
   PRIMARY KEY (run_id, issue_id, op)
 );
+CREATE TRIGGER writeback_no_upgrade BEFORE UPDATE OF decision ON writeback
+WHEN NEW.decision IS NOT OLD.decision AND NOT (OLD.decision = 'apply' AND NEW.decision = 'flag')
+BEGIN SELECT RAISE(ABORT, 'writeback decision may only be downgraded apply -> flag'); END;
 
 CREATE TABLE flag (
   id          INTEGER PRIMARY KEY,

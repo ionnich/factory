@@ -185,6 +185,26 @@ def execute(cfg: Config, conn, run_id: str, actor: str) -> dict:
                 "WHERE t.run_id=?", (run_id,))]}
 
 
+def archive(cfg: Config, conn, run_id: str) -> dict:
+    """reconciled -> archived: unlock, move to _archived/, commit it to the planner repo."""
+    d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+    if d is None or d["state"] != "reconciled":
+        raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not reconciled")
+    src, dst = cfg.dispatches / run_id, cfg.dispatches / "_archived" / run_id
+    for p in [src, *src.rglob("*")]:
+        os.chflags(p, 0)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src.rename(dst)
+    with db.tx(conn):
+        conn.execute("UPDATE dispatch SET state='archived', archived_at=?, last_actor='factory:archive' WHERE run_id=?",
+                     (db.now(), run_id))
+    git = ["git", "-C", str(dst.parent)]
+    subprocess.run([*git, "add", "--", run_id], check=True, capture_output=True)
+    r = subprocess.run([*git, "commit", "-q", "-m", f"archive dispatch {run_id}", "--", run_id],
+                       capture_output=True, text=True)
+    return {"run_id": run_id, "path": str(dst), "committed": r.returncode == 0}
+
+
 CARD_TO = {"claim": "running", "done": "done", "block": "blocked"}
 
 
@@ -209,20 +229,30 @@ def card(cfg: Config, conn, run_id: str, ident: str, kind: str, actor: str,
         raise StageError(f"{ident} is already {t['card_status']}")
     if kind == "claim" and t["card_status"] != "ready":
         raise StageError(f"{ident} is already claimed")
+    meta = None
     if kind == "done":
+        # finks-ddd: Ready for QA only for a landed outcome = merged PR, green checks, known commit.
         if not pr or not re.fullmatch(rf"https://github\.com/{re.escape(t['repo'])}/pull/\d+", pr):
             raise StageError(f"done needs --pr https://github.com/{t['repo']}/pull/N (the ticket's repo)")
+        if not body:
+            raise StageError("done needs --body: the landed outcome, one or two sentences")
         os.environ.setdefault("GITHUB_TOKEN", secret(cfg, "GITHUB_TOKEN"))
+        r = subprocess.run(["gh", "pr", "view", pr, "--json", "state,mergeCommit"],
+                           capture_output=True, text=True, timeout=60)
+        view = json.loads(r.stdout) if r.returncode == 0 else {}
+        if view.get("state") != "MERGED":
+            raise StageError(f"{pr} is {view.get('state', 'unreadable')}, not merged; done means landed")
         r = subprocess.run(["gh", "pr", "checks", pr], capture_output=True, text=True, timeout=120)
         if r.returncode:  # 1 = failing, 8 = pending
-            raise StageError(f"{pr} CI is not green (gh pr checks exit {r.returncode}); done refused")
+            raise StageError(f"{pr} checks are not green (gh pr checks exit {r.returncode}); done refused")
+        meta = {"pr": pr, "commit": view["mergeCommit"]["oid"], "checks": "gh pr checks: all passed"}
     with db.tx(conn):
         if kind in CARD_TO:
             conn.execute("UPDATE dispatch_ticket SET card_status=?, pr_url=coalesce(?, pr_url) "
                          "WHERE run_id=? AND identifier=?", (CARD_TO[kind], pr, run_id, ident))
         conn.execute("INSERT INTO card_event(run_id, issue_id, kind, actor, body, metadata_json, at) "
                      "VALUES (?,?,?,?,?,?,?)", (run_id, t["issue_id"], kind, actor, body,
-                                               json.dumps({"pr": pr}) if pr else None, db.now()))
+                                               json.dumps(meta) if meta else None, db.now()))
     if cfg.kanban.get("enabled") and t["kanban_card_id"]:
         cid = t["kanban_card_id"]
         r = _hermes_kanban(cfg, *{
