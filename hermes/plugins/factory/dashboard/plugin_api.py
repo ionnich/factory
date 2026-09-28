@@ -45,7 +45,7 @@ def jobs() -> list[dict]:
 
 @router.get("/overview")
 async def overview():
-    status, tickets = await asyncio.gather(factory("status"), factory("tickets"))
+    status, tickets, candidates = await asyncio.gather(factory("status"), factory("tickets"), factory("candidates"))
     runs = [d["run_id"] for d in status["dispatches"] if RUN_ID.match(d["run_id"])]
     dispatches = await asyncio.gather(*(factory("status", r) for r in runs))
-    return {"status": status, "tickets": tickets, "dispatches": dispatches, "jobs": jobs()}
+    return {"status": status, "tickets": tickets, "candidates": candidates, "dispatches": dispatches, "jobs": jobs()}

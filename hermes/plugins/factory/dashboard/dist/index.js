@@ -20,7 +20,7 @@
   };
   const CARD = { ready: "not started", running: "being worked on", done: "done", blocked: "blocked" };
 
-  function ticketStatus(t) {
+  function ticketStatus(t, skipped) {
     const v = t.verdict;
     if (t.dispatch) {
       return { group: "progress", tone: "blue", label: "In a dispatch",
@@ -32,7 +32,9 @@
       return { group: "progress", tone: "blue", label: "Checking", why: RECHECK[t.freshness] || "Queued for verification" };
     }
     switch (v.kind) {
-      case "valid": return { group: "ready", tone: "green", label: "Ready to stage", why: v.reason };
+      case "valid": return skipped[t.identifier]
+        ? { group: "nothing", tone: "gray", label: "Not for the factory now", why: skipped[t.identifier] }
+        : { group: "ready", tone: "green", label: "Ready to stage", why: v.reason };
       case "needs-clarification": return { group: "you", tone: "amber", label: "Needs your answer", why: v.reason };
       case "invalid-references": return { group: "you", tone: "amber", label: "Refers to something missing",
                                           why: `${v.target}: ${v.reason}` };
@@ -54,7 +56,7 @@
     switch (d.state) {
       case "draft": return { tone: "gray", label: "Being prepared", why: `${cards.length} tickets` };
       case "staged": return { tone: "amber", label: "Waiting for you to start",
-                              why: `${cards.length} tickets ready. Start it by telling firstmate: execute dispatch ${d.run_id}` };
+                              why: `${cards.length} tickets ready. Start it from the factory chat (hermes -p factory): "hand off ${d.run_id}"` };
       case "executing": return { tone: "blue", label: "Being worked on",
                                  why: `${n("done")} of ${cards.length} done` + (n("blocked") ? `, ${n("blocked")} blocked` : "") };
       case "done": return { tone: "blue", label: "Finished, writing back to Linear",
@@ -84,7 +86,7 @@
 
   function TicketRow({ t }) {
     const [open, setOpen] = useState(false);
-    const s = ticketStatus(t);
+    const s = t._s;
     return h("div", { className: "row", onClick: () => setOpen(!open) },
       h(Chip, { tone: s.tone }, s.label),
       h("div", null,
@@ -141,7 +143,8 @@
     if (!data) return h("div", { className: "fx" }, error ? h("div", { className: "err" }, error) : h("div", { className: "empty" }, "Loading…"));
 
     const groups = { you: [], ready: [], progress: [], nothing: [], ignored: [] };
-    data.tickets.forEach((t) => groups[ticketStatus(t).group].push(t));
+    const skipped = Object.fromEntries((data.candidates?.skipped || []).map((x) => [x.identifier, x.reason]));
+    data.tickets.forEach((t) => { t._s = ticketStatus(t, skipped); groups[t._s.group].push(t); });
     const flags = data.status.open_flags || [];
     const waiting = data.dispatches.filter((d) => d.state === "staged");
     const active = data.dispatches.filter((d) => d.state !== "staged");
