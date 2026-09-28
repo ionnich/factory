@@ -50,8 +50,16 @@ def _clickhouse(cfg: Config, w: dict, query: str) -> tuple[list, int]:
     auth = base64.b64encode(f"{secret(cfg, w['user_env'])}:{secret(cfg, w['password_env'])}".encode()).decode()
     req = urllib.request.Request(f"{w['url'].rstrip('/')}/?{params}", data=query.encode(),
                                  headers={"Authorization": f"Basic {auth}"})
-    with urllib.request.urlopen(req, timeout=TIMEOUT_S + 2) as r:
-        body = json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_S + 2) as r:
+            body = json.load(r)
+    except urllib.error.HTTPError as e:  # ClickHouse puts the reason (unknown table, syntax...) in the body
+        raw = e.read().decode(errors="replace")
+        try:
+            raw = json.loads(raw).get("exception", raw)
+        except ValueError:
+            pass
+        raise WitnessError(f"clickhouse HTTP {e.code}: {raw.strip()[:400]}") from None
     rows = body.get("data", [])[:ROW_CAP]
     return rows, len(rows)
 
