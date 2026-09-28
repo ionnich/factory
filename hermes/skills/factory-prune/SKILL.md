@@ -71,6 +71,11 @@ shell does not have `~/.local/bin` on PATH). Below, `factory` means that path.
 
 ## Rules
 
+- Work one ticket at a time: record its verdict before opening the next ticket.
+  Never survey all tickets first; a run cut off mid-batch must keep what it finished.
+- Budget: at most 6 investigation calls per ticket. Read targeted line ranges
+  or grep, never whole large files. Out of budget → decide on what you have, or
+  `needs-clarification` naming the missing fact.
 - Evidence must be observed in this run. Never cite from memory or from the ticket text alone.
 - Do not guess a repo or context. Mapping is config-owned. If the ticket plainly
   belongs elsewhere, use `needs-clarification` and say where it seems to belong.
