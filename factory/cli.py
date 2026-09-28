@@ -2,21 +2,43 @@
 import argparse
 import hashlib
 import json
+import sqlite3
 import sys
 
-from . import config, db, linear, prune, repos, witness
+from . import config, db, dispatch, linear, prune, repos, witness
 
 
 def out(obj) -> None:
     print(json.dumps(obj, indent=2, default=str))
 
 
-def cmd_ingest(cfg, conn, a):
-    res = linear.ingest(cfg, conn, full=a.full)
+def ingest(cfg, conn, full=False) -> dict:
+    res = linear.ingest(cfg, conn, full=full)
     res["projects"] = linear.sync_projects(cfg, conn)
     with db.tx(conn):
         res["trunks"] = {r: sha[:12] for r, sha in repos.sync_all(cfg, conn).items()}
-    out(res)
+    return res
+
+
+def cmd_ingest(cfg, conn, a):
+    out(ingest(cfg, conn, a.full))
+
+
+def cmd_candidates(cfg, conn, a):
+    out(dispatch.candidates(cfg, conn))
+
+
+def cmd_stage(cfg, conn, a):
+    ingest(cfg, conn)  # stage against Linear and trunk as they are now
+    out(dispatch.stage(cfg, conn, a.identifiers, a.actor))
+
+
+def cmd_card(cfg, conn, a):
+    out(dispatch.card(cfg, conn, a.run_id, a.identifier, a.kind, a.actor, body=a.body, pr=a.pr))
+
+
+def cmd_execute(cfg, conn, a):
+    out(dispatch.execute(cfg, conn, a.run_id, a.actor))
 
 
 def cmd_sync(cfg, conn, a):
@@ -155,6 +177,24 @@ def main(argv=None):
     s.set_defaults(fn=cmd_ticket)
     sub.add_parser("tickets", help="owned tickets with verdict + freshness (JSON)").set_defaults(fn=cmd_tickets)
     sub.add_parser("prune-gate", help="Hermes pre-check for the prune job").set_defaults(fn=cmd_prune_gate)
+    sub.add_parser("candidates", help="stageable tickets (JSON), and why the rest are not").set_defaults(
+        fn=cmd_candidates)
+    s = sub.add_parser("stage", help="ingest, then freeze tickets into an immutable staged dispatch")
+    s.add_argument("identifiers", nargs="+")
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_stage)
+    s = sub.add_parser("execute", help="staged -> executing; only from the executor's herdr workspace")
+    s.add_argument("run_id")
+    s.add_argument("--actor", default="executor")
+    s.set_defaults(fn=cmd_execute)
+    s = sub.add_parser("card", help="report on one card of the executing dispatch")
+    s.add_argument("kind", choices=("claim", "comment", "done", "block"))
+    s.add_argument("run_id")
+    s.add_argument("identifier")
+    s.add_argument("--body", help="comment text, block reason, or done summary")
+    s.add_argument("--pr", help="PR URL in the ticket's repo (required for done; CI must be green)")
+    s.add_argument("--actor", default="executor")
+    s.set_defaults(fn=cmd_card)
     v = sub.add_parser("verdict").add_subparsers(dest="vcmd", required=True)
     s = v.add_parser("put", help="record a verdict with evidence (JSON list from file or -)")
     s.add_argument("identifier")
@@ -174,7 +214,8 @@ def main(argv=None):
         cfg = config.load()
         conn = db.connect(cfg.db)
         sys.exit(a.fn(cfg, conn, a) or 0)
-    except (prune.VerdictError, prune.NotOwned, witness.WitnessError) as e:
+    except (prune.VerdictError, prune.NotOwned, witness.WitnessError, dispatch.StageError,
+            sqlite3.IntegrityError) as e:  # IntegrityError = a schema trigger refused the write
         print(f"factory: refused: {e}", file=sys.stderr)
         sys.exit(1)
     except config.ConfigError as e:

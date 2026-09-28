@@ -34,6 +34,11 @@ board = "factory"
 [prune]
 batch = 2
 
+[stage]
+max_tickets = 3
+# Other fleets' backlogs (read-only). A ticket named in any of them is theirs; stage skips it.
+foreign_backlogs = ["~/.local/share/firstmate/homes/*/data/backlog.md"]
+
 # ---------------------------------------------------------------- repos
 # trunk = the branch PRs land on. Verified with git ls-remote 2026-09-29: repo-map's
 # dev_target "dev" is stale for finks-prism and finks-insights-service (no dev branch).
