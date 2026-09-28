@@ -41,6 +41,10 @@ def cmd_execute(cfg, conn, a):
     out(dispatch.execute(cfg, conn, a.run_id, a.actor))
 
 
+def cmd_handoff(cfg, conn, a):
+    out(dispatch.handoff(cfg, conn, a.run_id))
+
+
 def cmd_reconcile(cfg, conn, a):
     if a.rcmd == "plan":
         ingest(cfg, conn)  # Linear + trunk as they are now
@@ -207,6 +211,9 @@ def main(argv=None):
     s.add_argument("identifiers", nargs="+")
     s.add_argument("--actor", default="user")
     s.set_defaults(fn=cmd_stage)
+    s = sub.add_parser("handoff", help="reset the executor's omp session (/new) and tell it to run the dispatch")
+    s.add_argument("run_id")
+    s.set_defaults(fn=cmd_handoff)
     s = sub.add_parser("execute", help="staged -> executing; only from the executor's herdr workspace")
     s.add_argument("run_id")
     s.add_argument("--actor", default="executor")

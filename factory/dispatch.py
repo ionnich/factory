@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import subprocess
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,10 +20,23 @@ class StageError(Exception):
     pass
 
 
-def _foreign_backlogs(cfg: Config) -> dict[str, str]:
-    """Other fleets' backlog files (read-only). A ticket named in one is that fleet's work."""
+def _foreign_holds(cfg: Config) -> dict[str, str]:
+    """Where other fleets record their work (read-only): backlog files, plus live herdr workspace labels
+    (nix-fleet crews name their worktree after the ticket, e.g. `fin3733-...` or `fin-2068-...`)."""
     pats = cfg.raw.get("stage", {}).get("foreign_backlogs", [])
-    return {p: Path(p).read_text() for pat in pats for p in glob.glob(os.path.expanduser(pat))}
+    holds = {p: Path(p).read_text() for pat in pats for p in glob.glob(os.path.expanduser(pat))}
+    own = cfg.raw.get("executor", {}).get("workspace", "factory")
+    r = subprocess.run(["herdr", "workspace", "list"], capture_output=True, text=True, timeout=10)
+    if r.returncode == 0:
+        labels = [w["label"] for w in json.loads(r.stdout)["result"]["workspaces"]
+                  if w["label"] != own and not w["label"].startswith("2ndmate-fx-") and "fx-" not in w["label"]]
+        holds["herdr workspaces"] = "\n".join(labels)
+    return holds
+
+
+def _names(text: str, ident: str) -> bool:
+    team, num = ident.split("-")
+    return re.search(rf"(?i)(?<![a-z0-9]){team}-?{num}(?!\d)", text) is not None
 
 
 def candidates(cfg: Config, conn) -> dict:
@@ -30,7 +44,7 @@ def candidates(cfg: Config, conn) -> dict:
     lead = cfg.linear["lead"]
     live = {r[0] for r in conn.execute(
         "SELECT t.issue_id FROM dispatch_ticket t JOIN dispatch d USING (run_id) WHERE d.state <> 'archived'")}
-    backlogs = _foreign_backlogs(cfg)
+    holds = _foreign_holds(cfg)
     ok, skipped = [], []
     for s in prune.owned_in_scope(cfg, conn):
         raw = json.loads(s["raw_json"])
@@ -39,7 +53,7 @@ def candidates(cfg: Config, conn) -> dict:
         v = conn.execute("SELECT * FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
                          (s["issue_id"],)).fetchone()
         assignee = (raw["assignee"] or {}).get("email")
-        held = next((p for p, text in backlogs.items() if re.search(rf"\b{ident}\b", text)), None)
+        held = next((p for p, text in holds.items() if _names(text, ident)), None)
         why = ("unmapped" if ctx is None
                else "no verdict" if v is None
                else f"verdict {v['kind']}" if v["kind"] != "valid"
@@ -158,6 +172,35 @@ def mirror_cards(cfg: Config, conn, run_id: str, tickets: dict) -> list:
                          (card, run_id, ident))
         res.append({"identifier": ident, "card": card})
     return res
+
+
+def _herdr(*args: str) -> dict:
+    r = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=10)
+    if r.returncode:
+        raise StageError(f"herdr {' '.join(args)}: {r.stderr.strip() or r.stdout.strip()}")
+    return json.loads(r.stdout) if r.stdout.strip().startswith("{") else {}
+
+
+def handoff(cfg: Config, conn, run_id: str) -> dict:
+    """Hand a staged dispatch to the executor: fresh omp session (/new), then `run dispatch-intake <run_id>`."""
+    d = conn.execute("SELECT * FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+    if d is None or d["state"] != "staged":
+        raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not staged")
+    if busy := conn.execute("SELECT run_id FROM dispatch WHERE state='executing'").fetchone():
+        raise StageError(f"dispatch {busy[0]} is still executing")
+    want = cfg.raw.get("executor", {}).get("workspace", "factory")
+    ws = [w["workspace_id"] for w in _herdr("workspace", "list")["result"]["workspaces"] if w["label"] == want]
+    panes = [p for p in _herdr("pane", "list")["result"]["panes"] if p["workspace_id"] in ws and p.get("agent") == "omp"]
+    if len(panes) != 1:
+        raise StageError(f"expected one omp pane in workspace {want!r}, found {len(panes)}")
+    pane = panes[0]
+    if pane.get("agent_status") not in ("idle", "done"):
+        raise StageError(f"executor pane {pane['pane_id']} is {pane.get('agent_status')}; not resetting a busy session")
+    for text in ("/new", f"run dispatch-intake {run_id}"):  # session reset at every dispatch boundary
+        _herdr("pane", "send-text", pane["pane_id"], text)
+        _herdr("pane", "send-keys", pane["pane_id"], "enter")
+        time.sleep(3)
+    return {"run_id": run_id, "executor_pane": pane["pane_id"], "sent": ["/new", f"run dispatch-intake {run_id}"]}
 
 
 def execute(cfg: Config, conn, run_id: str, actor: str) -> dict:

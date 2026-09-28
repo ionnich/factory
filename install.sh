@@ -27,10 +27,21 @@ for d in "$here"/hermes/skills/*/; do
   mkdir -p "$hermes_home/skills/factory/$name"
   cp -R "$d". "$hermes_home/skills/factory/$name/"
 done
-for d in "$here"/hermes/plugins/*/; do
-  name="$(basename "$d")"
-  rm -rf "$hermes_home/plugins/$name" && mkdir -p "$hermes_home/plugins" && cp -R "$d" "$hermes_home/plugins/$name"
+# Plugin: default profile serves the dashboard tab; the `factory` chat profile gets the tool (profile config:
+# plugins.enabled [factory], platform_toolsets.cli [factory], deepseek) — created once by hand, see README.
+for dest in "$hermes_home" "$hermes_home/profiles/factory"; do
+  [ -d "$dest" ] || continue
+  rm -rf "$dest/plugins/factory" && mkdir -p "$dest/plugins" && cp -R "$here/hermes/plugins/factory" "$dest/plugins/factory"
 done
+[ -d "$hermes_home/profiles/factory" ] && cp "$here/hermes/profiles/factory/SOUL.md" "$hermes_home/profiles/factory/SOUL.md"
+
+# factory-fleet primary: local charter + dispatch-intake skill (home data/ and the skill are untracked there)
+fp="$HOME/.local/share/factory-fleet/homes/factory-primary"
+if [ -d "$fp" ]; then
+  cp "$here/fleet/factory-primary/captain.md" "$fp/data/captain.md"
+  mkdir -p "$fp/.omp/skills" && rm -rf "$fp/.omp/skills/dispatch-intake"
+  cp -R "$here/fleet/factory-primary/dispatch-intake" "$fp/.omp/skills/dispatch-intake"
+fi
 
 boards="$(hermes kanban boards list 2>/dev/null || true)"
 grep -q '^ *factory ' <<<"$boards" \
