@@ -41,6 +41,7 @@ if [ -d "$fp" ]; then
   cp "$here/fleet/factory-primary/captain.md" "$fp/data/captain.md"
   mkdir -p "$fp/.omp/skills" && rm -rf "$fp/.omp/skills/dispatch-intake"
   cp -R "$here/fleet/factory-primary/dispatch-intake" "$fp/.omp/skills/dispatch-intake"
+  cp "$here/fleet/factory-primary/omp-config.yml" "$fp/.omp/config.yml"
 fi
 
 boards="$(hermes kanban boards list 2>/dev/null || true)"

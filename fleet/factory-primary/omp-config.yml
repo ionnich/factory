@@ -1,0 +1,2 @@
+todo:
+  eager: default  # global "always" forces tool_choice=_todo, which Opus 5.5 rejects (400)
