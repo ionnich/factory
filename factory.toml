@@ -47,6 +47,8 @@ trunk = "main"
 trunk = "main"
 [repos."Finks-ai/finks-overwatch"]
 trunk = "main"
+[repos."Finks-ai/finks-portfolio-service"]
+trunk = "main"
 
 # ---------------------------------------------------------------- bounded contexts
 # Keyed on the ticket body's canonical `Domain:` project (finks-ddd: Domain decides
@@ -70,7 +72,7 @@ domains = ["SEC Filings"]
 [[context]]
 name = "search-api"
 repo = "Finks-ai/finks-api"
-domains = ["Search API"]
+domains = ["Search API", "External API Surface"]
 
 [[context]]
 name = "insights"
@@ -83,6 +85,19 @@ name = "observability"
 repo = "Finks-ai/finks-overwatch"
 domains = ["Observability"]
 
+# Added 2026-09-29 by operator decision (these tickets carry no Repo: line or span repos).
+[[context]]
+name = "finks-data"
+repo = "Finks-ai/finks-dagster"
+domains = ["Finks Data", "FMP Ingestion Pipeline", "v0 Historical Ratios"]
+witnesses = ["dagster-prod", "clickhouse-serving"]
+
+[[context]]
+name = "connected-portfolios"
+repo = "Finks-ai/finks-portfolio-service"
+domains = ["Connected Portfolios"]
+witnesses = ["clickhouse-serving"]
+
 # ---------------------------------------------------------------- witnesses (all read-only)
 [witness.dagster-prod]
 kind = "dagster"
@@ -92,7 +107,8 @@ token_env = "DAGSTER_CLOUD_API_TOKEN"
 
 # User factory_witness (created 2026-09-29 via /finks/prod/clickhouse-uri `default`): settings profile
 # readonly=2, max_execution_time<=5, max_result_rows<=200; SELECT only on system.{tables,parts,columns},
-# filings.*, evidence_fabric.*, insights.*. One Cloud service holds every env's databases.
+# filings.*, evidence_fabric.*, insights.*, ck_dev.* (market data; the prod secret points here),
+# user_data_prod.* (per-user holdings). One Cloud service holds every env's databases.
 [witness.clickhouse-serving]
 kind = "clickhouse"
 readonly = true
