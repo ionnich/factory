@@ -28,10 +28,12 @@ for d in "$here"/hermes/skills/*/; do
   cp -R "$d". "$hermes_home/skills/factory/$name/"
 done
 
-hermes kanban boards list 2>/dev/null | grep -q '^ *factory ' \
+boards="$(hermes kanban boards list 2>/dev/null || true)"
+grep -q '^ *factory ' <<<"$boards" \
   || hermes kanban boards create factory --name "Software factory" --description "Dispatch cards; factory.db is authoritative"
 
-have_job() { hermes cron list 2>/dev/null | grep -q -- "$1"; }
+jobs="$(hermes cron list 2>/dev/null || true)"   # capture first: grep -q on a live pipe + pipefail = SIGPIPE false negative
+have_job() { grep -qE "Name: +$1\$" <<<"$jobs"; }
 
 have_job factory-ingest || hermes cron create "every 20m" --no-agent \
   --script factory-ingest.sh --name factory-ingest --deliver local
