@@ -68,6 +68,33 @@ def dispatch_status(cfg, conn, run_id):
     }
 
 
+def cmd_tickets(cfg, conn, a):
+    """Owned in-scope tickets with verdict, freshness and live dispatch, for the status tab."""
+    live = {r["issue_id"]: dict(r) for r in conn.execute(
+        "SELECT t.issue_id, t.run_id, t.card_status, d.state FROM dispatch_ticket t JOIN dispatch d USING (run_id) "
+        "WHERE d.state <> 'archived'")}
+    rows = []
+    for s in prune.owned_in_scope(cfg, conn):
+        raw = json.loads(s["raw_json"])
+        ctx, why = prune.map_context(cfg, s)
+        v = conn.execute("SELECT kind, target, reason, evidence_json, created_at, created_by FROM verdict "
+                         "WHERE issue_id=? AND superseded_at IS NULL", (s["issue_id"],)).fetchone()
+        rows.append({
+            "identifier": raw["identifier"], "title": raw["title"], "url": raw["url"],
+            "domain": prune.domain_project(conn, s)["name"], "context": ctx.name if ctx else None,
+            "unmapped_reason": why, "repo": ctx.repo if ctx else None,
+            "linear_state": raw["state"]["name"], "assignee": (raw["assignee"] or {}).get("email"),
+            "priority": raw["priority"], "updated_at": s["updated_at"],
+            "freshness": prune.staleness(cfg, conn, s, ctx) or "fresh",
+            "verdict": {**dict(v), "evidence": json.loads(v["evidence_json"])} if v else None,
+            "dispatch": live.get(s["issue_id"]),
+        })
+    for r in rows:
+        if r["verdict"]:
+            del r["verdict"]["evidence_json"]
+    out(rows)
+
+
 def cmd_ticket(cfg, conn, a):
     s = prune.latest(conn, a.identifier)
     raw = json.loads(s["raw_json"])
@@ -126,6 +153,7 @@ def main(argv=None):
     s = sub.add_parser("ticket", help="latest snapshot + mapping + current verdict")
     s.add_argument("identifier")
     s.set_defaults(fn=cmd_ticket)
+    sub.add_parser("tickets", help="owned tickets with verdict + freshness (JSON)").set_defaults(fn=cmd_tickets)
     sub.add_parser("prune-gate", help="Hermes pre-check for the prune job").set_defaults(fn=cmd_prune_gate)
     v = sub.add_parser("verdict").add_subparsers(dest="vcmd", required=True)
     s = v.add_parser("put", help="record a verdict with evidence (JSON list from file or -)")
