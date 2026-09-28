@@ -1,0 +1,103 @@
+"""Linear GraphQL: read-only ingest. Mutations live only in reconcile."""
+import json
+import urllib.request
+
+from . import db
+from .config import Config, secret
+
+API = "https://api.linear.app/graphql"
+
+ISSUE_FIELDS = """
+  id identifier title description url priority createdAt updatedAt archivedAt
+  state { id name type }
+  assignee { id email }
+  team { id key }
+  project { id name }
+  projectMilestone { id name }
+  labels { nodes { name } }
+  parent { identifier }
+  attachments { nodes { url } }
+"""
+
+ISSUES_QUERY = """
+query($filter: IssueFilter, $after: String) {
+  issues(filter: $filter, first: 100, after: $after, orderBy: updatedAt, includeArchived: true) {
+    nodes { %s }
+    pageInfo { hasNextPage endCursor }
+  }
+}""" % ISSUE_FIELDS
+
+
+def gql(cfg: Config, query: str, variables: dict | None = None) -> dict:
+    req = urllib.request.Request(
+        API,
+        data=json.dumps({"query": query, "variables": variables or {}}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": secret(cfg, "LINEAR_API_KEY")},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        body = json.load(r)
+    if body.get("errors"):
+        raise RuntimeError(f"linear: {body['errors'][0].get('message')}")
+    return body["data"]
+
+
+def scope_filter(cfg: Config) -> dict:
+    """Tickets we care about: configured teams (my team) or assigned to me."""
+    return {"or": [{"team": {"key": {"in": cfg.linear["teams"]}}}, {"assignee": {"isMe": {"eq": True}}}]}
+
+
+def in_scope(cfg: Config, issue: dict) -> bool:
+    team = cfg.linear.get("team", {}).get(issue["team"]["key"], {})
+    state = issue["state"]
+    return issue.get("archivedAt") is None and (
+        state["type"] in cfg.linear.get("active_state_types", ["unstarted", "started"])
+        or state["name"] == team.get("todo_state"))
+
+
+def fetch(cfg: Config, flt: dict):
+    after = None
+    while True:
+        page = gql(cfg, ISSUES_QUERY, {"filter": flt, "after": after})["issues"]
+        yield from page["nodes"]
+        if not page["pageInfo"]["hasNextPage"]:
+            return
+        after = page["pageInfo"]["endCursor"]
+
+
+CURSOR = "linear:issues"
+SKEW = 120  # seconds of overlap for clock skew; upsert makes the overlap free
+
+
+def ingest(cfg: Config, conn, full: bool = False) -> dict:
+    from datetime import datetime, timedelta
+
+    row = conn.execute("SELECT updated_at_gt FROM sync_cursor WHERE name=?", (CURSOR,)).fetchone()
+    flt = scope_filter(cfg)
+    if row is None or full:
+        # First run: only currently-active tickets; afterwards every change in scope, any state,
+        # so tickets closed elsewhere still land and invalidate verdicts.
+        flt = {"and": [flt, {"state": {"type": {"in": ["unstarted", "started", "backlog"]}}}]}
+        cursor = None
+    else:
+        cursor = row["updated_at_gt"]
+        since = datetime.fromisoformat(cursor.replace("Z", "+00:00")) - timedelta(seconds=SKEW)
+        flt = {"and": [flt, {"updatedAt": {"gt": since.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}}]}
+
+    fetched = inserted = 0
+    max_updated = cursor
+    fetched_at = db.now()
+    with db.tx(conn):
+        for issue in fetch(cfg, flt):
+            fetched += 1
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO linear_snapshot VALUES (?,?,?,?,?,?,?)",
+                (issue["id"], issue["identifier"], issue["updatedAt"], fetched_at, issue["state"]["type"],
+                 int(in_scope(cfg, issue)), json.dumps(issue, sort_keys=True)))
+            inserted += cur.rowcount
+            if max_updated is None or issue["updatedAt"] > max_updated:
+                max_updated = issue["updatedAt"]
+        conn.execute(
+            "INSERT INTO sync_cursor VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+            "updated_at_gt=excluded.updated_at_gt, last_run_at=excluded.last_run_at, last_count=excluded.last_count",
+            (CURSOR, max_updated or fetched_at, fetched_at, inserted))
+    return {"fetched": fetched, "inserted": inserted, "cursor": max_updated}

@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.egg-info/
+# live dispatch runs are runtime state; only archived runs are committed
+dispatches/*
+!dispatches/_archived/

@@ -1,0 +1,109 @@
+# factory control-plane config. Symlinked from ~/.config/factory/factory.toml.
+
+[paths]
+db = "~/.hermes/factory.db"
+mirrors = "~/.hermes/factory/mirrors"
+dispatches = "~/planner/dispatches"
+
+[secrets]
+# KEY=VALUE files; environment variables win. Values are never logged.
+env_files = ["~/.config/secrets/agents.env", "~/.config/secrets/dagster-cloud.env", "~/.config/secrets/factory.env"]
+
+[linear]
+teams = ["FIN"]
+active_state_types = ["unstarted", "started"]   # triage and backlog excluded
+
+# Per-team workflow names, confirmed against Linear 2026-09-29.
+# FIN has no "In Review": the started-type review state is "Ready for QA".
+# "Ready for Prod" is completed-type in FIN. A "Duplicate" state (type duplicate) exists,
+# but duplicate-of verdicts close to canceled_state per decision.
+[linear.team.FIN]
+todo_state = "Todo"
+review_state = "Ready for QA"
+done_state = "Done"
+canceled_state = "Canceled"
+
+[kanban]
+# factory.db is authoritative. false = factory card writes only factory.db.
+enabled = true
+board = "factory"
+
+[prune]
+batch = 10
+
+# ---------------------------------------------------------------- repos
+# trunk = the branch PRs land on. Verified with git ls-remote 2026-09-29: repo-map's
+# dev_target "dev" is stale for finks-prism and finks-insights-service (no dev branch).
+[repos."Finks-ai/finks-dagster"]
+trunk = "main"
+[repos."Finks-ai/finks-api"]
+trunk = "main"
+[repos."Finks-ai/finks-clustering-service"]
+trunk = "main"
+[repos."Finks-ai/finks-prism"]
+trunk = "main"
+[repos."Finks-ai/finks-insights-service"]
+trunk = "main"
+[repos."Finks-ai/finks-personalization-service"]
+trunk = "main"
+[repos."Finks-ai/finks-overwatch"]
+trunk = "main"
+
+# ---------------------------------------------------------------- bounded contexts
+# Keyed on the ticket body's canonical `Domain:` project (finks-ddd: Domain decides
+# ownership; labels/assignee/milestone/issue.project never do) or a label.
+# A ticket must match exactly one context; a multi-repo domain is narrowed by the
+# ticket's `Repo:` line. Otherwise: needs-clarification "no bounded context".
+# Seeded 2026-09-29 from the recorded Domain -> repo lines in
+# ~/.local/share/firstmate/homes/primary/data/projects.md. Nothing here is inferred.
+
+[[context]]
+name = "sec-filings"
+repo = "Finks-ai/finks-dagster"
+domains = ["SEC Filings"]
+witnesses = ["dagster-prod"]
+
+[[context]]
+name = "sec-filings-compute"
+repo = "Finks-ai/finks-prism"
+domains = ["SEC Filings"]
+
+[[context]]
+name = "search-api"
+repo = "Finks-ai/finks-api"
+domains = ["Search API"]
+
+[[context]]
+name = "news-clustering"
+repo = "Finks-ai/finks-clustering-service"
+domains = ["News Clustering"]
+
+[[context]]
+name = "insights"
+repo = "Finks-ai/finks-insights-service"
+domains = ["Insights"]
+
+[[context]]
+name = "personalization-profile"
+repo = "Finks-ai/finks-personalization-service"
+domains = ["Personalization Profile"]
+
+[[context]]
+name = "observability"
+repo = "Finks-ai/finks-overwatch"
+domains = ["Observability"]
+
+# ---------------------------------------------------------------- witnesses (all read-only)
+[witness.dagster-prod]
+kind = "dagster"
+readonly = true
+url = "https://finks.dagster.cloud/prod/graphql"
+token_env = "DAGSTER_CLOUD_API_TOKEN"
+
+# Pending a read-only ClickHouse user on the serving cluster (put the values in factory.env):
+# [witness.clickhouse-serving]
+# kind = "clickhouse"
+# readonly = true
+# url = "https://<host>:8443"
+# user_env = "FACTORY_CH_USER"
+# password_env = "FACTORY_CH_PASSWORD"
