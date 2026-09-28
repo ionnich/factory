@@ -55,7 +55,10 @@ def cmd_reconcile(cfg, conn, a):
         res = reconcile.apply(cfg, conn, a.run_id)
         out(res)
         return 1 if res["unfinished"] else 0
-    # gate: plan every done dispatch + a verdict sweep; wake the agent for runs with unsent rows.
+    # gate: archive reconciled dispatches, plan every done dispatch + a verdict sweep, and wake the agent
+    # for runs with unsent rows.
+    for (run_id,) in conn.execute("SELECT run_id FROM dispatch WHERE state='reconciled'").fetchall():
+        dispatch.archive(cfg, conn, run_id)
     ingest(cfg, conn)
     for (run_id,) in conn.execute("SELECT run_id FROM dispatch WHERE state='done'").fetchall():
         reconcile.plan(cfg, conn, run_id)
