@@ -1,0 +1,14 @@
+{
+  "name": "factory",
+  "label": "Factory",
+  "description": "Software factory lifecycle status: tickets, verifications, dispatches, items waiting on you. Read-only.",
+  "icon": "Activity",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/factory",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

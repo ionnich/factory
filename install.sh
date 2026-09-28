@@ -27,6 +27,10 @@ for d in "$here"/hermes/skills/*/; do
   mkdir -p "$hermes_home/skills/factory/$name"
   cp -R "$d". "$hermes_home/skills/factory/$name/"
 done
+for d in "$here"/hermes/plugins/*/; do
+  name="$(basename "$d")"
+  rm -rf "$hermes_home/plugins/$name" && mkdir -p "$hermes_home/plugins" && cp -R "$d" "$hermes_home/plugins/$name"
+done
 
 boards="$(hermes kanban boards list 2>/dev/null || true)"
 grep -q '^ *factory ' <<<"$boards" \

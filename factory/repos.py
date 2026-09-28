@@ -1,10 +1,11 @@
 """Factory-owned repo mirrors at trunk. Never firstmate's projects/ clones."""
+import os
 import subprocess
 from functools import cache
 from pathlib import Path
 
 from . import db
-from .config import Config
+from .config import Config, secret
 
 
 def git(path: Path, *args: str, check: bool = True) -> str:
@@ -16,6 +17,8 @@ def git(path: Path, *args: str, check: bool = True) -> str:
 
 def sync(cfg: Config, conn, repo: str) -> str:
     """Fetch trunk, hard-reset the mirror to it, record the SHA."""
+    # gh's git credential helper needs the token; cron/launchd envs don't carry it.
+    os.environ.setdefault("GITHUB_TOKEN", secret(cfg, "GITHUB_TOKEN"))
     path, branch = cfg.mirror_path(repo), cfg.trunk(repo)
     if not (path / ".git").exists():
         path.parent.mkdir(parents=True, exist_ok=True)

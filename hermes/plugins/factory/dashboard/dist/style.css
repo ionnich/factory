@@ -1,0 +1,36 @@
+/* Factory tab. Theme-aware: only dashboard CSS vars. Amber = needs you, blue = in progress,
+   green = ready/done, gray = nothing to do / not ours. */
+.fx { max-width: 980px; margin: 0 auto; padding: 1.25rem 1rem 3rem; font-size: 15px; line-height: 1.5;
+      color: var(--color-foreground); }
+.fx h2 { font-size: 1.05rem; font-weight: 600; margin: 1.75rem 0 .5rem; display: flex; gap: .5rem; align-items: baseline; }
+.fx h2 .n { font-weight: 400; color: var(--color-muted-foreground); font-size: .9rem; }
+.fx .summary { font-size: 1.15rem; margin: .25rem 0 .25rem; }
+.fx .sub { color: var(--color-muted-foreground); font-size: .88rem; }
+.fx .bar { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+.fx .empty { color: var(--color-muted-foreground); padding: .5rem 0; font-size: .92rem; }
+.fx .list { border: 1px solid var(--color-border); border-radius: var(--radius, 8px); overflow: hidden;
+            background: var(--color-card); }
+.fx .row { display: grid; grid-template-columns: 9.5rem 1fr; gap: .9rem; padding: .7rem .9rem;
+           border-top: 1px solid var(--color-border); cursor: pointer; }
+.fx .row:first-child { border-top: 0; }
+.fx .row:hover { background: color-mix(in srgb, var(--color-foreground) 4%, transparent); }
+.fx .title { font-weight: 500; }
+.fx .meta { color: var(--color-muted-foreground); font-size: .85rem; }
+.fx .meta a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.fx .why { margin-top: .15rem; font-size: .92rem; }
+.fx .chip { display: inline-block; padding: .15rem .55rem; border-radius: 999px; font-size: .8rem; font-weight: 600;
+            white-space: nowrap; align-self: start; text-align: center; }
+.fx .amber { background: color-mix(in srgb, #f59e0b 20%, transparent); color: #b45309; }
+.fx .blue  { background: color-mix(in srgb, #3b82f6 18%, transparent); color: #1d4ed8; }
+.fx .green { background: color-mix(in srgb, #10b981 18%, transparent); color: #047857; }
+.fx .gray  { background: color-mix(in srgb, var(--color-muted-foreground) 16%, transparent); color: var(--color-muted-foreground); }
+.dark .fx .amber { color: #fbbf24; } .dark .fx .blue { color: #93c5fd; } .dark .fx .green { color: #6ee7b7; }
+.fx .detail { grid-column: 2; margin-top: .4rem; font-size: .88rem; }
+.fx .detail li { margin: .2rem 0; }
+.fx .detail code { font-size: .82rem; }
+.fx .steps { display: flex; gap: .35rem; flex-wrap: wrap; margin-top: .35rem; }
+.fx .step { font-size: .78rem; padding: .1rem .45rem; border-radius: 4px; border: 1px solid var(--color-border);
+            color: var(--color-muted-foreground); }
+.fx .step.on { border-color: #3b82f6; color: var(--color-foreground); font-weight: 600; }
+.fx .err { border: 1px solid #ef4444; border-radius: var(--radius, 8px); padding: .75rem; color: #ef4444; }
+.fx details > summary { cursor: pointer; margin: 1.75rem 0 .5rem; font-weight: 600; }
