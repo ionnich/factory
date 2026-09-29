@@ -4,3 +4,5 @@ __pycache__/
 # live dispatch runs are runtime state; only archived runs are committed
 dispatches/*
 !dispatches/_archived/
+# built by install.sh from hermes/plugins/factory/dashboard/src
+hermes/plugins/factory/dashboard/dist/

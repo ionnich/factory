@@ -27,6 +27,9 @@ for d in "$here"/hermes/skills/*/; do
   mkdir -p "$hermes_home/skills/factory/$name"
   cp -R "$d". "$hermes_home/skills/factory/$name/"
 done
+# Dashboard bundle: JSX -> one IIFE; React is external (the dashboard's SDK provides it), so no node_modules.
+dash="$here/hermes/plugins/factory/dashboard"
+(cd "$dash" && bun build src/index.jsx --format iife --outfile dist/index.js >/dev/null)
 # Plugin: default profile serves the dashboard tab; the `factory` chat profile gets the tool (profile config:
 # plugins.enabled [factory], platform_toolsets.cli [factory], deepseek) — created once by hand, see README.md.
 for dest in "$hermes_home" "$hermes_home/profiles/factory"; do

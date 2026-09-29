@@ -28,7 +28,8 @@ One-time, by hand:
 
 - Dashboard: Hermes dashboard, **Factory** tab: status per lifecycle stage, draft / review (plan tree, notes on
   any node, approve / hold / reject) / resolve flags, and throughput (`factory metrics`). A click there is the
-  approval.
+  approval. UI source is React JSX in `hermes/plugins/factory/dashboard/src/index.jsx` (React comes from the
+  dashboard SDK); `./install.sh` bundles it with `bun build` into the gitignored `dist/` and copies the plugin.
 - Chat: `hermes -p factory`, also on the iPhone through Hermex (Bot Mode, factory profile). It shows drafts,
   takes notes ("note FIN-3788/2: …"), holds, rejects, and approves (Hermes approval prompt).
 - Review: `factory stage` makes a **draft**. `factory-plan` (agent, every 10m) writes its plan tree: a theme,
