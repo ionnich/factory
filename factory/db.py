@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -25,6 +25,20 @@ WHEN NEW.decision IS NOT OLD.decision AND NOT (OLD.decision = 'apply' AND NEW.de
 BEGIN SELECT RAISE(ABORT, 'writeback decision may only be downgraded apply -> flag'); END;""",
     4: """CREATE TABLE linear_own_write (issue_id TEXT NOT NULL, updated_at TEXT NOT NULL,
   PRIMARY KEY (issue_id, updated_at));""",
+    5: """ALTER TABLE writeback RENAME TO writeback_v4;
+CREATE TABLE writeback (
+  run_id TEXT NOT NULL, issue_id TEXT NOT NULL,
+  op TEXT NOT NULL CHECK (op IN ('state', 'comment', 'description', 'create')),
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+  decision TEXT NOT NULL CHECK (decision IN ('apply', 'skip', 'flag')),
+  rule TEXT NOT NULL, reason TEXT,
+  status TEXT NOT NULL CHECK (status IN ('planned', 'sent', 'confirmed', 'failed')),
+  linear_ref TEXT, PRIMARY KEY (run_id, issue_id, op));
+INSERT INTO writeback SELECT * FROM writeback_v4;
+DROP TABLE writeback_v4;
+CREATE TRIGGER writeback_no_upgrade BEFORE UPDATE OF decision ON writeback
+WHEN NEW.decision IS NOT OLD.decision AND NOT (OLD.decision = 'apply' AND NEW.decision = 'flag')
+BEGIN SELECT RAISE(ABORT, 'writeback decision may only be downgraded apply -> flag'); END;""",
 }
 
 

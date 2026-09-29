@@ -22,14 +22,20 @@ Always call the CLI by absolute path: `~/.local/bin/factory`.
 ## Input
 
 The prompt starts with the gate's JSON: `context.runs[]`, each with `run_id`
-and `writes[]` (`identifier`, `op` = state | comment | description, `decision`
-= apply | skip | flag, `rule`, `reason`, `payload`, `status`).
+and `writes[]` (`identifier`, `op` = state | comment | description | create,
+`decision` = apply | skip | flag, `rule`, `reason`, `payload`, `status`).
+A `create` row is a new follow-up ticket split out of `identifier`; its
+`payload` has `title` and `description`.
+
+Use only `~/.local/bin/factory`. Never query the database, run scripts, or call
+Linear any other way: everything you need is in the gate JSON and
+`factory ticket <IDENT>`.
 
 ## Per run
 
 1. For each `apply` write, read `factory ticket <IDENT>` if you need context.
-2. `comment` and `description` rows: if the draft is hard to read, rewrite it in
-   plain language, 2–5 short sentences:
+2. `comment`, `description` and `create` rows: if the draft is hard to read,
+   rewrite it in plain language:
 
    ```bash
    ~/.local/bin/factory reconcile resolve <run_id> FIN-123 --op comment --body 'Already done on trunk: ...'
@@ -47,8 +53,13 @@ and `writes[]` (`identifier`, `op` = state | comment | description, `decision`
    ~/.local/bin/factory reconcile resolve <run_id> FIN-123 --op state --flag 'owner commented yesterday that work continues'
    ```
 
+   Downgrade a `create` row to a flag if the parent ticket already links an
+   open ticket for the same ask (it would be a duplicate).
+
 4. `~/.local/bin/factory reconcile apply <run_id>`. It re-checks every gate
-   against live Linear, sends state first, then description, then comments,
+   against live Linear, sends state first, then description, then new
+   follow-up tickets, then comments, and raises flags. Exit 1 means some writes
+   failed; they retry next run.
    and raises flags. Exit 1 means some writes failed; they retry next run.
 
 Never write to Linear any other way. Finish with one line per run:

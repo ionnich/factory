@@ -51,6 +51,8 @@ def cmd_reconcile(cfg, conn, a):
         return out(reconcile.plan(cfg, conn, a.run_id))
     if a.rcmd == "resolve":
         return out(reconcile.resolve(conn, a.run_id, a.identifier, a.op, a.body, a.flag))
+    if a.rcmd == "followup":
+        return out(reconcile.followup(cfg, conn, a.parent, a.title, a.body, a.repo, a.actor))
     if a.rcmd == "apply":
         res = reconcile.apply(cfg, conn, a.run_id)
         out(res)
@@ -258,11 +260,17 @@ def main(argv=None):
     s = r.add_parser("resolve", help="agent: rewrite comment/description prose, or downgrade apply -> flag")
     s.add_argument("run_id")
     s.add_argument("identifier")
-    s.add_argument("--op", required=True, choices=("state", "comment", "description"))
+    s.add_argument("--op", required=True, choices=("state", "comment", "description", "create"))
     s.add_argument("--body", help="new prose; must keep every URL, commit and ticket id of the draft")
     s.add_argument("--flag", help="downgrade this write to a flag for the user, with the reason")
     s = r.add_parser("apply", help="send planned writes (gates re-checked live), raise flags, close the run")
     s.add_argument("run_id")
+    s = r.add_parser("followup", help="queue a new ticket split out of an owned one; reconcile creates it")
+    s.add_argument("parent")
+    s.add_argument("--title", required=True)
+    s.add_argument("--body", required=True, help="markdown; the parent's Domain line and a split-out note are added")
+    s.add_argument("--repo", help="adds a `Repo:` line so the new ticket maps to that repo")
+    s.add_argument("--actor", default="user")
     r.add_parser("gate", help="Hermes pre-check for the reconcile job (last line = wakeAgent JSON)")
     sub.choices["reconcile"].set_defaults(fn=cmd_reconcile)
     s = sub.add_parser("archive", help="reconciled -> archived; move to _archived/ and commit")

@@ -212,7 +212,7 @@ BEGIN SELECT RAISE(ABORT, 'card_event is append-only'); END;
 CREATE TABLE writeback (
   run_id       TEXT NOT NULL,               -- dispatch run_id, or sweep-<ts> for verdict write-backs
   issue_id     TEXT NOT NULL,
-  op           TEXT NOT NULL CHECK (op IN ('state', 'comment', 'description')),
+  op           TEXT NOT NULL CHECK (op IN ('state', 'comment', 'description', 'create')),  -- create: issue_id = parent
   payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
   decision     TEXT NOT NULL CHECK (decision IN ('apply', 'skip', 'flag')),
   rule         TEXT NOT NULL,

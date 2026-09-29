@@ -22,6 +22,9 @@ STATES_QUERY = "query($id: String!) { team(id: $id) { states { nodes { id name t
 UPDATE = ("mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) "
           "{ success issue { updatedAt state { name } } } }")
 COMMENT = "mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }"
+CREATE = "mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier url } } }"
+RELATE = ("mutation($input: IssueRelationCreateInput!) { issueRelationCreate(input: $input) { success } }")
+_DOMAIN_LINE = re.compile(r"^\s*\**Domain\**:.*$", re.M)
 _COMPLETION = re.compile(r"^## Completion\n.*?(?=^## |\Z)", re.M | re.S)
 
 
@@ -111,6 +114,32 @@ def plan(cfg: Config, conn, run_id: str | None) -> dict:
     return show(conn, run_id)
 
 
+def followup(cfg: Config, conn, parent: str, title: str, body: str, repo: str | None, actor: str) -> dict:
+    """Queue a new Linear ticket split out of an owned one. Reconcile creates it (same team, parent's Domain
+    line, `related` to the parent); nothing is written here."""
+    s = prune.latest(conn, parent)
+    if not prune.owned(cfg, conn, s):
+        raise StageError(f"{parent} is not the factory's concern; no follow-ups from it")
+    if not title.strip() or not body.strip():
+        raise StageError("follow-up needs a title and a body")
+    if conn.execute("SELECT 1 FROM writeback WHERE issue_id=? AND op='create' AND status <> 'failed' "
+                    "AND json_extract(payload_json, '$.title')=?", (s["issue_id"], title.strip())).fetchone():
+        raise StageError(f"a follow-up titled {title.strip()!r} from {parent} is already queued or created")
+    raw = json.loads(s["raw_json"])
+    domain = _DOMAIN_LINE.search(raw.get("description") or "")
+    head = [domain.group(0).strip()] if domain else []
+    head += [f"Repo: {repo}"] if repo else []
+    description = "\n\n".join(head + [body.strip(), f"Split out of {parent} ({raw['url']}) by {actor}."])
+    run_id = f"followup-{datetime.now(UTC):%Y%m%d-%H%M%S}"
+    with db.tx(conn):
+        conn.execute("INSERT INTO writeback(run_id, issue_id, op, payload_json, decision, rule, reason, status) "
+                     "VALUES (?,?,?,?,?,?,?,?)",
+                     (run_id, s["issue_id"], "create", json.dumps({"title": title.strip(), "description": description,
+                                                                     "team_id": raw["team"]["id"]}),
+                      "apply", "followup", None, "planned"))
+    return show(conn, run_id)
+
+
 def show(conn, run_id: str) -> dict:
     return {"run_id": run_id, "writes": [
         {**dict(r), "payload": json.loads(r["payload_json"])} | {"payload_json": None}
@@ -127,10 +156,10 @@ def resolve(conn, run_id: str, identifier: str, op: str, body: str | None, flag_
     payload = json.loads(w["payload_json"])
     with db.tx(conn):
         if body is not None:
-            key = {"comment": "body", "description": "completion"}.get(op)
+            key = {"comment": "body", "description": "completion", "create": "description"}.get(op)
             if key is None:
                 raise StageError("only comment and description prose may be edited")
-            links = set(re.findall(r"https?://\S+|\b[0-9a-f]{40}\b|\b[A-Z]+-\d+\b", payload[key]))
+            links = set(re.findall(r"https?://[^\s)>\]]+|\b[0-9a-f]{40}\b|\b[A-Z]+-\d+\b", payload[key]))
             if missing := [x for x in links if x not in body]:
                 raise StageError(f"rewrite drops required references: {missing}")
             if op == "description" and not body.startswith("## Completion\n"):
@@ -158,7 +187,7 @@ def _state_id(cfg: Config, issue: dict, name: str, cache: dict) -> str:
 
 def apply(cfg: Config, conn, run_id: str) -> dict:
     """Send planned apply rows (state first: a comment would bump updatedAt), raise flags, close the run."""
-    order = "CASE op WHEN 'state' THEN 0 WHEN 'description' THEN 1 ELSE 2 END"
+    order = "CASE op WHEN 'state' THEN 0 WHEN 'description' THEN 1 WHEN 'create' THEN 2 ELSE 3 END"
     states: dict = {}
     touched: set[str] = set()
     for w in conn.execute(f"SELECT * FROM writeback WHERE run_id=? AND status IN ('planned','failed') "
@@ -188,6 +217,14 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
                     r = linear.gql(cfg, UPDATE, {"id": w["issue_id"], "input": {"description": new}})["issueUpdate"]
                     conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
                                  ("confirmed" if r["success"] else "failed", r["issue"]["updatedAt"], *key))
+                elif w["op"] == "create":  # follow-up ticket; issue_id is the parent it was split from
+                    r = linear.gql(cfg, CREATE, {"input": {"teamId": p["team_id"], "title": p["title"],
+                                                           "description": p["description"]}})["issueCreate"]
+                    # Record the new id before relating it, so a failed relation can never re-create the ticket.
+                    conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
+                                 ("confirmed" if r["success"] else "failed", r["issue"]["identifier"], *key))
+                    linear.gql(cfg, RELATE, {"input": {"issueId": r["issue"]["id"], "relatedIssueId": w["issue_id"],
+                                                       "type": "related"}})
                 else:
                     r = linear.gql(cfg, COMMENT, {"input": {"issueId": w["issue_id"], "body": p["body"]}})
                     r = r["commentCreate"]
@@ -214,3 +251,4 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
     if left == 0:
         conn.execute("UPDATE dispatch SET state='reconciled', reconciled_at=?, last_actor='factory:reconcile' "
                      "WHERE run_id=? AND state='done'", (db.now(), run_id))
+    return {**show(conn, run_id), "unfinished": left}
