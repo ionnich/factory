@@ -15,6 +15,9 @@ active_state_types = ["unstarted", "started"]   # triage and backlog excluded
 # Only tickets whose canonical Domain: project is led by this Linear user are the factory's
 # concern (niko = aaron.gumapac@finks.ai). Everything else is ignored: no verdict, no write-back.
 lead = "aaron.gumapac@finks.ai"
+# Owned by the lead's domain but decided not factory work (operator call). Excluded everywhere.
+# FIN-3852: fix is in finks-frontend (no factory owner), Khel has it (2026-09-29).
+ignore = ["FIN-3852"]
 
 # Per-team workflow names, confirmed against Linear 2026-09-29.
 # FIN has no "In Review": the started-type review state is "Ready for QA".

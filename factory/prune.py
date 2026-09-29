@@ -41,7 +41,9 @@ def domain_project(conn, snapshot):
 
 
 def owned(cfg: Config, conn, snapshot) -> bool:
-    """Only tickets whose Domain project is led by linear.lead are the factory's concern."""
+    """Only tickets whose Domain project is led by linear.lead are the factory's concern, minus linear.ignore."""
+    if snapshot["identifier"] in cfg.linear.get("ignore", []):
+        return False
     p = domain_project(conn, snapshot)
     return p is not None and p["lead_email"] == cfg.linear["lead"]
 
@@ -178,7 +180,8 @@ def put(cfg: Config, conn, identifier: str, kind: str, reason: str, evidence: li
     with db.tx(conn):
         s = latest(conn, identifier)
         if not owned(cfg, conn, s):
-            raise VerdictError(f"{identifier}: Domain project is not led by {cfg.linear['lead']}; not the factory's concern")
+            raise VerdictError(f"{identifier}: not the factory's concern (on linear.ignore, or its Domain project "
+                               f"is not led by {cfg.linear['lead']})")
         ctx, why = map_context(cfg, s)
         if ctx is None and kind != "needs-clarification":
             raise VerdictError(f"{identifier}: {why}; only needs-clarification is allowed")
