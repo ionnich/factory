@@ -49,7 +49,6 @@
   }
 
   // ---- plain-language status for one dispatch ----------------------------------------------
-  const STEPS = ["draft", "staged", "executing", "done", "reconciled"];
   const STEP_LABEL = { draft: "Prepared", staged: "Ready to start", executing: "Being worked on",
                        done: "Finished", reconciled: "Written to Linear" };
 
@@ -71,12 +70,6 @@
 
   // ---- small pieces ------------------------------------------------------------------------
   const Chip = ({ tone, children }) => h("span", { className: `chip ${tone}` }, children);
-
-  function Section({ title, count, empty, children }) {
-    return h("section", null,
-      h("h2", null, title, count != null ? h("span", { className: "n" }, `(${count})`) : null),
-      count === 0 ? h("div", { className: "empty" }, empty) : h("div", { className: "list" }, children));
-  }
 
   function Evidence({ items }) {
     return h("ul", null, (items || []).map((e, i) => h("li", { key: i },
@@ -104,23 +97,53 @@
           t.verdict ? h(Evidence, { items: t.verdict.evidence }) : h("div", { className: "meta" }, "No verification yet.")) : null));
   }
 
+  const CARD_TONE = { ready: "gray", running: "blue", done: "green", blocked: "amber" };
+
   function DispatchRow({ d }) {
     const [open, setOpen] = useState(false);
     const s = dispatchStatus(d);
     return h("div", { className: "row", onClick: () => setOpen(!open) },
       h(Chip, { tone: s.tone }, s.label),
       h("div", null,
-        h("div", { className: "title" }, `${(d.tickets || []).length} tickets · ${(d.tickets || []).map((c) => c.identifier).join(", ")}`),
+        h("div", { className: "title" }, `Dispatch ${d.run_id}`),
         h("div", { className: "why" }, s.why),
-        h("div", { className: "steps" }, STEPS.map((st) =>
-          h("span", { key: st, className: "step" + (st === d.state ? " on" : "") }, STEP_LABEL[st]))),
+        h("ul", { className: "cards" }, (d.tickets || []).map((c) => h("li", { key: c.identifier },
+          h(Chip, { tone: CARD_TONE[c.card_status] || "gray" }, CARD[c.card_status] || c.card_status), " ",
+          h("strong", null, c.identifier),
+          c.pr_url ? h("span", null, " · ", h("a", { href: c.pr_url, target: "_blank", onClick: (e) => e.stopPropagation() },
+            c.pr_url.replace("https://github.com/", ""))) : null))),
         open ? h("div", { className: "detail" },
-          h("div", { className: "meta" }, `Run ${d.run_id}` + (d.hash_ok === false ? " · WARNING: dispatch file was modified" : "")),
-          h("ul", null, (d.tickets || []).map((c) => h("li", { key: c.identifier },
-            `${c.identifier}: ${CARD[c.card_status] || c.card_status}`,
-            c.pr_url ? h("span", null, " · ", h("a", { href: c.pr_url, target: "_blank" }, "PR")) : null))),
+          d.hash_ok === false ? h("div", { className: "meta" }, "WARNING: dispatch file was modified") : null,
           h("ul", null, (d.transitions || []).map((x, i) => h("li", { key: i, className: "meta" },
             `${STEP_LABEL[x.to_state] || x.to_state} — by ${x.actor}, ${ago(x.at)}`)))) : null));
+  }
+
+  function FlagRow({ f }) {
+    return h("div", { className: "row" }, h(Chip, { tone: "amber" }, FLAG_LABEL(f)),
+      h("div", null,
+        h("div", { className: "title" }, f.identifier
+          ? h("span", null, h("a", { href: f.url, target: "_blank" }, f.identifier), `: ${f.title || ""}`) : f.kind),
+        h("div", { className: "why" }, f.reason || ""),
+        h("div", { className: "meta" }, `Flag ${f.id}` + (f.run_id ? ` · from ${f.run_id}` : "") +
+          ` · when handled, tell the factory chat: "resolve flag ${f.id}: <what you decided>"`)));
+  }
+
+  const CLOSED_LABEL = { "already-done": "Closed: already done", "duplicate-of": "Closed: duplicate" };
+
+  function ClosedTicketRow({ w }) {
+    return h("div", { className: "row" }, h(Chip, { tone: "green" }, CLOSED_LABEL[w.kind] || w.kind),
+      h("div", null,
+        h("div", { className: "title" }, w.title),
+        h("div", { className: "meta" }, h("a", { href: w.url, target: "_blank" }, w.identifier),
+          ` · now ${w.linear_state} in Linear` + (w.target ? ` · duplicate of ${w.target}` : "") + ` · ${w.run_id}`)));
+  }
+
+  function ArchivedRow({ a }) {
+    return h("div", { className: "row" }, h(Chip, { tone: "green" }, "Archived"),
+      h("div", null,
+        h("div", { className: "title" }, `Dispatch ${a.run_id}`),
+        h("div", { className: "meta" }, `${a.tickets} · ${a.done} done` + (a.blocked ? `, ${a.blocked} blocked` : "") +
+          ` · archived ${ago(a.archived_at)}`)));
   }
 
   function jobLine(jobs) {
@@ -132,6 +155,25 @@
   }
 
   // ---- page --------------------------------------------------------------------------------
+  // One section per lifecycle stage, in order. `tone` colors the stage pill in the strip.
+  const STAGES = [
+    { key: "checking", title: "Checking", tone: "blue", hint: "Verifying the ticket against code and data.",
+      empty: "Nothing being verified." },
+    { key: "answer", title: "Needs your answer", tone: "amber", hint: "The check couldn't decide; fix or answer in Linear.",
+      empty: "No questions for you." },
+    { key: "ready", title: "Ready to stage", tone: "green", hint: "Verified and free. Stage from the factory chat.",
+      empty: "No verified tickets waiting. New verifications land every 20 minutes." },
+    { key: "staged", title: "Staged", tone: "amber", hint: "Frozen into a dispatch; waiting for your handoff.",
+      empty: "No dispatch waiting to start." },
+    { key: "working", title: "Being worked on", tone: "blue", hint: "factory-fleet is building it.",
+      empty: "No dispatch running." },
+    { key: "writeback", title: "Writing back", tone: "blue", hint: "Finished; results going to Linear. Held writes need you.",
+      empty: "Nothing waiting to be written to Linear." },
+    { key: "closed", title: "Closed", tone: "green", hint: "Written to Linear and archived.", empty: "Nothing closed yet." },
+  ];
+  const DISPATCH_STAGE = { draft: "staged", staged: "staged", executing: "working", done: "writeback", reconciled: "writeback" };
+  const TICKET_STAGE = { progress: "checking", you: "answer", ready: "ready" };
+
   function FactoryPage() {
     const [data, setData] = useState(null);
     const [error, setError] = useState(null);
@@ -145,50 +187,47 @@
 
     if (!data) return h("div", { className: "fx" }, error ? h("div", { className: "err" }, error) : h("div", { className: "empty" }, "Loading…"));
 
-    const groups = { you: [], ready: [], progress: [], nothing: [], ignored: [] };
+    const rows = Object.fromEntries(STAGES.map((s) => [s.key, []]));
+    const aside = [];
     const skipped = Object.fromEntries((data.candidates?.skipped || []).map((x) => [x.identifier, x.reason]));
-    data.tickets.forEach((t) => { t._s = ticketStatus(t, skipped); groups[t._s.group].push(t); });
-    const flags = data.status.open_flags || [];
-    const waiting = data.dispatches.filter((d) => d.state === "staged");
-    const active = data.dispatches.filter((d) => d.state !== "staged");
-    const needYou = flags.length + waiting.length + groups.you.length;
+    data.tickets.forEach((t) => {
+      t._s = ticketStatus(t, skipped);
+      if (t.dispatch) return;  // shown on its dispatch's card list
+      const stage = TICKET_STAGE[t._s.group];
+      (stage ? rows[stage] : aside).push(h(TicketRow, { key: t.identifier, t }));
+    });
+    data.dispatches.forEach((d) => rows[DISPATCH_STAGE[d.state] || "working"].push(h(DispatchRow, { key: d.run_id, d })));
+    (data.status.open_flags || []).forEach((f) => rows.writeback.unshift(h(FlagRow, { key: `f${f.id}`, f })));
+    (data.status.archived || []).forEach((a) => rows.closed.push(h(ArchivedRow, { key: a.run_id, a })));
+    (data.status.written_back || []).forEach((w) => rows.closed.push(h(ClosedTicketRow, { key: `w${w.identifier}`, w })));
+
+    const flags = (data.status.open_flags || []).length;
+    const needYou = flags + rows.answer.length + rows.staged.length;
     const jl = jobLine(data.jobs);
+    const go = (key) => document.getElementById(`fx-${key}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
 
     return h("div", { className: "fx" },
       h("div", { className: "bar" },
         h("div", null,
           h("div", { className: "summary" },
-            needYou ? `${needYou} thing${needYou > 1 ? "s" : ""} need you` : "Nothing needs you right now",
-            ` · ${groups.ready.length} ready to stage · ` +
-            (active.some((d) => d.state === "executing") ? "a dispatch is being worked on" : "no dispatch running")),
+            needYou ? `${needYou} thing${needYou > 1 ? "s" : ""} need you` : "Nothing needs you right now"),
           h("div", { className: "sub" }, `${data.tickets.length} tickets in your domains · ${data.status.ignored_other_leads} in other leads' domains are ignored`),
           h("div", { className: "sub", style: { color: jl.ok ? undefined : "#ef4444" } }, jl.text)),
         h(Button, { variant: "outline", size: "sm", onClick: load }, `Refresh · ${loadedAt ? ago(loadedAt) : ""}`)),
       error ? h("div", { className: "err" }, `Last refresh failed: ${error}`) : null,
 
-      h(Section, { title: "Needs you", count: needYou, empty: "Nothing is waiting on you." },
-        flags.map((f) => h("div", { className: "row", key: `f${f.id}` }, h(Chip, { tone: "amber" }, FLAG_LABEL(f)),
-          h("div", null,
-            h("div", { className: "title" }, f.identifier ? `${f.identifier}: ${f.title || ""}` : f.kind),
-            h("div", { className: "why" }, f.reason || ""),
-            h("div", { className: "meta" },
-              `Flag ${f.id}` + (f.run_id ? ` · from ${f.run_id}` : "") +
-              ` · when handled, tell the factory chat: "resolve flag ${f.id}: <what you decided>"`)))),
-        waiting.map((d) => h(DispatchRow, { key: d.run_id, d })),
-        groups.you.map((t) => h(TicketRow, { key: t.identifier, t }))),
+      h("nav", { className: "pipeline" }, STAGES.map((s, i) => h(React.Fragment, { key: s.key },
+        i ? h("span", { className: "arrow" }, "→") : null,
+        h("button", { className: `stage ${rows[s.key].length ? s.tone : "idle"}`, onClick: () => go(s.key) },
+          h("span", { className: "count" }, rows[s.key].length), s.title)))),
 
-      h(Section, { title: "Dispatches", count: active.length, empty: "No dispatch in progress." },
-        active.map((d) => h(DispatchRow, { key: d.run_id, d }))),
+      STAGES.map((s, i) => h("section", { key: s.key, id: `fx-${s.key}` },
+        h("h2", null, h("span", { className: "num" }, i + 1), s.title,
+          h("span", { className: "n" }, `(${rows[s.key].length})`), h("span", { className: "hint" }, s.hint)),
+        rows[s.key].length ? h("div", { className: "list" }, rows[s.key]) : h("div", { className: "empty" }, s.empty))),
 
-      h(Section, { title: "Ready to stage", count: groups.ready.length,
-                   empty: "No verified tickets waiting. New verifications land every 20 minutes." },
-        groups.ready.map((t) => h(TicketRow, { key: t.identifier, t }))),
-
-      h(Section, { title: "Being checked", count: groups.progress.length, empty: "Nothing being checked." },
-        groups.progress.map((t) => h(TicketRow, { key: t.identifier, t }))),
-
-      h("details", null, h("summary", null, `Nothing to do (${groups.nothing.length}) · Not mapped (${groups.ignored.length})`),
-        h("div", { className: "list" }, groups.nothing.concat(groups.ignored).map((t) => h(TicketRow, { key: t.identifier, t })))));
+      h("details", null, h("summary", null, `Not for the factory (${aside.length}): already handled, held elsewhere, or not mapped`),
+        h("div", { className: "list" }, aside)));
   }
 
   window.__HERMES_PLUGINS__.register("factory", FactoryPage);

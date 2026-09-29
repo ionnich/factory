@@ -113,6 +113,16 @@ def cmd_status(cfg, conn, a):
                         "coalesce(json_extract(f.detail_json, '$.reason'), json_extract(f.detail_json, '$.stderr')) reason "
                         "FROM flag f LEFT JOIN linear_latest l USING (issue_id) WHERE f.resolved_at IS NULL ORDER BY f.id"),
         "kanban": cfg.kanban,
+        # Last stage of the lifecycle: what the factory closed out recently.
+        "archived": q("SELECT d.run_id, d.archived_at, group_concat(t.identifier, ', ') tickets, "
+                      "sum(t.card_status='done') done, sum(t.card_status='blocked') blocked FROM dispatch d "
+                      "JOIN dispatch_ticket t USING (run_id) WHERE d.state='archived' GROUP BY d.run_id "
+                      "ORDER BY d.archived_at DESC LIMIT 5"),
+        "written_back": q("SELECT l.identifier, json_extract(l.raw_json, '$.title') title, "
+                          "json_extract(l.raw_json, '$.url') url, json_extract(l.raw_json, '$.state.name') linear_state, "
+                          "v.kind, v.target, v.written_back_run run_id FROM verdict v JOIN linear_latest l USING (issue_id) "
+                          "WHERE v.written_back_run LIKE 'sweep-%' AND v.superseded_at IS NULL "
+                          "ORDER BY v.written_back_run DESC LIMIT 10"),
     })
 
 
