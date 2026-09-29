@@ -1,8 +1,9 @@
 """`factory` tool for the Hermes `factory` chat profile. The only surface that agent gets.
 
-Reads are free. `stage` freezes tickets into a dispatch (nothing runs yet). `handoff` starts real work on real
-repos, so it asks the human through Hermes's approval prompt every time; with no human channel it refuses and
-returns the command to paste instead.
+Reads are free. `stage` makes a draft dispatch (a planner adds a plan; nothing runs yet). `note`, `hold` and
+`reject` only touch drafts. `approve` freezes a draft and starts real work on real repos, so it asks the human
+through Hermes's approval prompt every time; with no human channel it refuses and returns the command to paste
+instead.
 """
 import json
 import os
@@ -19,22 +20,29 @@ SCHEMA = {
     "description": (
         "Operate the software factory. Actions: status [run_id] (overview or one dispatch); tickets (owned tickets "
         "with verdicts); candidates (what can be staged, and why the rest cannot); ticket <identifier>; "
-        "stage <identifiers> (1-3 tickets into an immutable dispatch; nothing runs yet); handoff <run_id> "
-        "(start the dispatch on the executor fleet: real branches and PRs; the user must approve); "
+        "stage <identifiers> (1-3 tickets into a draft dispatch; a planner adds a plan; nothing runs yet); "
+        "draft <run_id> (one dispatch with its review state and plan tree: node ids, steps, dependencies, notes); "
+        "note <run_id> <node> <body> (add the user's note to a draft; node ids look like `root` (whole dispatch), "
+        "`FIN-3788` (a ticket), `FIN-3788/2` (a step); the executor reads it verbatim); approve <run_id> (freeze the draft and "
+        "start it on the executor fleet: real branches and PRs; the user must approve); hold <run_id> <reason> "
+        "(stop a draft's auto-start until approved); reject <run_id> <reason> (discard a draft); "
         "resolve_flag <flag_id> <resolution> (mark a 'needs you' flag handled with what the user decided; "
         "does not change Linear); followup <identifier> <title> <body> [repo] (queue a new ticket split out of an owned one; reconcile creates it in Linear)."),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["status", "tickets", "candidates", "ticket", "stage", "handoff",
-                                                  "resolve_flag", "followup"]},
-            "run_id": {"type": "string", "description": "dispatch run id for status/handoff"},
+            "action": {"type": "string", "enum": ["status", "tickets", "candidates", "ticket", "stage", "draft",
+                                                  "note", "approve", "hold", "reject", "resolve_flag", "followup"]},
+            "run_id": {"type": "string", "description": "dispatch run id for status/draft/note/approve/hold/reject"},
             "identifier": {"type": "string", "description": "ticket id for `ticket`, e.g. FIN-3481"},
             "identifiers": {"type": "array", "items": {"type": "string"}, "description": "tickets for `stage`"},
+            "node": {"type": "string", "description": "plan node id for `note`, from the `draft` tree: `root` (whole "
+                                                     "dispatch), `FIN-3788` (a ticket), `FIN-3788/2` or `FIN-3788/2.1` (a step)"},
+            "reason": {"type": "string", "description": "the user's reason, for `hold`/`reject`"},
             "flag_id": {"type": "integer", "description": "flag id for `resolve_flag`"},
             "resolution": {"type": "string", "description": "what the user decided, for `resolve_flag`"},
             "title": {"type": "string", "description": "new ticket title, for `followup`"},
-            "body": {"type": "string", "description": "new ticket body (markdown), for `followup`"},
+            "body": {"type": "string", "description": "note text for `note`; new ticket body (markdown) for `followup`"},
             "repo": {"type": "string", "description": "optional repo the new ticket maps to, for `followup`"},
         },
         "required": ["action"],
@@ -64,7 +72,7 @@ def _approve(command: str, description: str) -> str | None:
         notify = approval._gateway_notify_cbs.get(key)
     if notify is not None:
         decision = _await_gateway_decision(key, notify, {
-            "command": command, "pattern_key": "factory_handoff", "pattern_keys": ["factory_handoff"],
+            "command": command, "pattern_key": "factory_approve", "pattern_keys": ["factory_approve"],
             "description": description, "allow_permanent": False, "allow_session": False}, surface="gateway")
         choice = decision.get("choice") if decision.get("resolved") else "timeout"
     else:
@@ -78,8 +86,13 @@ def _approve(command: str, description: str) -> str | None:
 
 def handle(params: dict, **_) -> str:
     action = params.get("action")
+    run_id = (params.get("run_id") or "").strip()
+    if action == "draft":
+        action = "status"
+        if not run_id:
+            return '{"ok": false, "error": "run_id required"}'
     if action in READS:
-        arg = params.get("identifier") if action == "ticket" else params.get("run_id") if action == "status" else None
+        arg = params.get("identifier") if action == "ticket" else run_id if action == "status" else None
         return _run(action, *([arg] if arg else []))
     if action == "stage":
         ids = [i.strip().upper() for i in params.get("identifiers") or [] if i.strip()]
@@ -94,17 +107,27 @@ def handle(params: dict, **_) -> str:
             return '{"ok": false, "error": "identifier (parent), title and body required"}'
         return _run("reconcile", "followup", parent, "--title", title, "--body", body,
                     *(["--repo", params["repo"]] if params.get("repo") else []), "--actor", "agent:factory-chat")
-    if action == "handoff":
-        run_id = (params.get("run_id") or "").strip()
-        if not run_id:
-            return '{"ok": false, "error": "run_id required"}'
-        command = f"factory handoff {run_id}"
-        why = _approve(command, f"Start factory dispatch {run_id} on factory-fleet: resets the executor session and "
-                                "begins real work (branches, PRs, merges) on the dispatch's repos.")
+    if action in ("note", "hold", "reject", "approve") and not run_id:
+        return '{"ok": false, "error": "run_id required"}'
+    if action == "note":
+        node, body = (params.get("node") or "").strip(), (params.get("body") or "").strip()
+        if not (node and body):
+            return '{"ok": false, "error": "node and body required"}'
+        return _run("draft", "note", run_id, "--node", node, f"--body={body}", "--actor", "agent:factory-chat")
+    if action in ("hold", "reject"):
+        reason = (params.get("reason") or "").strip()
+        if not reason:
+            return '{"ok": false, "error": "reason required"}'
+        return _run("draft", action, run_id, f"--reason={reason}", "--actor", "agent:factory-chat")
+    if action == "approve":
+        command = f"factory draft approve {run_id}"
+        why = _approve(command, f"Approve factory dispatch {run_id} and start it on factory-fleet: freezes the plan, "
+                                "resets the executor session and begins real work (branches, PRs, merges) on the "
+                                "dispatch's repos.")
         if why:
-            return json.dumps({"ok": False, "error": f"handoff not started: {why}. "
+            return json.dumps({"ok": False, "error": f"dispatch not approved: {why}. "
                                f"The user can run it themselves: ~/.local/bin/{command}"})
-        return _run("handoff", run_id)
+        return _run("draft", "approve", run_id, "--actor", "user:factory-chat")
     return json.dumps({"ok": False, "error": f"unknown action {action!r}"})
 
 

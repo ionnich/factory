@@ -25,7 +25,7 @@ class Invariants(unittest.TestCase):
         return self.c.execute(sql, a)
 
     def stage(self, run):
-        self.x("UPDATE dispatch SET state='staged', body_sha256='h', last_actor='p' WHERE run_id=?", run)
+        self.x("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' WHERE run_id=?", run)
 
     def test_forward_edges_only(self):
         with self.assertRaises(sqlite3.DatabaseError):

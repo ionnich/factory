@@ -1,5 +1,5 @@
-// Factory tab. Plain words first; ids, hashes and evidence one click away. Actions (stage, hand off,
-// resolve flag) go through the plugin API to the factory CLI, which enforces every invariant.
+// Factory tab. Plain words first; ids, hashes and evidence one click away. Actions (draft, note, approve/hold/
+// reject a draft, resolve flag) go through the plugin API to the factory CLI, which enforces every invariant.
 (function () {
   "use strict";
   const SDK = window.__HERMES_PLUGIN_SDK__;
@@ -23,7 +23,7 @@
     const [err, setErr] = useState(null);
     const run = (path, body) => {
       setBusy(true); setErr(null);
-      return post(path, body).then(() => { setBusy(false); onDone(); }, (e) => { setBusy(false); setErr(errText(e)); });
+      return post(path, body).then((r) => { setBusy(false); onDone(r); }, (e) => { setBusy(false); setErr(errText(e)); });
     };
     return { busy, err, run };
   }
@@ -67,16 +67,31 @@
   }
 
   // ---- plain-language status for one dispatch ----------------------------------------------
-  const STEP_LABEL = { draft: "Prepared", staged: "Ready to start", executing: "Being worked on",
-                       done: "Finished", reconciled: "Written to Linear" };
+  const STEP_LABEL = { draft: "Drafted", staged: "Approved", executing: "Being worked on",
+                       done: "Finished", reconciled: "Written to Linear", archived: "Archived" };
+  const localTime = (iso) => new Date(iso).toLocaleString([], { hour: "2-digit", minute: "2-digit", month: "short", day: "numeric" });
+  const until = (iso) => {
+    const m = Math.max(0, Math.round((Date.parse(iso) - Date.now()) / 60000));
+    return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`;
+  };
+
+  function reviewStatus(d) {
+    switch (d.review) {
+      case "planning": return { tone: "gray", label: "Planning…", why: "A planner is writing the plan. Nothing runs yet." };
+      case "in-review": return { tone: "amber", label: `Auto-starts in ${until(d.review_until)}`,
+                                 why: `Starts on its own at ${localTime(d.review_until)} (your local time) unless you hold or reject it.` };
+      case "held": return { tone: "amber", label: "Held", why: `Held: ${d.held_reason || "no reason given"}. Starts only when you approve.` };
+      default: return { tone: "amber", label: "Waiting for your approval", why: "Nothing starts until you approve." };
+    }
+  }
 
   function dispatchStatus(d) {
     const cards = d.tickets || [];
     const n = (s) => cards.filter((c) => c.card_status === s).length;
     switch (d.state) {
-      case "draft": return { tone: "gray", label: "Being prepared", why: `${cards.length} tickets` };
-      case "staged": return { tone: "amber", label: "Waiting for you to start",
-                              why: `${cards.length} tickets ready. Hand it off to start the work.` };
+      case "draft": return reviewStatus(d);
+      case "staged": return { tone: "blue", label: "Starting",
+                              why: `Approved by ${d.approved_by || "?"}; starting on factory-fleet` };
       case "executing": return { tone: "blue", label: "Being worked on",
                                  why: `${n("done")} of ${cards.length} done` + (n("blocked") ? `, ${n("blocked")} blocked` : "") };
       case "done": return { tone: "blue", label: "Finished, writing back to Linear",
@@ -123,19 +138,64 @@
     return h("div", { className: "act" },
       h(Button, { size: "sm", disabled: a.busy || !picked.length,
                   onClick: () => a.run("/stage", { identifiers: picked }) },
-        a.busy ? `Staging ${picked.length}…` : `Stage selected (${picked.length} of max ${max})`),
+        a.busy ? `Drafting ${picked.length}…` : `Draft dispatch (${picked.length} of max ${max})`),
       h(ActErr, { err: a.err }));
   }
 
-  function HandoffButton({ d, onDone }) {
-    const a = useAction(onDone);
-    const go = () => window.confirm(`Hand off dispatch ${d.run_id}?\n\nThis starts real work on factory-fleet: ` +
-      `branches, commits and pull requests for its ${(d.tickets || []).length} tickets.`) &&
-      a.run("/handoff", { run_id: d.run_id });
-    return h("div", { className: "act", onClick: stop },
-      h(Button, { size: "sm", disabled: a.busy, onClick: go },
-        a.busy ? "Handing off… (can take a few minutes)" : "Hand off"),
+  // One note box per plan node. Notes are append-only and only accepted while the dispatch is a draft.
+  function NoteBox({ d, node, onDone }) {
+    const [text, setText] = useState("");
+    const a = useAction(() => { setText(""); onDone(); });
+    const root = node.kind === "dispatch";
+    const go = () => text.trim() && a.run(`/drafts/${encodeURIComponent(d.run_id)}/notes`, { node: node.id, body: text.trim() });
+    return h("div", { className: "act" },
+      h(root ? "textarea" : "input", { type: root ? undefined : "text", rows: root ? 4 : undefined, value: text,
+        maxLength: 4000, disabled: a.busy, "aria-label": root ? "Notes for the whole dispatch" : `Note on ${node.id}`,
+        placeholder: root ? "Notes for the whole dispatch" : "Add a note on this " + node.kind,
+        onChange: (e) => setText(e.target.value),
+        onKeyDown: root ? undefined : (e) => { if (e.key === "Enter") go(); } }),
+      h(Button, { size: "sm", variant: "outline", disabled: a.busy || !text.trim(), onClick: go }, a.busy ? "Adding…" : "Add note"),
       h(ActErr, { err: a.err }));
+  }
+
+  function PlanNode({ d, node, depth, onDone }) {
+    return h("div", { className: `node ${node.kind}`, style: { marginLeft: `${depth * 1.25}rem` } },
+      h("div", null, h("strong", null, node.title), h("span", { className: "meta" }, ` · ${node.id}`)),
+      node.detail ? h("div", { className: "why" }, node.detail) : null,
+      node.depends_on?.length ? h("div", { className: "meta" }, `after ${node.depends_on.join(", ")}`) : null,
+      (node.notes || []).map((n) => h("div", { key: n.id, className: "note" },
+        h("div", { className: "meta" }, `${n.author} · `, h("span", { title: localTime(n.at) }, ago(n.at))), n.body)),
+      node.kind === "dispatch" ? h("div", { className: "meta" }, "Notes for the whole dispatch") : null,
+      h(NoteBox, { d, node, onDone }));
+  }
+
+  function Review({ d, onDone }) {
+    const [which, setWhich] = useState(null);
+    const a = useAction((r) => {
+      if (r && r.handoff_error) window.alert(`Approved, but starting failed: ${r.handoff_error}\nThe factory will retry.`);
+      onDone();
+    });
+    const id = encodeURIComponent(d.run_id);
+    const act = (verb, body) => { setWhich(verb); a.run(`/drafts/${id}/${verb}`, body); };
+    const ask = (verb, q) => { const reason = (window.prompt(q) || "").trim(); if (reason) act(verb, { reason }); };
+    const approve = () => window.confirm(`Approve and start dispatch ${d.run_id}?\n\nThis freezes the plan and starts real ` +
+      `work on factory-fleet: branches, commits and pull requests for its ${(d.tickets || []).length} tickets.`) && act("approve", {});
+    const tree = d.tree || [];
+    const depth = {};
+    tree.forEach((n) => { depth[n.id] = n.parent == null ? 0 : (depth[n.parent] ?? 0) + 1; });
+    const busy = (verb, text) => (a.busy && which === verb ? text : null);
+    return h("div", { className: "review", onClick: stop },
+      h("div", { className: "act" },
+        h(Button, { size: "sm", disabled: a.busy, onClick: approve },
+          busy("approve", "Approving… (can take a few minutes)") || "Approve & start"),
+        d.review === "held" ? null : h(Button, { size: "sm", variant: "outline", disabled: a.busy,
+          onClick: () => ask("hold", "Why hold it? (stops the automatic start until you approve)") }, busy("hold", "Holding…") || "Hold"),
+        h(Button, { size: "sm", variant: "outline", disabled: a.busy,
+          onClick: () => ask("reject", "Why reject it? (the draft is discarded)") }, busy("reject", "Rejecting…") || "Reject"),
+        h(ActErr, { err: a.err })),
+      tree.length ? h("div", { className: "tree" },
+        h("div", { className: "meta" }, "Notes go to the executor word for word, and can't be edited or removed."),
+        tree.map((n) => h(PlanNode, { key: n.id, d, node: n, depth: depth[n.id], onDone }))) : null);
   }
 
   const CARD_TONE = { ready: "gray", running: "blue", done: "green", blocked: "amber" };
@@ -146,9 +206,10 @@
     return h("div", { className: "row", onClick: () => setOpen(!open) },
       h(Chip, { tone: s.tone }, s.label),
       h("div", null,
-        h("div", { className: "title" }, `Dispatch ${d.run_id}`),
+        h("div", { className: "title" }, `Dispatch ${d.run_id}`,
+          d.auto ? h("span", { className: "meta", title: "Drafted by the factory itself" }, " · auto") : null),
         h("div", { className: "why" }, s.why),
-        d.state === "staged" ? h(HandoffButton, { d, onDone }) : null,
+        d.emergency ? h(Chip, { tone: "amber" }, "Emergency: no review window") : null,
         h("ul", { className: "cards" }, (d.tickets || []).map((c) => h("li", { key: c.identifier },
           h(Chip, { tone: CARD_TONE[c.card_status] || "gray" }, CARD[c.card_status] || c.card_status), " ",
           h("strong", null, c.identifier),
@@ -157,7 +218,8 @@
         open ? h("div", { className: "detail" },
           d.hash_ok === false ? h("div", { className: "meta" }, "WARNING: dispatch file was modified") : null,
           h("ul", null, (d.transitions || []).map((x, i) => h("li", { key: i, className: "meta" },
-            `${STEP_LABEL[x.to_state] || x.to_state} — by ${x.actor}, ${ago(x.at)}`)))) : null));
+            `${STEP_LABEL[x.to_state] || x.to_state} — by ${x.actor}, ${ago(x.at)}`)))) : null,
+        d.state === "draft" ? h(Review, { d, onDone }) : null));
   }
 
   function FlagRow({ f, onDone }) {
@@ -246,9 +308,12 @@
       empty: "Nothing being verified." },
     { key: "answer", title: "Needs your answer", tone: "amber", hint: "The check couldn't decide; fix or answer in Linear.",
       empty: "No questions for you." },
-    { key: "ready", title: "Ready to stage", tone: "green", hint: "Verified and free. Tick tickets and stage them.",
+    { key: "ready", title: "Ready to stage", tone: "green", hint: "Verified and free. Tick tickets and draft a dispatch.",
       empty: "No verified tickets waiting. New verifications land every 20 minutes." },
-    { key: "staged", title: "Staged", tone: "amber", hint: "Frozen into a dispatch; waiting for your handoff.",
+    { key: "review", title: "In review", tone: "amber",
+      hint: "A planner writes the plan; read it, leave notes, then approve, hold or reject.",
+      empty: "No draft waiting for review." },
+    { key: "staged", title: "Staged", tone: "blue", hint: "Approved and frozen; starting on factory-fleet.",
       empty: "No dispatch waiting to start." },
     { key: "working", title: "Being worked on", tone: "blue", hint: "factory-fleet is building it.",
       empty: "No dispatch running." },
@@ -256,7 +321,7 @@
       empty: "Nothing waiting to be written to Linear." },
     { key: "closed", title: "Closed", tone: "green", hint: "Written to Linear and archived.", empty: "Nothing closed yet." },
   ];
-  const DISPATCH_STAGE = { draft: "staged", staged: "staged", executing: "working", done: "writeback", reconciled: "writeback" };
+  const DISPATCH_STAGE = { draft: "review", staged: "staged", executing: "working", done: "writeback", reconciled: "writeback" };
   const TICKET_STAGE = { progress: "checking", you: "answer", ready: "ready" };
 
   function FactoryPage() {
@@ -297,7 +362,8 @@
     (data.status.written_back || []).forEach((w) => rows.closed.push(h(ClosedTicketRow, { key: `w${w.identifier}`, w })));
 
     const flags = (data.status.open_flags || []).length;
-    const needYou = flags + rows.answer.length + rows.staged.length;
+    const needYou = flags + rows.answer.length +
+      data.dispatches.filter((d) => d.state === "draft" && d.review !== "planning").length;
     const jl = jobLine(data.jobs);
     const go = (key) => document.getElementById(`fx-${key}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
 

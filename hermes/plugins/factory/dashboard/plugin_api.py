@@ -1,7 +1,8 @@
 """Factory tab backend. Every figure and every action goes through the `factory` CLI (single source of
-truth, which enforces the invariants) plus Hermes's own cron job records. Writes: stage, handoff, resolve
-flag. The dashboard sits behind Hermes login on the tailnet, so a click by the logged-in user is the human
-approval. POSTs take JSON bodies only (a cross-site form or no-cors fetch can't send application/json)."""
+truth, which enforces the invariants) plus Hermes's own cron job records. Writes: stage (a draft), draft notes,
+approve/hold/reject a draft, resolve flag. The dashboard sits behind Hermes login on the tailnet, so a click by
+the logged-in user is the human approval. POSTs take JSON bodies only (a cross-site form or no-cors fetch can't
+send application/json)."""
 import asyncio
 import json
 import os
@@ -21,6 +22,7 @@ ENV = {**os.environ, "PATH": ":".join([str(HOME / ".local/bin"), "/etc/profiles/
                                        "/run/current-system/sw/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"])}
 RUN_ID = re.compile(r"^[\w.:-]{1,80}$")
 IDENT = re.compile(r"^[A-Z]+-\d+$")
+NODE = re.compile(r"^(root|[A-Z]+-\d+(/[\d.]+)?)$")
 
 
 async def factory(*args: str, timeout: float = 60):
@@ -62,8 +64,17 @@ class Stage(BaseModel):
     identifiers: list[str] = Field(min_length=1, max_length=20)
 
 
-class Handoff(BaseModel):
-    run_id: str
+class Note(BaseModel):
+    node: str
+    body: str = Field(min_length=1, max_length=4000)
+
+
+class Reason(BaseModel):
+    reason: str = Field(min_length=1, max_length=4000)
+
+
+class Approve(BaseModel):  # empty, but its presence makes the route demand a JSON body
+    pass
 
 
 class Resolve(BaseModel):
@@ -78,11 +89,43 @@ async def stage(body: Stage):
     return await factory("stage", *body.identifiers, "--actor", "user:dashboard", timeout=120)
 
 
-@router.post("/handoff")
-async def handoff(body: Handoff):
-    if not RUN_ID.match(body.run_id) or body.run_id.startswith("-"):
+def run_id_ok(run_id: str) -> str:
+    if not RUN_ID.match(run_id) or run_id.startswith("-"):
         raise HTTPException(422, "bad run_id")
-    return await factory("handoff", body.run_id, timeout=240)  # may have to start the executor agent
+    return run_id
+
+
+def text_ok(text: str, what: str) -> str:
+    text = text.strip()
+    if not text:
+        raise HTTPException(422, f"{what} is empty")
+    return text
+
+
+@router.post("/drafts/{run_id}/notes")
+async def draft_note(run_id: str, body: Note):
+    if not NODE.match(body.node):
+        raise HTTPException(422, "bad node id")
+    return await factory("draft", "note", run_id_ok(run_id), "--node", body.node,
+                         f"--body={text_ok(body.body, 'note')}", "--actor", "user:dashboard")
+
+
+@router.post("/drafts/{run_id}/approve")
+async def draft_approve(run_id: str, body: Approve):
+    # freezes and hands off; may have to start the executor agent
+    return await factory("draft", "approve", run_id_ok(run_id), "--actor", "user:dashboard", timeout=240)
+
+
+@router.post("/drafts/{run_id}/hold")
+async def draft_hold(run_id: str, body: Reason):
+    return await factory("draft", "hold", run_id_ok(run_id), f"--reason={text_ok(body.reason, 'reason')}",
+                         "--actor", "user:dashboard")
+
+
+@router.post("/drafts/{run_id}/reject")
+async def draft_reject(run_id: str, body: Reason):
+    return await factory("draft", "reject", run_id_ok(run_id), f"--reason={text_ok(body.reason, 'reason')}",
+                         "--actor", "user:dashboard")
 
 
 @router.post("/flags/{flag_id}/resolve")

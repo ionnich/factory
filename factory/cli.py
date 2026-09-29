@@ -51,7 +51,38 @@ def cmd_handoff(cfg, conn, a):
 
 def cmd_propose(cfg, conn, a):
     ingest(cfg, conn)
-    out(dispatch.propose(cfg, conn))
+    res = dispatch.propose(cfg, conn)
+    if not a.announce:
+        return out(res)
+    if res.get("announce"):  # cron stdout -> bot-chat:factory (Hermex); silence otherwise
+        print(f"[factory] {res['announce']}")
+
+
+def cmd_draft(cfg, conn, a):
+    if a.dcmd == "gate":  # Hermes pre-check for factory-plan: drafts without a plan, one per run
+        d = conn.execute("SELECT run_id FROM dispatch WHERE state='draft' AND planned_at IS NULL "
+                         "ORDER BY created_at LIMIT 1").fetchone()
+        ctx = dispatch_status(cfg, conn, d["run_id"]) if d else None
+        if ctx:
+            ctx["tickets"] = [json.loads(json.dumps(t, default=str)) for t in dispatch._tickets_for_render(
+                cfg, conn, d["run_id"], check=False)[0]]
+            for t in ctx["tickets"]:
+                t["mirror"] = str(cfg.mirror_path(t["repo"]))
+        return print(json.dumps({"wakeAgent": bool(ctx), "context": {"draft": ctx}}, default=str))
+    if a.dcmd == "plan":
+        try:
+            steps = json.loads(a.steps)
+        except json.JSONDecodeError as e:
+            raise dispatch.StageError(f"--steps is not JSON: {e}")
+        return out(dispatch.plan(conn, a.run_id, steps))
+    if a.dcmd == "note":
+        return out(dispatch.note(conn, a.run_id, a.node, a.body, a.actor))
+    if a.dcmd == "hold":
+        return out(dispatch.hold(conn, a.run_id, a.reason, a.actor))
+    if a.dcmd == "reject":
+        return out(dispatch.reject(cfg, conn, a.run_id, a.reason, a.actor))
+    ingest(cfg, conn)  # approve: check the tickets against Linear as it is now
+    return out(dispatch.approve(cfg, conn, a.run_id, a.actor))
 
 
 def cmd_backup(cfg, conn, a):
@@ -194,6 +225,9 @@ def dispatch_status(cfg, conn, run_id):
     body = base.read_bytes() if base.exists() else None
     return {
         **dict(d),
+        "auto": d["drafted_by"] == dispatch.PROPOSE,
+        "review": dispatch.review(d),
+        "tree": dispatch.tree(conn, run_id),
         "path": str(base),
         "hash_ok": None if d["body_sha256"] is None or body is None
         else hashlib.sha256(body).hexdigest() == d["body_sha256"],
@@ -293,15 +327,37 @@ def main(argv=None):
     sub.add_parser("prune-gate", help="Hermes pre-check for the prune job").set_defaults(fn=cmd_prune_gate)
     sub.add_parser("candidates", help="stageable tickets (JSON), and why the rest are not").set_defaults(
         fn=cmd_candidates)
-    s = sub.add_parser("stage", help="ingest, then freeze tickets into an immutable staged dispatch")
+    s = sub.add_parser("stage", help="ingest, then draft a dispatch for review (nothing starts until approved)")
     s.add_argument("identifiers", nargs="+")
     s.add_argument("--actor", default="user")
     s.set_defaults(fn=cmd_stage)
     s = sub.add_parser("handoff", help="reset the executor's omp session (/new) and tell it to run the dispatch")
     s.add_argument("run_id")
     s.set_defaults(fn=cmd_handoff)
-    sub.add_parser("propose", help="cron: stage the top candidate in an `auto` repo and hand it off, when idle"
-                   ).set_defaults(fn=cmd_propose)
+    s = sub.add_parser("propose", help="cron: draft the top `auto` candidate, announce it for review, start it after "
+                                        "the review window (emergency: at once); hand off approved dispatches")
+    s.add_argument("--announce", action="store_true", help="print only the announcement text (for cron delivery)")
+    s.set_defaults(fn=cmd_propose)
+    dr = sub.add_parser("draft", help="review a draft dispatch: plan, notes, approve, hold, reject").add_subparsers(
+        dest="dcmd", required=True)
+    s = dr.add_parser("plan", help="planner agent: write the plan tree once")
+    s.add_argument("run_id")
+    s.add_argument("--steps", required=True, help='JSON list: [{"id":"FIN-1/1","title":..,"detail":..,"depends_on":[]}]')
+    s = dr.add_parser("note", help="add a note to a node (root, a ticket id, or a step id); binds the executor")
+    s.add_argument("run_id")
+    s.add_argument("--node", default="root")
+    s.add_argument("--body", required=True)
+    s.add_argument("--actor", default="user")
+    for name, hlp in (("hold", "stop the auto-start clock until approved"), ("reject", "discard the draft")):
+        s = dr.add_parser(name, help=hlp)
+        s.add_argument("run_id")
+        s.add_argument("--reason", required=True)
+        s.add_argument("--actor", default="user")
+    s = dr.add_parser("approve", help="freeze the draft (plan + notes) into dispatch.md and start it")
+    s.add_argument("run_id")
+    s.add_argument("--actor", default="user")
+    dr.add_parser("gate", help="Hermes pre-check for the factory-plan job (last line = wakeAgent JSON)")
+    sub.choices["draft"].set_defaults(fn=cmd_draft)
     s = sub.add_parser("backup", help="consistent, integrity-checked copy of factory.db; keeps the newest N")
     s.add_argument("--keep", type=int, default=14)
     s.set_defaults(fn=cmd_backup)

@@ -145,3 +145,9 @@ readonly = true
 url = "https://zqlprdmaw4.us-east-1.aws.clickhouse.cloud:8443"
 user_env = "FACTORY_CH_USER"
 password_env = "FACTORY_CH_PASSWORD"
+
+# ---------------------------------------------------------------- review notifications
+# factory-propose prints review announcements; its cron job delivers them to bot-chat:factory, which the
+# Hermex iPhone app shows (Bot Mode on the factory profile). The link goes in every announcement.
+[notify]
+url = "https://nich-studio.ainu-vernier.ts.net:9119/factory"

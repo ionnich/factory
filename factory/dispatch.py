@@ -7,7 +7,7 @@ import re
 import stat
 import subprocess
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import db, prune
@@ -81,30 +81,105 @@ def max_tickets(cfg: Config) -> int:
     return cfg.raw.get("stage", {}).get("max_tickets", 3)
 
 
-def _render(run_id: str, staged_at: str, actor: str, trunks: dict, tickets: list) -> str:
-    lines = [f"# Dispatch {run_id}", "",
-             f"Staged {staged_at} by {actor}. This file is immutable (`chflags uchg`); factory.db holds its sha256.",
-             "", "## Repos", ""]
-    lines += [f"- {repo} @ trunk `{sha}`" for repo, sha in sorted(trunks.items())]
+def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tree: list, rejected: str | None) -> str:
+    notes = lambda node: [f"- {n['author']} ({n['at'][:16]}Z): {n['body'].strip()}" for n in node["notes"]]
+    root = tree[0]
+    lines = [f"# Dispatch {run_id}", ""]
+    lines += ([f"**REJECTED in review** by {actor} at {when}: {rejected}", ""] if rejected else
+              [f"Approved {when} by {actor}. This file is immutable (`chflags uchg`); factory.db holds its sha256.", ""])
+    lines += ["## Repos", ""] + [f"- {repo} @ trunk `{sha}`" for repo, sha in sorted(trunks.items())]
     lines += ["", "## Rules", "",
               "- Work only the tickets below. One PR per ticket, against the repo's trunk.",
-              "- Report through `factory card claim|comment|done|block <run_id> <ID>`; `done` needs the PR URL.",
+              "- Follow each ticket's plan in dependency order. Operator notes are binding and override the plan "
+              "and the ticket body; if a note cannot be followed, `factory card block` with why.",
+              "- Report through `factory card claim|comment|done|block <run_id> <ID>`; `done` needs the PR URL. "
+              "Name the step id (e.g. FIN-1/2) in comments.",
               "- Never write to Linear. Reconcile does that after the dispatch closes.",
               "- The ticket body is a claim; the code and DB are truth. If the verdict below no longer holds, "
               "`factory card block` with the evidence instead of forcing a change.", ""]
+    if root["notes"]:
+        lines += ["## Operator notes (whole dispatch)", "", *notes(root), ""]
+    by_parent = {}
+    for node in tree[1:]:
+        by_parent.setdefault(node["parent"], []).append(node)
+
+    def plan(parent: str, depth: int) -> list:
+        out = []
+        for s in by_parent.get(parent, []):
+            after = f" (after {', '.join(s['depends_on'])})" if s["depends_on"] else ""
+            pad = "  " * depth
+            out.append(f"{pad}- **{s['id']}** {s['title']}{after}")
+            if s["detail"].strip():
+                out.append(f"{pad}  {s['detail'].strip()}")
+            out += [f"{pad}  - note {line[2:]}" for line in notes(s)]
+            out += plan(s["id"], depth + 1)
+        return out
+
     for t in tickets:
+        node = next(n for n in tree if n["id"] == t["identifier"])
         ev = "\n".join(f"  - `{json.dumps(e, sort_keys=True)}`" for e in t["evidence"])
         lines += [f"## {t['identifier']}: {t['title']}", "",
                   f"- Linear: {t['url']} ({t['state']}, assignee {t['assignee'] or 'none'})",
                   f"- Repo: {t['repo']} (context {t['context']}), trunk `{trunks[t['repo']]}`",
                   f"- Verdict: valid — {t['reason']}",
-                  f"- Evidence:\n{ev}", "",
+                  f"- Evidence:\n{ev}", ""]
+        if node["notes"]:
+            lines += [f"### Operator notes on {t['identifier']}", "", *notes(node), ""]
+        lines += ["### Plan", "", *(plan(t["identifier"], 0) or ["_(no plan written)_"]), "",
                   "### Ticket body (claim, not truth)", "", t["description"].strip() or "_(empty)_", ""]
     return "\n".join(lines)
 
 
-def stage(cfg: Config, conn, identifiers: list[str], actor: str) -> dict:
-    """Freeze the chosen tickets into an immutable dispatch. Caller runs ingest first."""
+def _draft(conn, run_id: str):
+    d = conn.execute("SELECT * FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+    if d is None or d["state"] != "draft":
+        raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not a draft in review")
+    return d
+
+
+def _step_key(step_id: str) -> tuple:
+    return tuple(int(p) for p in step_id.split("/", 1)[1].split("."))
+
+
+STEP_ID = re.compile(r"^([A-Z]+-\d+)/(\d+(?:\.\d+)*)$")
+
+
+def tree(conn, run_id: str) -> list:
+    """Pre-order: root, then each ticket with its steps depth-first. Parent is derived from the id."""
+    notes = {}
+    for n in conn.execute("SELECT id, node_id, author, body, at FROM dispatch_note WHERE run_id=? ORDER BY id",
+                          (run_id,)):
+        notes.setdefault(n["node_id"], []).append({k: n[k] for k in ("id", "author", "body", "at")})
+    steps = sorted(conn.execute("SELECT * FROM dispatch_step WHERE run_id=?", (run_id,)).fetchall(),
+                   key=lambda s: (s["step_id"].split("/")[0], _step_key(s["step_id"])))
+    out = [{"id": "root", "parent": None, "kind": "dispatch", "title": run_id, "detail": "", "depends_on": [],
+            "notes": notes.get("root", [])}]
+    for t in conn.execute("SELECT t.identifier, json_extract(s.raw_json, '$.title') title FROM dispatch_ticket t "
+                          "JOIN linear_snapshot s ON s.issue_id=t.issue_id AND s.updated_at=t.snapshot_updated_at "
+                          "WHERE t.run_id=? ORDER BY t.rowid", (run_id,)):
+        out.append({"id": t["identifier"], "parent": "root", "kind": "ticket", "title": t["title"], "detail": "",
+                    "depends_on": [], "notes": notes.get(t["identifier"], [])})
+        for s in steps:
+            if s["step_id"].split("/")[0] == t["identifier"]:
+                parent = s["step_id"].rsplit(".", 1)[0] if "." in s["step_id"] else t["identifier"]
+                out.append({"id": s["step_id"], "parent": parent, "kind": "step", "title": s["title"],
+                            "detail": s["detail"], "depends_on": json.loads(s["depends_on_json"]),
+                            "notes": notes.get(s["step_id"], [])})
+    return out
+
+
+def review(d) -> str | None:
+    if d["state"] != "draft":
+        return None
+    if d["planned_at"] is None:
+        return "planning"
+    if d["held_reason"]:
+        return "held"
+    return "in-review" if d["review_until"] else "waiting-approval"
+
+
+def stage(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool = False) -> dict:
+    """Draft a dispatch for review. Nothing is frozen or started until it is approved. Caller runs ingest first."""
     if not identifiers:
         raise StageError("name at least one ticket")
     if len(identifiers) > max_tickets(cfg):
@@ -117,41 +192,163 @@ def stage(cfg: Config, conn, identifiers: list[str], actor: str) -> dict:
     bad = [f"{i}: {why.get(i, 'not an owned in-scope ticket')}" for i in identifiers if i not in ok]
     if bad:
         raise StageError("not stageable: " + "; ".join(bad))
-
-    tickets = []
+    rows = []
     for ident in identifiers:
         s = prune.latest(conn, ident)
-        raw = json.loads(s["raw_json"])
         ctx, _ = prune.map_context(cfg, s)
-        v = conn.execute("SELECT * FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
-                         (s["issue_id"],)).fetchone()
-        tickets.append({"identifier": ident, "issue_id": s["issue_id"], "updated_at": s["updated_at"],
-                        "verdict_id": v["id"], "title": raw["title"], "url": raw["url"],
-                        "state": raw["state"]["name"], "assignee": (raw["assignee"] or {}).get("email"),
-                        "repo": ctx.repo, "context": ctx.name, "reason": v["reason"],
-                        "evidence": json.loads(v["evidence_json"]), "description": raw.get("description") or ""})
-    trunks = {t["repo"]: conn.execute("SELECT sha FROM repo_trunk WHERE repo=?", (t["repo"],)).fetchone()["sha"]
-              for t in tickets}
-    now = datetime.now(UTC)
-    run_id = f"{now:%Y%m%d-%H%M%S}-{identifiers[0].lower()}"
-    body = _render(run_id, db.now(), actor, trunks, tickets).encode()
-    path = cfg.dispatches / run_id / "dispatch.md"
-
+        v = conn.execute("SELECT id FROM verdict WHERE issue_id=? AND superseded_at IS NULL", (s["issue_id"],)).fetchone()
+        rows.append((s["issue_id"], ident, s["updated_at"], v["id"], ctx.repo))
+    trunks = {r[4]: conn.execute("SELECT sha FROM repo_trunk WHERE repo=?", (r[4],)).fetchone()["sha"] for r in rows}
+    run_id = f"{datetime.now(UTC):%Y%m%d-%H%M%S}-{identifiers[0].lower()}"
     with db.tx(conn):
-        conn.execute("INSERT INTO dispatch(run_id, state, repos_json, last_actor, created_at) VALUES (?,?,?,?,?)",
+        conn.execute("INSERT INTO dispatch(run_id, state, repos_json, last_actor, created_at, drafted_by, emergency) "
+                     "VALUES (?,?,?,?,?,?,?)",
                      (run_id, "draft", json.dumps([{"repo": r, "trunk_sha": s} for r, s in sorted(trunks.items())]),
-                      actor, db.now()))
-        conn.executemany(
-            "INSERT INTO dispatch_ticket(run_id, issue_id, identifier, snapshot_updated_at, verdict_id) "
-            "VALUES (?,?,?,?,?)",
-            [(run_id, t["issue_id"], t["identifier"], t["updated_at"], t["verdict_id"]) for t in tickets])
-        path.parent.mkdir(parents=True)
+                      actor, db.now(), actor, int(emergency)))
+        conn.executemany("INSERT INTO dispatch_ticket(run_id, issue_id, identifier, snapshot_updated_at, verdict_id) "
+                         "VALUES (?,?,?,?,?)", [(run_id, *r[:4]) for r in rows])
+    return {"run_id": run_id, "state": "draft", "tickets": identifiers, "emergency": emergency}
+
+
+def plan(conn, run_id: str, steps: list) -> dict:
+    """Planner agent: write the draft's plan once. Steps: [{id: 'FIN-1/2' or 'FIN-1/2.1', title, detail,
+    depends_on: [node ids]}]. Every ticket gets at least one step; depends_on must be acyclic."""
+    _draft(conn, run_id)
+    if conn.execute("SELECT planned_at FROM dispatch WHERE run_id=?", (run_id,)).fetchone()[0]:
+        raise StageError(f"{run_id} already has a plan")
+    tickets = [r[0] for r in conn.execute("SELECT identifier FROM dispatch_ticket WHERE run_id=?", (run_id,))]
+    if not isinstance(steps, list) or not steps:
+        raise StageError("steps must be a non-empty JSON list")
+    ids = set()
+    for s in steps:
+        m = STEP_ID.match(str(s.get("id", ""))) if isinstance(s, dict) else None
+        if not m or m[1] not in tickets:
+            raise StageError(f"bad step id {s.get('id') if isinstance(s, dict) else s!r}: want <TICKET>/<n>[.<n>...] "
+                             f"for a ticket in this dispatch ({', '.join(tickets)})")
+        if s["id"] in ids:
+            raise StageError(f"duplicate step {s['id']}")
+        if not str(s.get("title", "")).strip() or len(s["title"]) > 200 or len(str(s.get("detail", ""))) > 2000:
+            raise StageError(f"{s['id']}: title 1-200 chars, detail <= 2000")
+        ids.add(s["id"])
+    for s in steps:
+        if "." in s["id"] and s["id"].rsplit(".", 1)[0] not in ids:
+            raise StageError(f"{s['id']}: parent step {s['id'].rsplit('.', 1)[0]} missing")
+    for t in tickets:
+        n = sum(s["id"].startswith(t + "/") for s in steps)
+        if not 1 <= n <= 12:
+            raise StageError(f"{t}: {n} steps; want 1-12")
+    nodes = ids | set(tickets)
+    edges = {s["id"]: list(s.get("depends_on") or []) for s in steps}
+    for sid, deps in edges.items():
+        if not isinstance(deps, list) or any(dep not in nodes or dep == sid for dep in deps):
+            raise StageError(f"{sid}: depends_on must list other node ids of this dispatch")
+    state = {}
+
+    def visit(n):  # DFS cycle check over explicit edges
+        if state.get(n) == 1:
+            raise StageError(f"dependency cycle through {n}")
+        if state.get(n) != 2:
+            state[n] = 1
+            for dep in edges.get(n, []):
+                visit(dep)
+            state[n] = 2
+    for n in edges:
+        visit(n)
+    with db.tx(conn):
+        conn.executemany("INSERT INTO dispatch_step(run_id, step_id, title, detail, depends_on_json) VALUES (?,?,?,?,?)",
+                         [(run_id, s["id"], s["title"].strip(), str(s.get("detail", "")).strip(),
+                           json.dumps(edges[s["id"]])) for s in steps])
+        conn.execute("UPDATE dispatch SET planned_at=? WHERE run_id=?", (db.now(), run_id))
+    return {"run_id": run_id, "steps": len(steps)}
+
+
+def note(conn, run_id: str, node: str, body: str, actor: str) -> dict:
+    _draft(conn, run_id)
+    if node not in {n["id"] for n in tree(conn, run_id)}:
+        raise StageError(f"no node {node!r} in {run_id}; use root, a ticket id or a step id")
+    if not body.strip() or len(body) > 4000:
+        raise StageError("note must be 1-4000 characters")
+    with db.tx(conn):
+        cur = conn.execute("INSERT INTO dispatch_note(run_id, node_id, author, body, at) VALUES (?,?,?,?,?)",
+                           (run_id, node, actor, body.strip(), db.now()))
+    return {"run_id": run_id, "node": node, "note": cur.lastrowid}
+
+
+def hold(conn, run_id: str, reason: str, actor: str) -> dict:
+    _draft(conn, run_id)
+    if not reason.strip():
+        raise StageError("say why it is held")
+    with db.tx(conn):
+        conn.execute("UPDATE dispatch SET held_reason=?, last_actor=? WHERE run_id=?",
+                     (f"{reason.strip()} ({actor})", actor, run_id))
+    return {"run_id": run_id, "review": "held"}
+
+
+def _tickets_for_render(cfg: Config, conn, run_id: str, check: bool) -> tuple[list, dict]:
+    """Ticket data as drafted (snapshot + verdict pinned in dispatch_ticket). check=True refuses when the ticket or
+    its verdict moved during review: the reviewed plan would no longer match."""
+    tickets, bad = [], []
+    for r in conn.execute("SELECT * FROM dispatch_ticket WHERE run_id=? ORDER BY rowid", (run_id,)).fetchall():
+        s = conn.execute("SELECT * FROM linear_snapshot WHERE issue_id=? AND updated_at=?",
+                         (r["issue_id"], r["snapshot_updated_at"])).fetchone()
+        v = conn.execute("SELECT * FROM verdict WHERE id=?", (r["verdict_id"],)).fetchone()
+        raw = json.loads(s["raw_json"])
+        if check:
+            latest = prune.latest(conn, r["identifier"])
+            ctx, _ = prune.map_context(cfg, latest)
+            if v["superseded_at"] or prune.staleness(cfg, conn, latest, ctx):
+                bad.append(r["identifier"])
+        tickets.append({"identifier": r["identifier"], "issue_id": r["issue_id"], "title": raw["title"],
+                        "url": raw["url"], "state": raw["state"]["name"],
+                        "assignee": (raw["assignee"] or {}).get("email"), "repo": v["repo"], "context": v["context"],
+                        "reason": v["reason"], "evidence": json.loads(v["evidence_json"]),
+                        "description": raw.get("description") or ""})
+    if bad:
+        raise StageError(f"{', '.join(bad)} changed since the draft (ticket or verdict); reject it and draft again")
+    return tickets, {x["repo"]: x["trunk_sha"] for x in json.loads(
+        conn.execute("SELECT repos_json FROM dispatch WHERE run_id=?", (run_id,)).fetchone()[0])}
+
+
+def approve(cfg: Config, conn, run_id: str, actor: str, start: bool = True) -> dict:
+    """Review done: freeze the draft (plan + notes rendered into an immutable dispatch.md) and try to start it."""
+    _draft(conn, run_id)
+    tickets, trunks = _tickets_for_render(cfg, conn, run_id, check=True)
+    now = db.now()
+    body = _render(run_id, now, actor, trunks, tickets, tree(conn, run_id), None).encode()
+    path = cfg.dispatches / run_id / "dispatch.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with db.tx(conn):
         path.write_bytes(body)
-        conn.execute("UPDATE dispatch SET state='staged', body_sha256=?, staged_at=?, last_actor=? WHERE run_id=?",
-                     (hashlib.sha256(body).hexdigest(), db.now(), actor, run_id))
+        conn.execute("UPDATE dispatch SET state='staged', body_sha256=?, staged_at=?, approved_by=?, last_actor=? "
+                     "WHERE run_id=?", (hashlib.sha256(body).hexdigest(), now, actor, actor, run_id))
     os.chflags(path, stat.UF_IMMUTABLE)
-    return {"run_id": run_id, "path": str(path), "tickets": identifiers,
-            "kanban": mirror_cards(cfg, conn, run_id, {t["identifier"]: t for t in tickets})}
+    res = {"run_id": run_id, "path": str(path), "handoff": None, "handoff_error": None,
+           "kanban": mirror_cards(cfg, conn, run_id, {t["identifier"]: t for t in tickets})}
+    if start:
+        try:
+            res["handoff"] = handoff(cfg, conn, run_id)
+        except StageError as e:  # executor busy/starting: factory-propose retries every run
+            res["handoff_error"] = str(e)
+    return res
+
+
+def reject(cfg: Config, conn, run_id: str, reason: str, actor: str) -> dict:
+    """Discard a draft. It is rendered (with plan and notes) into _archived/ as the record; its tickets are not
+    drafted again until their verdict changes."""
+    _draft(conn, run_id)
+    if not reason.strip():
+        raise StageError("say why it is rejected")
+    tickets, trunks = _tickets_for_render(cfg, conn, run_id, check=False)
+    now = db.now()
+    body = _render(run_id, now, actor, trunks, tickets, tree(conn, run_id), reason.strip()).encode()
+    path = cfg.dispatches / "_archived" / run_id / "dispatch.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with db.tx(conn):
+        path.write_bytes(body)
+        conn.execute("UPDATE dispatch SET state='archived', body_sha256=?, archived_at=?, rejected_reason=?, "
+                     "last_actor=? WHERE run_id=?", (hashlib.sha256(body).hexdigest(), now, reason.strip(), actor, run_id))
+    _commit_archived(cfg, run_id, f"reject draft {run_id}")
+    return {"run_id": run_id, "state": "archived", "rejected": reason.strip(), "path": str(path)}
 
 
 def mirror_cards(cfg: Config, conn, run_id: str, tickets: dict) -> list:
@@ -268,11 +465,13 @@ def archive(cfg: Config, conn, run_id: str) -> dict:
     with db.tx(conn):
         conn.execute("UPDATE dispatch SET state='archived', archived_at=?, last_actor='factory:archive' WHERE run_id=?",
                      (db.now(), run_id))
-    git = ["git", "-C", str(dst.parent)]
-    subprocess.run([*git, "add", "--", run_id], check=True, capture_output=True)
-    r = subprocess.run([*git, "commit", "-q", "-m", f"archive dispatch {run_id}", "--", run_id],
-                       capture_output=True, text=True)
-    return {"run_id": run_id, "path": str(dst), "committed": r.returncode == 0}
+    return {"run_id": run_id, "path": str(dst), "committed": _commit_archived(cfg, run_id, f"archive dispatch {run_id}")}
+
+
+def _commit_archived(cfg: Config, run_id: str, message: str) -> bool:
+    git = ["git", "-C", str(cfg.dispatches / "_archived")]
+    subprocess.run([*git, "add", "--", run_id], capture_output=True)  # not a git checkout (tests): no commit
+    return subprocess.run([*git, "commit", "-q", "-m", message, "--", run_id], capture_output=True).returncode == 0
 
 
 CARD_TO = {"claim": "running", "done": "done", "block": "blocked"}
@@ -347,26 +546,75 @@ def flag(conn, run_id: str | None, issue_id: str | None, kind: str, detail: dict
 PROPOSE = "factory:propose"
 
 
+REVIEW = timedelta(hours=2)
+EMERGENCY_MAX_PATHS = 3
+
+
+def _emergency(cfg: Config, conn, ident: str) -> str | None:
+    """Skip review only on facts, never on an agent's say-so: a person marked the ticket Urgent in Linear, and the
+    verdict's evidence touches at most EMERGENCY_MAX_PATHS files (small blast radius). One ticket, auto repo."""
+    s = prune.latest(conn, ident)
+    v = conn.execute("SELECT evidence_paths_json FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
+                     (s["issue_id"],)).fetchone()
+    paths = json.loads(v["evidence_paths_json"]) if v else []
+    if json.loads(s["raw_json"])["priority"] == 1 and 0 < len(paths) <= EMERGENCY_MAX_PATHS:
+        return f"Urgent in Linear, touches {len(paths)} file(s): {', '.join(paths)}"
+    return None
+
+
 def propose(cfg: Config, conn) -> dict:
-    """Cron: keep one small dispatch moving without a human. Stages the top candidate in a repo marked
-    `auto = true` and hands it off; retries its own handoff while it waits. Never touches a dispatch a
-    person staged, and does nothing while any dispatch is past staging. Pause the cron job to stop it."""
-    busy = conn.execute("SELECT run_id, state, last_actor FROM dispatch WHERE state NOT IN ('draft', 'archived') "
-                        "ORDER BY created_at").fetchall()
-    if busy and not (len(busy) == 1 and busy[0]["state"] == "staged" and busy[0]["last_actor"] == PROPOSE):
-        return {"action": "wait", "dispatches": [dict(d) for d in busy]}
-    if busy:
-        run_id, staged = busy[0]["run_id"], None
-    else:
+    """Cron: move one dispatch at a time through review. Drafts the top candidate in an `auto` repo; once the
+    planner has written its plan, announces it (result["announce"], delivered to the factory Bot Chat / Hermex)
+    and starts it after REVIEW unless held. Emergency drafts start as soon as they are planned. A person's draft
+    is never started here. Staged (approved) dispatches are handed off, retried every run."""
+    live = conn.execute("SELECT * FROM dispatch WHERE state <> 'archived' ORDER BY created_at").fetchall()
+    if any(d["state"] in ("executing", "done", "reconciled") for d in live):
+        return {"action": "wait", "dispatches": [{"run_id": d["run_id"], "state": d["state"]} for d in live]}
+    if staged := [d for d in live if d["state"] == "staged"]:
+        try:
+            return {"action": "handoff", "handoff": handoff(cfg, conn, staged[0]["run_id"])}
+        except StageError as e:
+            return {"action": "staged", "run_id": staged[0]["run_id"], "handoff_error": str(e)}
+    drafts = [d for d in live if d["state"] == "draft"]
+    if not drafts:
         auto = [c for c in candidates(cfg, conn)["candidates"] if cfg.repos.get(c["repo"], {}).get("auto")]
         if not auto:
             return {"action": "idle", "reason": "no candidate in an auto repo"}
-        staged = stage(cfg, conn, [auto[0]["identifier"]], PROPOSE)  # ponytail: one ticket per auto dispatch
-        run_id = staged["run_id"]
+        why = _emergency(cfg, conn, auto[0]["identifier"])
+        d = stage(cfg, conn, [auto[0]["identifier"]], PROPOSE, emergency=bool(why))  # ponytail: one ticket each
+        return {"action": "drafted", "run_id": d["run_id"], "emergency": why}
+    own = [d for d in drafts if d["drafted_by"] == PROPOSE]
+    if not own:
+        return {"action": "wait", "reason": "a person's draft is in review", "run_id": drafts[0]["run_id"]}
+    d, run_id = own[0], own[0]["run_id"]
+    if d["planned_at"] is None:
+        return {"action": "planning", "run_id": run_id}
+    if d["held_reason"]:
+        return {"action": "held", "run_id": run_id, "reason": d["held_reason"]}
+    what = "; ".join(f"{n['id']} {n['title']}" for n in tree(conn, run_id) if n["kind"] == "ticket")
+    url = cfg.raw.get("notify", {}).get("url", "")
+    now = datetime.now(UTC)
+    if not d["emergency"] and d["review_until"] is None:
+        until = now + REVIEW
+        with db.tx(conn):
+            conn.execute("UPDATE dispatch SET notified_at=?, review_until=? WHERE run_id=?",
+                         (db.now(), until.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), run_id))
+        return {"action": "in-review", "run_id": run_id, "review_until": until.isoformat(),
+                "announce": f"Dispatch {run_id} is ready for review: {what}. It starts by itself at "
+                            f"{until.astimezone():%H:%M} unless you hold it. {url}"}
+    if not d["emergency"] and now < datetime.fromisoformat(d["review_until"]):
+        return {"action": "in-review", "run_id": run_id, "review_until": d["review_until"]}
+    actor = f"{PROPOSE} ({'emergency: no review window' if d['emergency'] else 'review window elapsed'})"
     try:
-        return {"action": "handoff", "staged": staged, "handoff": handoff(cfg, conn, run_id)}
-    except StageError as e:  # executor busy or not starting: stays staged, retried next run
-        return {"action": "staged", "staged": staged, "run_id": run_id, "handoff_error": str(e)}
+        res = approve(cfg, conn, run_id, actor)
+    except StageError as e:  # ticket or verdict moved during review: the reviewed plan is void
+        reject(cfg, conn, run_id, f"not started: {e}", PROPOSE)
+        return {"action": "rejected", "run_id": run_id, "reason": str(e),
+                "announce": f"Dispatch {run_id} was dropped instead of started: {e}."}
+    head = "Emergency dispatch" if d["emergency"] else "Dispatch"
+    tail = "without review" if d["emergency"] else "after the review window"
+    return {"action": "started", "run_id": run_id, **res,
+            "announce": f"{head} {run_id} started {tail}: {what}. {url}"}
 
 
 def watch(cfg: Config, conn) -> list:

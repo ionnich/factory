@@ -1,4 +1,6 @@
-"""propose never hands off a dispatch a person staged, and retries its own without restaging."""
+"""Review step: nothing leaves draft unreviewed, a person's draft is never started by the cron, and an automatic
+draft starts only after its review window unless held."""
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,31 +12,72 @@ from factory import db, dispatch
 SNAP = "2026-09-01T00:00:00Z"
 
 
-class Propose(unittest.TestCase):
+class Review(unittest.TestCase):
     def setUp(self):
         self.c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
-        self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) VALUES ('d1','draft','[]','x',?)",
-                       (SNAP,))
+        self.c.execute("INSERT INTO linear_snapshot VALUES ('i1','FIN-1',?,?,'unstarted',1,?)",
+                       (SNAP, SNAP, '{"title": "t"}'))
+        self.c.execute("INSERT INTO verdict(issue_id,snapshot_updated_at,kind,reason,evidence_json,created_at,created_by) "
+                       "VALUES ('i1',?,'valid','r','[1]',?,'t')", (SNAP, SNAP))
+        self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at,drafted_by,planned_at) "
+                       "VALUES ('d1','draft','[]','x',?,?,?)", (SNAP, dispatch.PROPOSE, SNAP))
+        self.c.execute("INSERT INTO dispatch_ticket(run_id,issue_id,identifier,snapshot_updated_at,verdict_id) "
+                       "VALUES ('d1','i1','FIN-1',?,1)", (SNAP,))
         self.cfg = SimpleNamespace(repos={}, raw={})
 
-    def staged_by(self, actor):
-        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', last_actor=? WHERE run_id='d1'", (actor,))
+    def propose(self):
+        with mock.patch.object(dispatch, "approve", return_value={}) as ap:
+            res = dispatch.propose(self.cfg, self.c)
+        return res, ap
 
-    def test_person_staged_dispatch_is_left_for_the_person(self):
-        self.staged_by("user")
-        with mock.patch.object(dispatch, "handoff") as h, mock.patch.object(dispatch, "stage") as s:
-            self.assertEqual(dispatch.propose(self.cfg, self.c)["action"], "wait")
-        h.assert_not_called()
-        s.assert_not_called()
+    def test_draft_leaves_review_only_approved_or_rejected(self):
+        for sql in ("UPDATE dispatch SET state='staged', body_sha256='h' WHERE run_id='d1'",
+                    "UPDATE dispatch SET state='archived', body_sha256='h' WHERE run_id='d1'"):
+            with self.subTest(sql=sql), self.assertRaises(sqlite3.IntegrityError):
+                self.c.execute(sql)
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u' WHERE run_id='d1'")
+        with self.assertRaises(sqlite3.IntegrityError):  # notes and plan close with the review
+            self.c.execute("INSERT INTO dispatch_note(run_id,node_id,author,body,at) VALUES ('d1','root','u','n',?)",
+                           (SNAP,))
 
-    def test_own_staged_dispatch_is_retried_not_restaged(self):
-        self.staged_by(dispatch.PROPOSE)
-        with mock.patch.object(dispatch, "handoff", side_effect=dispatch.StageError("busy")) as h, \
-                mock.patch.object(dispatch, "stage") as s:
-            self.assertEqual(dispatch.propose(self.cfg, self.c)["action"], "staged")
-            self.assertEqual(dispatch.propose(self.cfg, self.c)["run_id"], "d1")
-        self.assertEqual(h.call_count, 2)
-        s.assert_not_called()
+    def test_person_draft_is_never_started_by_the_cron(self):
+        self.c.execute("UPDATE dispatch SET drafted_by='user', review_until=? WHERE run_id='d1'", (SNAP,))
+        res, ap = self.propose()
+        self.assertEqual(res["action"], "wait")
+        ap.assert_not_called()
+
+    def test_auto_draft_announced_then_started_after_window_unless_held(self):
+        res, ap = self.propose()
+        self.assertEqual(res["action"], "in-review")
+        self.assertIn("ready for review", res["announce"])
+        ap.assert_not_called()
+        res, ap = self.propose()  # window still open
+        self.assertEqual(res["action"], "in-review")
+        self.assertNotIn("announce", res)
+        self.c.execute("UPDATE dispatch SET review_until=? WHERE run_id='d1'", (SNAP,))  # window elapsed
+        dispatch.hold(self.c, "d1", "reading it", "u")
+        res, ap = self.propose()
+        self.assertEqual(res["action"], "held")
+        ap.assert_not_called()
+        self.c.execute("UPDATE dispatch SET held_reason=NULL WHERE run_id='d1'")
+        res, ap = self.propose()
+        self.assertEqual(res["action"], "started")
+        ap.assert_called_once()
+
+    def test_plan_is_a_dag_under_the_dispatch_tickets(self):
+        self.c.execute("UPDATE dispatch SET planned_at=NULL WHERE run_id='d1'")
+        bad = ([{"id": "FIN-2/1", "title": "x"}],                                     # not this dispatch's ticket
+               [{"id": "FIN-1/1.1", "title": "x"}],                                   # parent step missing
+               [{"id": "FIN-1/1", "title": "a", "depends_on": ["FIN-1/2"]},
+                {"id": "FIN-1/2", "title": "b", "depends_on": ["FIN-1/1"]}])          # cycle
+        for steps in bad:
+            with self.subTest(steps=steps), self.assertRaises(dispatch.StageError):
+                dispatch.plan(self.c, "d1", steps)
+        dispatch.plan(self.c, "d1", [{"id": "FIN-1/1", "title": "a"}, {"id": "FIN-1/1.1", "title": "a1"},
+                                     {"id": "FIN-1/2", "title": "b", "depends_on": ["FIN-1/1"]}])
+        self.assertEqual([(n["id"], n["parent"]) for n in dispatch.tree(self.c, "d1")],
+                         [("root", None), ("FIN-1", "root"), ("FIN-1/1", "FIN-1"), ("FIN-1/1.1", "FIN-1/1"),
+                          ("FIN-1/2", "FIN-1")])
 
 
 if __name__ == "__main__":

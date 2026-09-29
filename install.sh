@@ -68,8 +68,15 @@ have_job factory-reconcile || hermes cron create "every 20m" "$(cat "$here/herme
 have_job factory-backup || hermes cron create "0 3 * * *" --no-agent \
   --script factory-backup.sh --name factory-backup --deliver local
 
-# Autonomous staging + handoff for repos marked `auto` in factory.toml. Pause this job to stop it.
-have_job factory-propose || hermes cron create "every 20m" --no-agent \
-  --script factory-propose.sh --name factory-propose --deliver local
+# Drafts dispatches for `auto` repos, announces them for review (to the factory Bot Chat, i.e. Hermex), starts
+# them after the review window, hands off approved ones. Pause this job to stop it.
+have_job factory-propose || hermes cron create "every 10m" --no-agent \
+  --script factory-propose.sh --name factory-propose --deliver bot-chat:factory
+
+# Writes the plan tree of each new draft so it can be reviewed.
+have_job factory-plan || hermes cron create "every 10m" "$(cat "$here/hermes/prompts/plan.md")" \
+  --script factory-plan-gate.sh --skill factory-plan --workdir "$hermes_home/factory/mirrors" \
+  --provider "$provider" --model "$model" --reasoning-effort medium \
+  --name factory-plan --deliver local
 
 hermes cron list

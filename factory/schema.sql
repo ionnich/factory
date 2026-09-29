@@ -100,7 +100,12 @@ CREATE TABLE dispatch (
   created_at    TEXT NOT NULL,
   staged_at     TEXT, executing_at TEXT, done_at TEXT, reconciled_at TEXT, archived_at TEXT,
   executor_pane TEXT,
-  CHECK (state = 'draft' OR body_sha256 IS NOT NULL)
+  -- review step (draft only): planner agent writes the plan, the user leaves notes, then approve/hold/reject.
+  drafted_by    TEXT,                       -- factory:propose drafts auto-start after review_until unless held
+  planned_at    TEXT, notified_at TEXT, review_until TEXT, held_reason TEXT,
+  approved_by   TEXT, rejected_reason TEXT,
+  emergency     INTEGER NOT NULL DEFAULT 0, -- 1 = no review window (urgent, one ticket, tiny evidence footprint)
+  CHECK (state = 'draft' OR body_sha256 IS NOT NULL)  -- rejected drafts are rendered too, as the record
 );
 CREATE UNIQUE INDEX one_executing ON dispatch(state) WHERE state = 'executing';
 
@@ -110,8 +115,14 @@ BEGIN SELECT RAISE(ABORT, 'dispatch must be created in draft'); END;
 CREATE TRIGGER dispatch_edges BEFORE UPDATE OF state ON dispatch
 WHEN NEW.state IS NOT OLD.state AND (OLD.state, NEW.state) NOT IN (VALUES
   ('draft', 'staged'), ('staged', 'executing'), ('executing', 'done'),
-  ('done', 'reconciled'), ('reconciled', 'archived'))
+  ('done', 'reconciled'), ('reconciled', 'archived'), ('draft', 'archived'))
 BEGIN SELECT RAISE(ABORT, 'illegal dispatch transition'); END;
+
+-- Nothing leaves draft unreviewed: staging needs an approver, discarding needs a reason.
+CREATE TRIGGER dispatch_review_gate BEFORE UPDATE OF state ON dispatch
+WHEN OLD.state = 'draft' AND ((NEW.state = 'staged' AND NEW.approved_by IS NULL)
+  OR (NEW.state = 'archived' AND NEW.rejected_reason IS NULL))
+BEGIN SELECT RAISE(ABORT, 'a draft leaves review only approved (staged) or rejected with a reason'); END;
 
 CREATE TRIGGER dispatch_frozen BEFORE UPDATE ON dispatch
 WHEN OLD.state <> 'draft' AND (NEW.body_sha256 IS NOT OLD.body_sha256 OR NEW.repos_json IS NOT OLD.repos_json
@@ -120,6 +131,42 @@ BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;
 
 CREATE TRIGGER dispatch_no_delete BEFORE DELETE ON dispatch WHEN OLD.state <> 'draft'
 BEGIN SELECT RAISE(ABORT, 'only draft dispatches may be deleted'); END;
+
+-- Plan tree of a draft: steps under tickets (id `FIN-1/2`, nested `FIN-1/2.1`; parent derived from the id),
+-- depends_on = DAG edges across the dispatch. Written once by the planner agent, only while draft.
+CREATE TABLE dispatch_step (
+  run_id          TEXT NOT NULL REFERENCES dispatch(run_id),
+  step_id         TEXT NOT NULL,
+  title           TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 200),
+  detail          TEXT NOT NULL DEFAULT '',
+  depends_on_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(depends_on_json)),
+  PRIMARY KEY (run_id, step_id)
+);
+CREATE TRIGGER dispatch_step_draft_only BEFORE INSERT ON dispatch_step
+WHEN (SELECT state FROM dispatch WHERE run_id = NEW.run_id) IS NOT 'draft'
+BEGIN SELECT RAISE(ABORT, 'the plan is frozen once the dispatch leaves draft'); END;
+CREATE TRIGGER dispatch_step_no_update BEFORE UPDATE ON dispatch_step
+BEGIN SELECT RAISE(ABORT, 'plan steps are written once'); END;
+CREATE TRIGGER dispatch_step_no_delete BEFORE DELETE ON dispatch_step
+BEGIN SELECT RAISE(ABORT, 'plan steps are written once'); END;
+
+-- Review notes on any node (`root`, a ticket id, a step id). Append-only, only while draft; frozen into
+-- dispatch.md, where they bind the executor.
+CREATE TABLE dispatch_note (
+  id      INTEGER PRIMARY KEY,
+  run_id  TEXT NOT NULL REFERENCES dispatch(run_id),
+  node_id TEXT NOT NULL,
+  author  TEXT NOT NULL,
+  body    TEXT NOT NULL CHECK (length(trim(body)) > 0),
+  at      TEXT NOT NULL
+);
+CREATE TRIGGER dispatch_note_draft_only BEFORE INSERT ON dispatch_note
+WHEN (SELECT state FROM dispatch WHERE run_id = NEW.run_id) IS NOT 'draft'
+BEGIN SELECT RAISE(ABORT, 'notes close when the dispatch leaves draft'); END;
+CREATE TRIGGER dispatch_note_append_only_u BEFORE UPDATE ON dispatch_note
+BEGIN SELECT RAISE(ABORT, 'notes are append-only'); END;
+CREATE TRIGGER dispatch_note_append_only_d BEFORE DELETE ON dispatch_note
+BEGIN SELECT RAISE(ABORT, 'notes are append-only'); END;
 
 CREATE TABLE transition_log (
   id         INTEGER PRIMARY KEY,

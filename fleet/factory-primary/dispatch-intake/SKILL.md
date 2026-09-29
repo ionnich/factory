@@ -20,7 +20,14 @@ absolute path: `~/.local/bin/factory`.
 another dispatch executes. A refusal ends this skill: report it, change nothing.
 
 Read `dispatch.md` in full. Each `## FIN-…` section is one card: repo, trunk
-SHA, the verdict and its evidence, then the ticket body (a claim, not truth).
+SHA, the verdict and its evidence, operator notes, the reviewed **Plan** (steps
+`FIN-…/n` with `after …` dependencies), then the ticket body (a claim, not truth).
+
+The dispatch was reviewed by the captain before approval. **Operator notes are
+binding**: the dispatch-level notes and each ticket's and step's notes override
+the plan and the ticket body. Carry the plan and every note into the
+secondmate hand-off verbatim; a note that cannot be followed is a block, not a
+judgement call.
 
 ## 2. Route every card
 
@@ -30,9 +37,11 @@ For each card, pick the owner from `data/captain.md` Routes and
 - **Owner found:** `factory card claim <run_id> <ID>`, then hand it over with
   the native mechanics: a `bin/fm-tasks-axi.sh add` item keyed `fx-<id-lower>`
   (for example `fx-fin-3481`), `bin/fm-backlog-handoff.sh <secondmate> <key>`, and
-  `bin/fm-send.sh` to the secondmate with the card section verbatim plus:
-  "Deliver a merged PR in <repo> against trunk. Return outcome, PR URL, merge
-  commit, checks. If the verdict no longer holds, return the evidence instead."
+  `bin/fm-send.sh` to the secondmate with the card section verbatim (plan and
+  notes included) plus: "Deliver a merged PR in <repo> against trunk, following
+  the plan in dependency order and every operator note. Return outcome, PR URL,
+  merge commit, checks. If the verdict or a note can't hold, return the evidence
+  instead."
   Always with `FM_HOME` and `FM_ROOT_OVERRIDE` set to this home.
 - **No factory-fleet owner, or the repo is marked UNREGISTERED / NOT OURS:**
   `factory card block <run_id> <ID> --body "<why>"`.
@@ -40,7 +49,8 @@ For each card, pick the owner from `data/captain.md` Routes and
 ## 3. Supervise
 
 Follow normal secondmate supervision (status files, watcher). Relay progress
-worth keeping with `factory card comment <run_id> <ID> --body "…"`.
+worth keeping with `factory card comment <run_id> <ID> --body "…"`, naming the
+step id (for example `FIN-3788/2 done: origin allowlist added`).
 
 When a secondmate returns:
 

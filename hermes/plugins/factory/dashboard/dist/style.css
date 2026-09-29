@@ -50,13 +50,22 @@
 .fx .cards { list-style: none; padding: 0; margin: .4rem 0 0; display: grid; gap: .3rem; }
 .fx .cards .chip { font-size: .72rem; padding: .05rem .45rem; }
 
-/* actions: stage / hand off / resolve; errors (API refusal text) sit next to the button */
+/* actions: draft / review / resolve; errors (API refusal text) sit next to the button */
 .fx .act { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: .45rem 0; cursor: auto; }
-.fx .act input[type=text] { flex: 1; min-width: 12rem; padding: .3rem .55rem; font: inherit; font-size: .9rem;
-                            color: inherit; background: transparent; border: 1px solid var(--color-border);
-                            border-radius: 6px; }
+.fx .act input[type=text], .fx .act textarea { flex: 1; min-width: 12rem; padding: .3rem .55rem; font: inherit;
+                            font-size: .9rem; color: inherit; background: transparent;
+                            border: 1px solid var(--color-border); border-radius: 6px; }
 .fx .act-err { color: #ef4444; font-size: .85rem; }
 .fx .pick { margin: 0 .5rem 0 0; vertical-align: middle; cursor: pointer; }
+
+/* draft review: plan tree with notes */
+.fx .review { cursor: auto; margin-top: .4rem; }
+.fx .tree { display: grid; gap: .35rem; margin-top: .3rem; }
+.fx .node { border-left: 2px solid var(--color-border); padding: .25rem 0 .1rem .65rem; font-size: .9rem; }
+.fx .node.ticket { border-left-color: #3b82f6; }
+.fx .node .act { margin: .25rem 0; }
+.fx .note { margin: .3rem 0; padding: .3rem .55rem; border-radius: 6px; white-space: pre-wrap;
+            background: color-mix(in srgb, #f59e0b 10%, transparent); }
 
 /* throughput */
 .fx .stats { display: flex; flex-wrap: wrap; gap: .5rem 1.75rem; margin: .25rem 0 .5rem; }
