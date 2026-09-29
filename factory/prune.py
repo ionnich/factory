@@ -87,7 +87,9 @@ def staleness(cfg: Config, conn, snapshot, ctx: Context | None) -> str | None:
                      (snapshot["issue_id"],)).fetchone()
     if v is None:
         return "new"
-    if v["snapshot_updated_at"] != snapshot["updated_at"]:
+    if v["snapshot_updated_at"] != snapshot["updated_at"] and not conn.execute(
+            "SELECT 1 FROM linear_own_write WHERE issue_id=? AND updated_at=?",
+            (snapshot["issue_id"], snapshot["updated_at"])).fetchone():
         return "ticket-changed"
     if v["context"] != (ctx.name if ctx else None):
         return "context-changed"

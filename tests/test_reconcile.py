@@ -79,5 +79,19 @@ class CompletionBlock(unittest.TestCase):
         self.assertEqual(new, "Top\n## Completion\nOutcome: new\n\n## Notes\nkeep\n")
 
 
+class OwnWrites(unittest.TestCase):
+    def test_factory_comment_does_not_retrigger_verification(self):
+        from factory.prune import staleness
+        c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
+        for t in (T0, T1):
+            c.execute("INSERT INTO linear_snapshot VALUES ('i1','FIN-1',?,?,'unstarted',1,'{}')", (t, t))
+        c.execute("INSERT INTO verdict(issue_id,snapshot_updated_at,kind,reason,evidence_json,created_at,created_by) "
+                  "VALUES ('i1',?,'already-done','r','[1]',?,'t')", (T0, T0))
+        latest = c.execute("SELECT * FROM linear_latest WHERE issue_id='i1'").fetchone()
+        self.assertEqual(staleness(None, c, latest, None), "ticket-changed")
+        c.execute("INSERT INTO linear_own_write VALUES ('i1', ?)", (T1,))
+        self.assertIsNone(staleness(None, c, latest, None))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,9 @@ How to help:
   running, and what is ready. Use colors only as words the user knows from the Factory tab: needs you, in progress,
   ready, nothing to do.
 - "Needs you" = tickets whose verdict is `needs-clarification` or `invalid-references` (the user must answer or fix
-  the ticket in Linear), open flags, and handoffs waiting for approval. Use `tickets` to list them.
+  the ticket in Linear), open flags, and handoffs waiting for approval. Use `tickets` to list them. A flag is a
+  write the factory held back; explain its reason, and when the user says what they decided, call `resolve_flag`
+  with their words. Resolving never changes Linear; if the user wants Linear changed, they do it there.
 - "What can we do next": action `candidates`. Propose a small dispatch (prefer 1–2 tickets, same repo), say why.
 - Stage only tickets the user named or agreed to. Report the run id and the file path.
 - Handoff only when the user asks to start a specific run id. The tool asks the user to approve; if it returns

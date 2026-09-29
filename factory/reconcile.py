@@ -160,6 +160,7 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
     """Send planned apply rows (state first: a comment would bump updatedAt), raise flags, close the run."""
     order = "CASE op WHEN 'state' THEN 0 WHEN 'description' THEN 1 ELSE 2 END"
     states: dict = {}
+    touched: set[str] = set()
     for w in conn.execute(f"SELECT * FROM writeback WHERE run_id=? AND status IN ('planned','failed') "
                           f"ORDER BY issue_id, {order}", (run_id,)).fetchall():
         key = (run_id, w["issue_id"], w["op"])
@@ -168,6 +169,7 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
         try:
             if decision == "apply":
                 issue = _live(cfg, w["issue_id"])
+                touched.add(w["issue_id"])
                 if w["op"] == "state":
                     if why := state_gate(cfg, issue, p.get("expect_updated_at")):
                         decision, reason = "flag", f"apply-time gate: {why}"
@@ -198,6 +200,12 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
         except Exception as e:  # one bad write never blocks the rest; failed rows retry on the next apply
             conn.execute("UPDATE writeback SET status='failed', reason=? WHERE run_id=? AND issue_id=? AND op=?",
                          (f"{type(e).__name__}: {e}"[:400], *key))
+    # Our own writes bump updatedAt. Record the result so prune does not treat it as a ticket change and
+    # re-verify (which re-plans the same comment every sweep). ponytail: a human edit landing between our
+    # write and this read is also absorbed; the next human edit re-arms it.
+    for issue_id in touched:
+        conn.execute("INSERT OR IGNORE INTO linear_own_write VALUES (?,?)",
+                     (issue_id, _live(cfg, issue_id)["updatedAt"]))
     with db.tx(conn):  # a verdict is written back once all of its rows landed; never re-planned after
         conn.execute("UPDATE verdict SET written_back_run=? WHERE written_back_run IS NULL AND id IN ("
                      "SELECT json_extract(payload_json, '$.verdict_id') v FROM writeback WHERE run_id=? AND v IS NOT NULL "

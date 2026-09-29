@@ -20,14 +20,19 @@ SCHEMA = {
         "Operate the software factory. Actions: status [run_id] (overview or one dispatch); tickets (owned tickets "
         "with verdicts); candidates (what can be staged, and why the rest cannot); ticket <identifier>; "
         "stage <identifiers> (1-3 tickets into an immutable dispatch; nothing runs yet); handoff <run_id> "
-        "(start the dispatch on the executor fleet: real branches and PRs; the user must approve)."),
+        "(start the dispatch on the executor fleet: real branches and PRs; the user must approve); "
+        "resolve_flag <flag_id> <resolution> (mark a 'needs you' flag handled with what the user decided; "
+        "does not change Linear)."),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["status", "tickets", "candidates", "ticket", "stage", "handoff"]},
+            "action": {"type": "string",
+                       "enum": ["status", "tickets", "candidates", "ticket", "stage", "handoff", "resolve_flag"]},
             "run_id": {"type": "string", "description": "dispatch run id for status/handoff"},
             "identifier": {"type": "string", "description": "ticket id for `ticket`, e.g. FIN-3481"},
             "identifiers": {"type": "array", "items": {"type": "string"}, "description": "tickets for `stage`"},
+            "flag_id": {"type": "integer", "description": "flag id for `resolve_flag`"},
+            "resolution": {"type": "string", "description": "what the user decided, for `resolve_flag`"},
         },
         "required": ["action"],
     },
@@ -76,6 +81,10 @@ def handle(params: dict, **_) -> str:
     if action == "stage":
         ids = [i.strip().upper() for i in params.get("identifiers") or [] if i.strip()]
         return _run("stage", *ids, "--actor", "agent:factory-chat") if ids else '{"ok": false, "error": "no identifiers"}'
+    if action == "resolve_flag":
+        if not params.get("flag_id") or not (params.get("resolution") or "").strip():
+            return '{"ok": false, "error": "flag_id and resolution required"}'
+        return _run("flag", "resolve", str(int(params["flag_id"])), "--resolution", params["resolution"].strip())
     if action == "handoff":
         run_id = (params.get("run_id") or "").strip()
         if not run_id:

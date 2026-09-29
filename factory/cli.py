@@ -72,6 +72,15 @@ def cmd_archive(cfg, conn, a):
     out(dispatch.archive(cfg, conn, a.run_id))
 
 
+def cmd_flag_resolve(cfg, conn, a):
+    with db.tx(conn):
+        n = conn.execute("UPDATE flag SET resolved_at=?, resolution=? WHERE id=? AND resolved_at IS NULL",
+                         (db.now(), a.resolution, a.id)).rowcount
+    if not n:
+        raise dispatch.StageError(f"no open flag {a.id}")
+    out({"flag": a.id, "resolved": True})
+
+
 def cmd_sync(cfg, conn, a):
     with db.tx(conn):
         out({r: sha for r, sha in repos.sync_all(cfg, conn).items()})
@@ -98,7 +107,11 @@ def cmd_status(cfg, conn, a):
                       "(SELECT value FROM json_each(?)) GROUP BY kind", json.dumps(ids)),
         "dispatches": q("SELECT run_id, state, staged_at, executing_at, done_at FROM dispatch "
                         "WHERE state <> 'archived' ORDER BY created_at"),
-        "open_flags": q("SELECT id, run_id, issue_id, kind FROM flag WHERE resolved_at IS NULL"),
+        "open_flags": q("SELECT f.id, f.run_id, f.issue_id, f.kind, f.created_at, l.identifier, "
+                        "json_extract(l.raw_json, '$.title') title, json_extract(l.raw_json, '$.url') url, "
+                        "json_extract(f.detail_json, '$.op') op, "
+                        "coalesce(json_extract(f.detail_json, '$.reason'), json_extract(f.detail_json, '$.stderr')) reason "
+                        "FROM flag f LEFT JOIN linear_latest l USING (issue_id) WHERE f.resolved_at IS NULL ORDER BY f.id"),
         "kanban": cfg.kanban,
     })
 
@@ -245,6 +258,11 @@ def main(argv=None):
     s = sub.add_parser("archive", help="reconciled -> archived; move to _archived/ and commit")
     s.add_argument("run_id")
     s.set_defaults(fn=cmd_archive)
+    fl = sub.add_parser("flag", help="flags raised for the user").add_subparsers(dest="fcmd", required=True)
+    s = fl.add_parser("resolve", help="mark a flag handled, with what was decided (never writes Linear)")
+    s.add_argument("id", type=int)
+    s.add_argument("--resolution", required=True)
+    s.set_defaults(fn=cmd_flag_resolve)
     v = sub.add_parser("verdict").add_subparsers(dest="vcmd", required=True)
     s = v.add_parser("put", help="record a verdict with evidence (JSON list from file or -)")
     s.add_argument("identifier")

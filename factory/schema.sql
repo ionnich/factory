@@ -225,6 +225,13 @@ CREATE TRIGGER writeback_no_upgrade BEFORE UPDATE OF decision ON writeback
 WHEN NEW.decision IS NOT OLD.decision AND NOT (OLD.decision = 'apply' AND NEW.decision = 'flag')
 BEGIN SELECT RAISE(ABORT, 'writeback decision may only be downgraded apply -> flag'); END;
 
+-- updatedAt values produced by reconcile's own writes: not a ticket change, so no re-verification.
+CREATE TABLE linear_own_write (
+  issue_id   TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (issue_id, updated_at)
+);
+
 CREATE TABLE flag (
   id          INTEGER PRIMARY KEY,
   run_id      TEXT,

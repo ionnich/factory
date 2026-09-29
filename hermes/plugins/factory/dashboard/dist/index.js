@@ -19,6 +19,9 @@
     "context-changed": "Repo mapping changed; verifying again",
   };
   const CARD = { ready: "not started", running: "being worked on", done: "done", blocked: "blocked" };
+  const FLAG_LABEL = (f) => f.kind === "kanban-mirror" ? "Board out of sync"
+    : ({ state: "Status held", description: "Note held", comment: "Comment held" })[f.op]
+      || "Decide";
 
   function ticketStatus(t, skipped) {
     const v = t.verdict;
@@ -164,9 +167,13 @@
       error ? h("div", { className: "err" }, `Last refresh failed: ${error}`) : null,
 
       h(Section, { title: "Needs you", count: needYou, empty: "Nothing is waiting on you." },
-        flags.map((f) => h("div", { className: "row", key: `f${f.id}` }, h(Chip, { tone: "amber" }, "Decide"),
-          h("div", null, h("div", { className: "title" }, `${f.kind.replace(/-/g, " ")}${f.issue_id ? "" : ""}`),
-            h("div", { className: "meta" }, f.run_id ? `from dispatch ${f.run_id}` : "")))),
+        flags.map((f) => h("div", { className: "row", key: `f${f.id}` }, h(Chip, { tone: "amber" }, FLAG_LABEL(f)),
+          h("div", null,
+            h("div", { className: "title" }, f.identifier ? `${f.identifier}: ${f.title || ""}` : f.kind),
+            h("div", { className: "why" }, f.reason || ""),
+            h("div", { className: "meta" },
+              `Flag ${f.id}` + (f.run_id ? ` · from ${f.run_id}` : "") +
+              ` · when handled, tell the factory chat: "resolve flag ${f.id}: <what you decided>"`)))),
         waiting.map((d) => h(DispatchRow, { key: d.run_id, d })),
         groups.you.map((t) => h(TicketRow, { key: t.identifier, t }))),
 
