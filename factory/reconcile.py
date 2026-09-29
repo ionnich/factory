@@ -135,7 +135,8 @@ def followup(cfg: Config, conn, parent: str, title: str, body: str, repo: str | 
         conn.execute("INSERT INTO writeback(run_id, issue_id, op, payload_json, decision, rule, reason, status) "
                      "VALUES (?,?,?,?,?,?,?,?)",
                      (run_id, s["issue_id"], "create", json.dumps({"title": title.strip(), "description": description,
-                                                                     "team_id": raw["team"]["id"]}),
+                                                                     "team_id": raw["team"]["id"],
+                                                                     "state": team_cfg(cfg, raw)["todo_state"]}),
                       "apply", "followup", None, "planned"))
     return show(conn, run_id)
 
@@ -219,7 +220,9 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
                                  ("confirmed" if r["success"] else "failed", r["issue"]["updatedAt"], *key))
                 elif w["op"] == "create":  # follow-up ticket; issue_id is the parent it was split from
                     r = linear.gql(cfg, CREATE, {"input": {"teamId": p["team_id"], "title": p["title"],
-                                                           "description": p["description"]}})["issueCreate"]
+                                                           "description": p["description"],
+                                                           "stateId": _state_id(cfg, {"team": {"id": p["team_id"]}},
+                                                                                p["state"], states)}})["issueCreate"]
                     # Record the new id before relating it, so a failed relation can never re-create the ticket.
                     conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
                                  ("confirmed" if r["success"] else "failed", r["issue"]["identifier"], *key))
