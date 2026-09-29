@@ -20,7 +20,7 @@ SCHEMA = {
     "description": (
         "Operate the software factory. Actions: status [run_id] (overview or one dispatch); tickets (owned tickets "
         "with verdicts); candidates (what can be staged, and why the rest cannot); ticket <identifier>; "
-        "stage <identifiers> (1-3 tickets into a draft dispatch; a planner adds a plan; nothing runs yet); "
+        "stage <identifiers> (a cohort of related tickets, up to 8, into a draft dispatch; a planner adds a plan; nothing runs yet); "
         "draft <run_id> (one dispatch with its review state and plan tree: node ids, steps, dependencies, notes); "
         "note <run_id> <node> <body> (add the user's note to a draft; node ids look like `root` (whole dispatch), "
         "`FIN-3788` (a ticket), `FIN-3788/2` (a step); the executor reads it verbatim); approve <run_id> (freeze the draft and "

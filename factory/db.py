@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -91,6 +91,7 @@ CREATE TRIGGER dispatch_note_append_only_u BEFORE UPDATE ON dispatch_note
 BEGIN SELECT RAISE(ABORT, 'notes are append-only'); END;
 CREATE TRIGGER dispatch_note_append_only_d BEFORE DELETE ON dispatch_note
 BEGIN SELECT RAISE(ABORT, 'notes are append-only'); END;""",
+    7: "ALTER TABLE dispatch_step ADD COLUMN parent TEXT;",
 }
 
 

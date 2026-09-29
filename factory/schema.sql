@@ -132,11 +132,13 @@ BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;
 CREATE TRIGGER dispatch_no_delete BEFORE DELETE ON dispatch WHEN OLD.state <> 'draft'
 BEGIN SELECT RAISE(ABORT, 'only draft dispatches may be deleted'); END;
 
--- Plan tree of a draft: steps under tickets (id `FIN-1/2`, nested `FIN-1/2.1`; parent derived from the id),
--- depends_on = DAG edges across the dispatch. Written once by the planner agent, only while draft.
+-- Plan tree of a draft, written once by the planner agent, only while draft. Rows: `root` (the dispatch's theme),
+-- a ticket id (its role; `parent` = the ticket it is nested under, NULL = root), or a step (`FIN-1/2`, nested
+-- `FIN-1/2.1`; parent derived from the id). depends_on = DAG edges across the dispatch.
 CREATE TABLE dispatch_step (
   run_id          TEXT NOT NULL REFERENCES dispatch(run_id),
   step_id         TEXT NOT NULL,
+  parent          TEXT,
   title           TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 200),
   detail          TEXT NOT NULL DEFAULT '',
   depends_on_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(depends_on_json)),

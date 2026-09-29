@@ -1,6 +1,6 @@
 ---
 name: factory-plan
-description: "Software-factory plan job: turn a draft dispatch into a reviewable plan tree (steps with dependencies) per ticket, written once with `factory draft plan`."
+description: "Software-factory plan job: shape a draft dispatch (a cohort of related tickets) into a reviewable tree: theme, nested tickets, misfits excluded, steps with dependencies; written once with `factory draft plan`."
 version: 1.0.0
 author: nich
 platforms: [macos]
@@ -28,27 +28,39 @@ the ticket body, a claim, not truth).
 Use only `~/.local/bin/factory` (absolute path), `git -C <mirror>` and read-only
 file access. No heredocs, pipes, `$(...)`, `-c` or `-e`: the security scan blocks them.
 
-## Per ticket
+## Shape the dispatch
 
-1. Read the evidence files in `mirror` (targeted ranges or grep, at most 6 reads
-   per ticket). Confirm where the change goes.
-2. Write 2-6 steps. Each step is one reviewable action with a concrete target:
-   a file, function, table, test, or command. Examples: "Add origin allowlist to
-   `app/cors.py:load_origins`", "Test: preflight from console origin returns 200",
-   "Open PR against main; CI green". Use nested steps (`FIN-1/2.1`) only when a
-   step has distinct sub-parts.
-3. `depends_on` lists steps that must finish first (also across tickets). Leave
-   it empty when order doesn't matter. No cycles.
+A dispatch is a cohort: tickets drafted together because they share a Domain or
+repo, so one pass through the code lands several of them with little context
+switching. Your job is to shape the cohort into a tree:
+
+1. For each ticket, read the evidence files in `mirror` (targeted ranges or
+   grep, at most 6 reads per ticket) and confirm where the change goes.
+2. Decide the tree:
+   - `root`: a theme title (what the dispatch achieves) and a detail of 1-2
+     sentences on why these tickets belong together.
+   - Nest a ticket `under` another when it builds on it or is a sub-part of it
+     (same file/table/surface, or it only makes sense after the other lands).
+   - `depends_on` between tickets or steps when order matters.
+   - `exclude` a ticket (with the reason) when it does not fit: different
+     surface, not atomic with the rest, or much larger/riskier than the others.
+     Keep at least one ticket. A one-ticket dispatch is fine.
+3. Per kept ticket write 2-6 steps. Each step is one reviewable action with a
+   concrete target: a file, function, table, test, or command. Examples: "Add
+   origin allowlist to `app/cors.py:load_origins`", "Test: preflight from
+   console origin returns 200", "Open PR against main; CI green". Nested steps
+   (`FIN-1/2.1`) only when a step has distinct sub-parts. Shared work goes in
+   the first ticket that needs it; later tickets depend on that step.
 
 ## Record it (once per draft)
 
 ```bash
-~/.local/bin/factory draft plan <run_id> --steps '[{"id":"FIN-123/1","title":"Add X to app/y.py:z","detail":"why/how in one or two sentences","depends_on":[]},{"id":"FIN-123/2","title":"Test ...","detail":"...","depends_on":["FIN-123/1"]}]'
+~/.local/bin/factory draft plan <run_id> --steps '[{"id":"root","title":"Console CORS on the commercial API","detail":"Both tickets change the same origin allowlist."},{"id":"FIN-2","under":"FIN-1","detail":"Extends FIN-1 to /v2."},{"id":"FIN-3","exclude":"Different repo surface (billing); not atomic with the CORS change."},{"id":"FIN-1/1","title":"Add X to app/y.py:z","detail":"why/how in one or two sentences","depends_on":[]},{"id":"FIN-2/1","title":"Reuse FIN-1/1 for /v2 routes","detail":"...","depends_on":["FIN-1/1"]}]'
 ```
 
-Step ids: `<TICKET>/<n>` or nested `<TICKET>/<n>.<m>`; every ticket needs 1-12
-steps; titles <= 200 chars, detail <= 2000. If the CLI refuses, fix what it
-names and retry; never retry the same payload.
+Ids: `root`, a ticket id, or a step `<TICKET>/<n>[.<m>]`. Every kept ticket
+needs 1-12 steps; titles <= 200 chars, detail <= 2000. If the CLI refuses, fix
+what it names and retry; never retry the same payload.
 
 ## Rules
 
@@ -58,4 +70,4 @@ names and retry; never retry the same payload.
 - If the evidence shows the work is already done or the ticket is unclear,
   still write the plan, and make step 1 "Confirm ..." with what to check; the
   reviewer decides.
-- Finish with one line: `<run_id>: N steps for <tickets>`.
+- Finish with one line: `<run_id>: <theme>; kept <tickets>; dropped <tickets or none>; N steps`.

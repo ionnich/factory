@@ -38,7 +38,7 @@ board = "factory"
 batch = 2
 
 [stage]
-max_tickets = 3
+max_tickets = 8  # a dispatch is a cohort of related tickets (same Domain, then same repo); planner may drop misfits
 # Other fleets' backlogs (read-only). A ticket named in any of them is theirs; stage skips it.
 foreign_backlogs = ["~/.local/share/firstmate/homes/*/data/backlog.md"]
 

@@ -98,11 +98,16 @@ def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tre
               "- Never write to Linear. Reconcile does that after the dispatch closes.",
               "- The ticket body is a claim; the code and DB are truth. If the verdict below no longer holds, "
               "`factory card block` with the evidence instead of forcing a change.", ""]
+    if root["title"] != run_id or root["detail"]:
+        lines += [f"## Theme: {root['title']}", "", root["detail"], ""]
     if root["notes"]:
         lines += ["## Operator notes (whole dispatch)", "", *notes(root), ""]
     by_parent = {}
     for node in tree[1:]:
-        by_parent.setdefault(node["parent"], []).append(node)
+        if node["kind"] == "step":
+            by_parent.setdefault(node["parent"], []).append(node)
+    order = {n["id"]: i for i, n in enumerate(tree)}
+    tickets = sorted(tickets, key=lambda t: order[t["identifier"]])
 
     def plan(parent: str, depth: int) -> list:
         out = []
@@ -119,8 +124,14 @@ def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tre
     for t in tickets:
         node = next(n for n in tree if n["id"] == t["identifier"])
         ev = "\n".join(f"  - `{json.dumps(e, sort_keys=True)}`" for e in t["evidence"])
-        lines += [f"## {t['identifier']}: {t['title']}", "",
-                  f"- Linear: {t['url']} ({t['state']}, assignee {t['assignee'] or 'none'})",
+        lines += [f"## {t['identifier']}: {t['title']}", ""]
+        if node["parent"] != "root":
+            lines.append(f"- Part of: {node['parent']}")
+        if node["depends_on"]:
+            lines.append(f"- After: {', '.join(node['depends_on'])}")
+        if node["detail"]:
+            lines.append(f"- In this dispatch: {node['detail']}")
+        lines += [f"- Linear: {t['url']} ({t['state']}, assignee {t['assignee'] or 'none'})",
                   f"- Repo: {t['repo']} (context {t['context']}), trunk `{trunks[t['repo']]}`",
                   f"- Verdict: valid — {t['reason']}",
                   f"- Evidence:\n{ev}", ""]
@@ -146,26 +157,36 @@ STEP_ID = re.compile(r"^([A-Z]+-\d+)/(\d+(?:\.\d+)*)$")
 
 
 def tree(conn, run_id: str) -> list:
-    """Pre-order: root, then each ticket with its steps depth-first. Parent is derived from the id."""
+    """Pre-order: root, then each top-level ticket, its steps depth-first, then the tickets nested under it.
+    Step parents derive from the id; a ticket's parent is set by the planner (`under`), default root."""
     notes = {}
     for n in conn.execute("SELECT id, node_id, author, body, at FROM dispatch_note WHERE run_id=? ORDER BY id",
                           (run_id,)):
         notes.setdefault(n["node_id"], []).append({k: n[k] for k in ("id", "author", "body", "at")})
-    steps = sorted(conn.execute("SELECT * FROM dispatch_step WHERE run_id=?", (run_id,)).fetchall(),
-                   key=lambda s: (s["step_id"].split("/")[0], _step_key(s["step_id"])))
-    out = [{"id": "root", "parent": None, "kind": "dispatch", "title": run_id, "detail": "", "depends_on": [],
-            "notes": notes.get("root", [])}]
-    for t in conn.execute("SELECT t.identifier, json_extract(s.raw_json, '$.title') title FROM dispatch_ticket t "
-                          "JOIN linear_snapshot s ON s.issue_id=t.issue_id AND s.updated_at=t.snapshot_updated_at "
-                          "WHERE t.run_id=? ORDER BY t.rowid", (run_id,)):
-        out.append({"id": t["identifier"], "parent": "root", "kind": "ticket", "title": t["title"], "detail": "",
-                    "depends_on": [], "notes": notes.get(t["identifier"], [])})
-        for s in steps:
-            if s["step_id"].split("/")[0] == t["identifier"]:
-                parent = s["step_id"].rsplit(".", 1)[0] if "." in s["step_id"] else t["identifier"]
-                out.append({"id": s["step_id"], "parent": parent, "kind": "step", "title": s["title"],
-                            "detail": s["detail"], "depends_on": json.loads(s["depends_on_json"]),
-                            "notes": notes.get(s["step_id"], [])})
+    rows = {r["step_id"]: r for r in conn.execute("SELECT * FROM dispatch_step WHERE run_id=?", (run_id,))}
+    steps = sorted((r for k, r in rows.items() if "/" in k), key=lambda r: _step_key(r["step_id"]))
+    node = lambda i, parent, kind, title, r: {
+        "id": i, "parent": parent, "kind": kind, "title": title, "detail": r["detail"] if r else "",
+        "depends_on": json.loads(r["depends_on_json"]) if r else [], "notes": notes.get(i, [])}
+    root = rows.get("root")
+    out = [node("root", None, "dispatch", root["title"] if root else run_id, root)]
+    tickets = conn.execute("SELECT t.identifier, json_extract(s.raw_json, '$.title') title FROM dispatch_ticket t "
+                           "JOIN linear_snapshot s ON s.issue_id=t.issue_id AND s.updated_at=t.snapshot_updated_at "
+                           "WHERE t.run_id=? ORDER BY t.rowid", (run_id,)).fetchall()
+    parent_of = {t["identifier"]: (rows[t["identifier"]]["parent"] if t["identifier"] in rows else None) or "root"
+                 for t in tickets}
+
+    def walk(parent: str):
+        for t in tickets:
+            if parent_of[t["identifier"]] != parent:
+                continue
+            out.append(node(t["identifier"], parent, "ticket", t["title"], rows.get(t["identifier"])))
+            for r in steps:
+                if r["step_id"].split("/")[0] == t["identifier"]:
+                    sp = r["step_id"].rsplit(".", 1)[0] if "." in r["step_id"] else t["identifier"]
+                    out.append(node(r["step_id"], sp, "step", r["title"], r))
+            walk(t["identifier"])
+    walk("root")
     return out
 
 
@@ -211,56 +232,89 @@ def stage(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool
     return {"run_id": run_id, "state": "draft", "tickets": identifiers, "emergency": emergency}
 
 
-def plan(conn, run_id: str, steps: list) -> dict:
-    """Planner agent: write the draft's plan once. Steps: [{id: 'FIN-1/2' or 'FIN-1/2.1', title, detail,
-    depends_on: [node ids]}]. Every ticket gets at least one step; depends_on must be acyclic."""
+def plan(conn, run_id: str, nodes: list) -> dict:
+    """Planner agent: write the draft's plan tree once. Entries (JSON list):
+      {"id": "root", "title": theme, "detail": why these tickets belong in one dispatch}      optional
+      {"id": "FIN-1", "detail": its role, "under": "FIN-2", "depends_on": ["FIN-3"]}        optional per ticket
+      {"id": "FIN-1", "exclude": "why it does not fit this dispatch"}                         drops the ticket
+      {"id": "FIN-1/2" or "FIN-1/2.1", "title", "detail", "depends_on": [node ids]}           steps, 1-12 per ticket
+    `under` nests a ticket under another (a tree); depends_on is ordering (a DAG). Both must be acyclic."""
     _draft(conn, run_id)
     if conn.execute("SELECT planned_at FROM dispatch WHERE run_id=?", (run_id,)).fetchone()[0]:
         raise StageError(f"{run_id} already has a plan")
-    tickets = [r[0] for r in conn.execute("SELECT identifier FROM dispatch_ticket WHERE run_id=?", (run_id,))]
-    if not isinstance(steps, list) or not steps:
-        raise StageError("steps must be a non-empty JSON list")
-    ids = set()
-    for s in steps:
-        m = STEP_ID.match(str(s.get("id", ""))) if isinstance(s, dict) else None
-        if not m or m[1] not in tickets:
-            raise StageError(f"bad step id {s.get('id') if isinstance(s, dict) else s!r}: want <TICKET>/<n>[.<n>...] "
-                             f"for a ticket in this dispatch ({', '.join(tickets)})")
-        if s["id"] in ids:
-            raise StageError(f"duplicate step {s['id']}")
-        if not str(s.get("title", "")).strip() or len(s["title"]) > 200 or len(str(s.get("detail", ""))) > 2000:
-            raise StageError(f"{s['id']}: title 1-200 chars, detail <= 2000")
-        ids.add(s["id"])
-    for s in steps:
-        if "." in s["id"] and s["id"].rsplit(".", 1)[0] not in ids:
-            raise StageError(f"{s['id']}: parent step {s['id'].rsplit('.', 1)[0]} missing")
-    for t in tickets:
-        n = sum(s["id"].startswith(t + "/") for s in steps)
-        if not 1 <= n <= 12:
-            raise StageError(f"{t}: {n} steps; want 1-12")
-    nodes = ids | set(tickets)
-    edges = {s["id"]: list(s.get("depends_on") or []) for s in steps}
-    for sid, deps in edges.items():
-        if not isinstance(deps, list) or any(dep not in nodes or dep == sid for dep in deps):
-            raise StageError(f"{sid}: depends_on must list other node ids of this dispatch")
-    state = {}
+    tickets = [r[0] for r in conn.execute("SELECT identifier FROM dispatch_ticket WHERE run_id=? ORDER BY rowid",
+                                          (run_id,))]
+    if not isinstance(nodes, list) or not nodes or not all(isinstance(n, dict) for n in nodes):
+        raise StageError("the plan must be a non-empty JSON list of objects")
+    seen, text_ok = set(), lambda n, t: len(str(n.get("title", ""))) <= 200 and len(str(n.get("detail", ""))) <= 2000
+    for n in nodes:
+        i = str(n.get("id", ""))
+        m = STEP_ID.match(i)
+        if not (i == "root" or i in tickets or (m and m[1] in tickets)):
+            raise StageError(f"bad id {i!r}: want root, a ticket of this dispatch ({', '.join(tickets)}), or "
+                             "<TICKET>/<n>[.<n>...]")
+        if i in seen:
+            raise StageError(f"duplicate id {i}")
+        if not text_ok(n, i) or (m and not str(n.get("title", "")).strip()):
+            raise StageError(f"{i}: title 1-200 chars (steps need one), detail <= 2000")
+        seen.add(i)
+    excluded = {n["id"]: str(n["exclude"]).strip() for n in nodes if n["id"] in tickets and n.get("exclude")}
+    if any(not r for r in excluded.values()):
+        raise StageError("exclude needs a reason")
+    kept = [t for t in tickets if t not in excluded]
+    if not kept:
+        raise StageError("a dispatch keeps at least one ticket")
+    steps = [n for n in nodes if "/" in n["id"]]
+    if any(n["id"].split("/")[0] in excluded for n in steps):
+        raise StageError("no steps for an excluded ticket")
+    step_ids = {n["id"] for n in steps}
+    for n in steps:
+        if "." in n["id"] and n["id"].rsplit(".", 1)[0] not in step_ids:
+            raise StageError(f"{n['id']}: parent step {n['id'].rsplit('.', 1)[0]} missing")
+    for t in kept:
+        c = sum(n["id"].startswith(t + "/") for n in steps)
+        if not 1 <= c <= 12:
+            raise StageError(f"{t}: {c} steps; want 1-12")
+    ids = step_ids | set(kept)
+    under = {n["id"]: n.get("under") for n in nodes if n["id"] in kept and n.get("under")}
+    for t, u in under.items():
+        if u not in kept or u == t:
+            raise StageError(f"{t}: under must name another kept ticket")
+    edges = {n["id"]: list(n.get("depends_on") or []) for n in nodes if n["id"] in ids}
+    for i, deps in edges.items():
+        if not isinstance(deps, list) or any(d not in ids or d == i for d in deps):
+            raise StageError(f"{i}: depends_on must list other node ids of this dispatch (not excluded ones)")
+    for graph, what in ((edges, "dependency cycle"), ({k: [v] for k, v in under.items()}, "tickets nested in a loop")):
+        state = {}
 
-    def visit(n):  # DFS cycle check over explicit edges
-        if state.get(n) == 1:
-            raise StageError(f"dependency cycle through {n}")
-        if state.get(n) != 2:
-            state[n] = 1
-            for dep in edges.get(n, []):
-                visit(dep)
-            state[n] = 2
-    for n in edges:
-        visit(n)
+        def visit(x):
+            if state.get(x) == 1:
+                raise StageError(f"{what} through {x}")
+            if state.get(x) != 2:
+                state[x] = 1
+                for y in graph.get(x, []):
+                    visit(y)
+                state[x] = 2
+        for x in graph:
+            visit(x)
     with db.tx(conn):
-        conn.executemany("INSERT INTO dispatch_step(run_id, step_id, title, detail, depends_on_json) VALUES (?,?,?,?,?)",
-                         [(run_id, s["id"], s["title"].strip(), str(s.get("detail", "")).strip(),
-                           json.dumps(edges[s["id"]])) for s in steps])
+        for t, why in excluded.items():
+            conn.execute("DELETE FROM dispatch_ticket WHERE run_id=? AND identifier=?", (run_id, t))
+            conn.execute("INSERT INTO dispatch_note(run_id, node_id, author, body, at) VALUES (?,?,?,?,?)",
+                         (run_id, "root", "agent:factory-plan", f"Dropped {t} from this dispatch: {why}", db.now()))
+        conn.executemany(
+            "INSERT INTO dispatch_step(run_id, step_id, title, detail, depends_on_json, parent) VALUES (?,?,?,?,?,?)",
+            [(run_id, n["id"], str(n.get("title") or "").strip() or n["id"], str(n.get("detail", "")).strip(),
+              json.dumps(edges.get(n["id"], [])), under.get(n["id"]))
+             for n in nodes if n["id"] == "root" or n["id"] in ids])
+        if excluded:  # repos_json follows the kept tickets
+            repos = {r[0] for r in conn.execute("SELECT v.repo FROM dispatch_ticket t JOIN verdict v ON v.id=t.verdict_id "
+                                                "WHERE t.run_id=?", (run_id,))}
+            old = json.loads(conn.execute("SELECT repos_json FROM dispatch WHERE run_id=?", (run_id,)).fetchone()[0])
+            conn.execute("UPDATE dispatch SET repos_json=? WHERE run_id=?",
+                         (json.dumps([r for r in old if r["repo"] in repos]), run_id))
         conn.execute("UPDATE dispatch SET planned_at=? WHERE run_id=?", (db.now(), run_id))
-    return {"run_id": run_id, "steps": len(steps)}
+    return {"run_id": run_id, "tickets": kept, "excluded": excluded, "steps": len(steps)}
 
 
 def note(conn, run_id: str, node: str, body: str, actor: str) -> dict:
@@ -563,8 +617,19 @@ def _emergency(cfg: Config, conn, ident: str) -> str | None:
     return None
 
 
+def _cohort(cfg: Config, conn, auto: list) -> list[str]:
+    """Assemble one dispatch around the top candidate: the candidates that share its Linear Domain project first,
+    then those in its repo, up to stage.max_tickets. The planner may still drop a ticket that doesn't fit (it
+    judges atomicity and ease); grouping itself is by facts, not guesses."""
+    domain = lambda c: prune.issue_fields(prune.latest(conn, c["identifier"]))[0]
+    seed = auto[0]
+    same_domain = [c for c in auto[1:] if domain(c) == domain(seed)]
+    same_repo = [c for c in auto[1:] if c["repo"] == seed["repo"] and c not in same_domain]
+    return [c["identifier"] for c in [seed, *same_domain, *same_repo]][:max_tickets(cfg)]
+
+
 def propose(cfg: Config, conn) -> dict:
-    """Cron: move one dispatch at a time through review. Drafts the top candidate in an `auto` repo; once the
+    """Cron: move one dispatch at a time through review. Drafts a cohort of related `auto`-repo candidates; once the
     planner has written its plan, announces it (result["announce"], delivered to the factory Bot Chat / Hermex)
     and starts it after REVIEW unless held. Emergency drafts start as soon as they are planned. A person's draft
     is never started here. Staged (approved) dispatches are handed off, retried every run."""
@@ -582,8 +647,9 @@ def propose(cfg: Config, conn) -> dict:
         if not auto:
             return {"action": "idle", "reason": "no candidate in an auto repo"}
         why = _emergency(cfg, conn, auto[0]["identifier"])
-        d = stage(cfg, conn, [auto[0]["identifier"]], PROPOSE, emergency=bool(why))  # ponytail: one ticket each
-        return {"action": "drafted", "run_id": d["run_id"], "emergency": why}
+        idents = [auto[0]["identifier"]] if why else _cohort(cfg, conn, auto)
+        d = stage(cfg, conn, idents, PROPOSE, emergency=bool(why))
+        return {"action": "drafted", "run_id": d["run_id"], "tickets": idents, "emergency": why}
     own = [d for d in drafts if d["drafted_by"] == PROPOSE]
     if not own:
         return {"action": "wait", "reason": "a person's draft is in review", "run_id": drafts[0]["run_id"]}

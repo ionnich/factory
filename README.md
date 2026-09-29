@@ -1,6 +1,6 @@
 # factory: software factory control plane
 
-Linear tickets in niko's domains are checked against code and data, frozen into small dispatches, executed by
+Linear tickets in niko's domains are checked against code and data, grouped into reviewed dispatches (cohorts of related tickets), executed by
 factory-fleet, and written back to Linear. `~/.hermes/factory.db` is the only authoritative tracker.
 
 ```
@@ -31,15 +31,17 @@ One-time, by hand:
   approval.
 - Chat: `hermes -p factory`, also on the iPhone through Hermex (Bot Mode, factory profile). It shows drafts,
   takes notes ("note FIN-3788/2: …"), holds, rejects, and approves (Hermes approval prompt).
-- Review: `factory stage` makes a **draft**. `factory-plan` (agent, every 10m) writes its plan tree: steps per
-  ticket (`FIN-1/2`, nested `FIN-1/2.1`) with `depends_on` edges. You add notes to the dispatch (`root`), a ticket
+- Review: `factory stage` makes a **draft**. `factory-plan` (agent, every 10m) writes its plan tree: a theme,
+  tickets nested under the ones they build on (misfits dropped with a reason), steps per ticket (`FIN-1/2`,
+  nested `FIN-1/2.1`) with `depends_on` edges. You add notes to the dispatch (`root`), a ticket
   or a step; `factory draft approve` renders plan + notes into the immutable `dispatch.md`, where notes bind the
   executor. `draft hold` stops the auto-start clock; `draft reject` archives the draft as a record, and its
   tickets are not drafted again until their verdict changes. Approval re-checks every ticket: one that changed
   during review voids the draft.
-- Autonomous: `factory-propose` (every 10m) drafts the top candidate in a repo with `auto = true` (one ticket),
-  announces it once planned to the factory Bot Chat (Hermex), and approves it itself 2h later unless held.
-  **Emergency** (no review window): the ticket is Urgent in Linear (a person set it) and its verdict evidence
+- Autonomous: `factory-propose` (every 10m) drafts a cohort in `auto = true` repos: the top candidate plus those
+  sharing its Linear Domain, then its repo (up to `stage.max_tickets`); the planner shapes it into a tree and may
+  drop misfits; announces it once planned to the factory Bot Chat (Hermex), and approves it itself 2h later unless held.
+  **Emergency** (no review window, a one-ticket dispatch): the ticket is Urgent in Linear (a person set it) and its verdict evidence
   touches at most 3 files. A person's draft is never started by the cron. It also hands off approved dispatches.
   Stop it with `hermes cron pause factory-propose`.
 - Backups: `factory-backup` (03:00) writes `~/.hermes/factory/backups/factory-YYYY-MM-DD.db` (newest 14), and every
