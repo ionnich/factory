@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from factory import db, dispatch
+from factory import db, decide, dispatch
 
 SNAP = "2026-09-01T00:00:00Z"
 
@@ -23,10 +23,12 @@ class Review(unittest.TestCase):
                        "VALUES ('d1','draft','[]','x',?,?,?)", (SNAP, dispatch.PROPOSE, SNAP))
         self.c.execute("INSERT INTO dispatch_ticket(run_id,issue_id,identifier,snapshot_updated_at,verdict_id) "
                        "VALUES ('d1','i1','FIN-1',?,1)", (SNAP,))
+        self.review = decide.review(self.c, "d1", "approve", "plan written", "t")
         self.cfg = SimpleNamespace(repos={}, raw={})
 
     def propose(self):
-        with mock.patch.object(dispatch, "approve", return_value={}) as ap:
+        with mock.patch.object(dispatch, "approve", return_value={}) as ap, \
+                mock.patch.object(dispatch, "start", return_value={}):
             res = dispatch.propose(self.cfg, self.c)
         return res, ap
 
@@ -55,7 +57,7 @@ class Review(unittest.TestCase):
         self.assertEqual(res["action"], "in-review")
         self.assertNotIn("announce", res)
         self.c.execute("UPDATE dispatch SET review_until=? WHERE run_id='d1'", (SNAP,))  # window elapsed
-        dispatch.hold(self.c, "d1", "reading it", "u")
+        decide.choose(self.cfg, self.c, self.review, "hold", "u", note="reading it")
         res, ap = self.propose()
         self.assertEqual(res["action"], "held")
         ap.assert_not_called()
@@ -63,6 +65,18 @@ class Review(unittest.TestCase):
         res, ap = self.propose()
         self.assertEqual(res["action"], "started")
         ap.assert_called_once()
+
+    def test_window_end_takes_the_recommendation_even_when_it_is_not_approve(self):
+        decide.void(self.c, "id=?", (self.review,), "replaced for the test")
+        decide.review(self.c, "d1", "hold", "the plan guesses the schema", "agent:factory-plan")
+        self.c.execute("UPDATE dispatch SET review_until=? WHERE run_id='d1'", (SNAP,))
+        res, ap = self.propose()
+        self.assertEqual(res["action"], "hold")
+        ap.assert_not_called()
+        self.assertIn("the plan guesses the schema", self.c.execute("SELECT held_reason FROM dispatch").fetchone()[0])
+        held = decide.open_review(self.c, "d1")  # held: approve or reject, and no clock any more
+        self.assertEqual([o["id"] for o in held["options"]], ["approve", "reject"])
+        self.assertIsNone(held["deadline"])
 
     def test_plan_is_a_dag_under_the_dispatch_tickets(self):
         self.c.execute("UPDATE dispatch SET planned_at=NULL WHERE run_id='d1'")

@@ -12,22 +12,28 @@ absolute path: `~/.local/bin/factory`.
 ## 1. Take the dispatch
 
 ```sh
-~/.local/bin/factory status <run_id>        # state must be staged, hash_ok true
+~/.local/bin/factory status <run_id>        # state staged (or executing: a restart), hash_ok true
 ~/.local/bin/factory execute <run_id> --actor factory-primary
 ```
 
 `execute` refuses outside herdr workspace `factory`, on a changed file, or while
 another dispatch executes. A refusal ends this skill: report it, change nothing.
 
+**Restart.** If the state is already `executing`, the captain chose "restart the
+executor" and this is a fresh session: `execute` re-attaches this pane. Skip
+cards that are `done` or `blocked`; for `running` cards, read the secondmate's
+status and the card comments (`factory status <run_id>`) before routing anything
+again, so no ticket gets two owners.
+
 Read `dispatch.md` in full. Each `## FIN-…` section is one card: repo, trunk
 SHA, the verdict and its evidence, operator notes, the reviewed **Plan** (steps
 `FIN-…/n` with `after …` dependencies), then the ticket body (a claim, not truth).
 
-The dispatch was reviewed by the captain before approval. **Operator notes are
-binding**: the dispatch-level notes and each ticket's and step's notes override
-the plan and the ticket body. Carry the plan and every note into the
-secondmate hand-off verbatim; a note that cannot be followed is a block, not a
-judgement call.
+The dispatch was reviewed by the captain before approval. **Operator notes and
+answered questions are binding**: the dispatch-level notes, each ticket's and
+step's notes, and the "Answered questions" section override the plan and the
+ticket body. Carry the plan, every note and every answer into the secondmate
+hand-off verbatim; one that cannot be followed is a block, not a judgement call.
 
 ## 2. Route every card
 
@@ -58,12 +64,27 @@ When a secondmate returns:
   The CLI refuses unless the PR is in the ticket's repo, merged, and checks are
   green. If it refuses, send the refusal back to the secondmate; do not retry
   with a different PR.
-- **Cannot land** (verdict wrong, needs a captain decision, blocked by another
-  domain): `factory card block <run_id> <ID> --body "<evidence>"`.
+- **Cannot land** (verdict wrong, blocked by another domain):
+  `factory card block <run_id> <ID> --body "<evidence>"`. The captain is then
+  asked whether to write it back or retry it later; nothing more for you to do.
 
-A PR that needs the captain's merge (for example `no-mistakes-prod-only`
-repos) stays running until merged; ask the captain once, in plain words, with
-the full PR URL.
+## Asking the captain
+
+When only the captain can decide (a PR that needs their merge, a choice the plan
+and notes don't settle), ask through the factory, never in prose alone:
+
+```sh
+~/.local/bin/factory decide ask <run_id> --node FIN-123/2 \
+  --question "PR #61 needs a prod-only merge. Who merges?" \
+  --option "me|You merge it|the PR lands once you merge; I mark the card done after" \
+  --option "wait|Leave it open|the card stays running until you look" \
+  --recommend me --why "checks are green and the change is two lines"
+```
+
+Every question has 2-5 options (`id|label|what it leads to`) and your
+recommendation with why. Keep working on other cards meanwhile; the answer is
+typed into this session as `Answer to factory decision #N (...)`. Act on it, and
+record what you did with `factory card comment`.
 
 ## 4. Close
 

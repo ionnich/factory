@@ -1,6 +1,6 @@
 """Factory tab backend. Every figure and every action goes through the `factory` CLI (single source of
 truth, which enforces the invariants) plus Hermes's own cron job records. Writes: stage (a draft), draft notes,
-approve/hold/reject a draft, resolve flag. The dashboard sits behind Hermes login on the tailnet, so a click by
+and answering decisions (approve/hold/reject a draft, questions, blocked tickets, held Linear writes, executor). The dashboard sits behind Hermes login on the tailnet, so a click by
 the logged-in user is the human approval. POSTs take JSON bodies only (a cross-site form or no-cors fetch can't
 send application/json)."""
 import asyncio
@@ -55,8 +55,10 @@ def jobs() -> list[dict]:
 @router.get("/overview")
 async def overview():
     status, tickets, candidates = await asyncio.gather(factory("status"), factory("tickets"), factory("candidates"))
-    runs = [d["run_id"] for d in status["dispatches"] if RUN_ID.match(d["run_id"])]
-    dispatches = await asyncio.gather(*(factory("status", r) for r in runs))
+    # live dispatches, plus finished ones something still waits on you for (e.g. a blocked ticket)
+    runs = list(dict.fromkeys([d["run_id"] for d in status["dispatches"]] +
+                              [x["run_id"] for x in status["decisions"] if x["run_id"] and x["kind"] == "blocked"]))
+    dispatches = await asyncio.gather(*(factory("status", r) for r in runs if RUN_ID.match(r)))
     return {"status": status, "tickets": tickets, "candidates": candidates, "dispatches": dispatches, "jobs": jobs()}
 
 
@@ -69,16 +71,9 @@ class Note(BaseModel):
     body: str = Field(min_length=1, max_length=4000)
 
 
-class Reason(BaseModel):
-    reason: str = Field(min_length=1, max_length=4000)
-
-
-class Approve(BaseModel):  # empty, but its presence makes the route demand a JSON body
-    pass
-
-
-class Resolve(BaseModel):
-    resolution: str = Field(min_length=1, max_length=2000)
+class Choice(BaseModel):
+    option: str = Field(min_length=1, max_length=40, pattern=r"^[\w-]+$")
+    note: str | None = Field(default=None, max_length=4000)
 
 
 @router.post("/stage")
@@ -110,30 +105,12 @@ async def draft_note(run_id: str, body: Note):
                          f"--body={text_ok(body.body, 'note')}", "--actor", "user:dashboard")
 
 
-@router.post("/drafts/{run_id}/approve")
-async def draft_approve(run_id: str, body: Approve):
-    # freezes and hands off; may have to start the executor agent
-    return await factory("draft", "approve", run_id_ok(run_id), "--actor", "user:dashboard", timeout=240)
-
-
-@router.post("/drafts/{run_id}/hold")
-async def draft_hold(run_id: str, body: Reason):
-    return await factory("draft", "hold", run_id_ok(run_id), f"--reason={text_ok(body.reason, 'reason')}",
-                         "--actor", "user:dashboard")
-
-
-@router.post("/drafts/{run_id}/reject")
-async def draft_reject(run_id: str, body: Reason):
-    return await factory("draft", "reject", run_id_ok(run_id), f"--reason={text_ok(body.reason, 'reason')}",
-                         "--actor", "user:dashboard")
-
-
-@router.post("/flags/{flag_id}/resolve")
-async def resolve_flag(flag_id: int, body: Resolve):
-    text = body.resolution.strip()
-    if not text:
-        raise HTTPException(422, "resolution is empty")
-    return await factory("flag", "resolve", str(flag_id), f"--resolution={text}")
+@router.post("/decisions/{decision_id}")
+async def choose(decision_id: int, body: Choice):
+    # an approval freezes and hands off, and may have to start the executor agent first
+    note = [f"--note={text_ok(body.note, 'note')}"] if body.note and body.note.strip() else []
+    return await factory("decide", "choose", str(decision_id), body.option, *note, "--actor", "user:dashboard",
+                         timeout=300)
 
 
 @router.get("/metrics")

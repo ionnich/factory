@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from factory import db
+from factory import db, decide
 from factory.dispatch import StageError
 from factory.reconcile import _COMPLETION, resolve, state_gate
 
@@ -49,8 +49,8 @@ class Resolve(unittest.TestCase):
                                                "Commit: " + "a" * 40 + "\n"}, "apply"),
                 ("state", {"state": "Canceled"}, "apply")]
         for op, payload, decision in rows:
-            self.c.execute("INSERT INTO writeback VALUES ('r','i1',?,?,?,'dup',NULL,'planned',NULL)",
-                           (op, json.dumps(payload), decision))
+            self.c.execute("INSERT INTO writeback(run_id, issue_id, op, payload_json, decision, rule, status) "
+                           "VALUES ('r','i1',?,?,?,'dup','planned')", (op, json.dumps(payload), decision))
 
     def test_prose_must_keep_every_reference(self):
         with self.assertRaises(StageError):
@@ -70,6 +70,22 @@ class Resolve(unittest.TestCase):
             resolve(self.c, "r", "FIN-1", "state", None, "again")
         with self.assertRaises(sqlite3.DatabaseError):  # raw SQL cannot upgrade either
             self.c.execute("UPDATE writeback SET decision='apply' WHERE op='state'")
+
+    def test_person_may_apply_a_held_write_and_the_agent_cannot_hold_it_again(self):
+        resolve(self.c, "r", "FIN-1", "state", None, "reconcile agent: owner objected")
+        did = decide.writeback(self.c, "r", "i1", "state", {"state": "Canceled"}, "reconcile agent: owner objected")
+        self.assertEqual(decide.one(self.c, did)["recommended"], "skip")
+        decide.choose(None, self.c, did, "apply", "user")
+        w = self.c.execute("SELECT decision, status, approved_by FROM writeback WHERE op='state'").fetchone()
+        self.assertEqual(tuple(w), ("apply", "planned", "user"))
+        with self.assertRaises(StageError):
+            resolve(self.c, "r", "FIN-1", "state", None, "still doubtful")
+        with self.assertRaises(StageError):  # answered once
+            decide.choose(None, self.c, did, "skip", "user")
+
+    def test_a_code_gate_hold_offers_no_apply(self):
+        did = decide.writeback(self.c, "r", "i1", "state", {"state": "Canceled"}, "assigned to someone@else")
+        self.assertEqual([o["id"] for o in decide.one(self.c, did)["options"]], ["skip", "manual"])
 
 
 class CompletionBlock(unittest.TestCase):

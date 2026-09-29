@@ -9,7 +9,7 @@ import statistics
 import sys
 from datetime import UTC, datetime, timedelta
 
-from . import config, db, dispatch, linear, prune, reconcile, repos, witness
+from . import config, db, decide, dispatch, linear, prune, reconcile, repos, witness
 
 
 def out(obj) -> None:
@@ -75,14 +75,24 @@ def cmd_draft(cfg, conn, a):
         except json.JSONDecodeError as e:
             raise dispatch.StageError(f"--steps is not JSON: {e}")
         return out(dispatch.plan(conn, a.run_id, steps))
-    if a.dcmd == "note":
-        return out(dispatch.note(conn, a.run_id, a.node, a.body, a.actor))
-    if a.dcmd == "hold":
-        return out(dispatch.hold(conn, a.run_id, a.reason, a.actor))
-    if a.dcmd == "reject":
-        return out(dispatch.reject(cfg, conn, a.run_id, a.reason, a.actor))
-    ingest(cfg, conn)  # approve: check the tickets against Linear as it is now
-    return out(dispatch.approve(cfg, conn, a.run_id, a.actor))
+    return out(dispatch.note(conn, a.run_id, a.node, a.body, a.actor))
+
+
+def cmd_decide(cfg, conn, a):
+    if a.xcmd == "list":
+        return out(decide.rows(conn, a.run_id, open_only=not a.all))
+    if a.xcmd == "ask":
+        opts = []
+        for o in a.option:
+            parts = [p.strip() for p in o.split("|")]
+            if len(parts) != 3 or not all(parts):
+                raise dispatch.StageError(f"--option {o!r}: want 'id|label|what it leads to'")
+            opts.append(decide.option(*parts))
+        return out(decide.ask(conn, a.run_id, a.node, a.question, opts, a.recommend, a.why, a.actor))
+    d = decide.one(conn, a.id)
+    if d and d["kind"] == "review" and a.option == "approve":
+        ingest(cfg, conn)  # approve: check the tickets against Linear as it is now
+    return out(decide.choose(cfg, conn, a.id, a.option, a.actor, a.note))
 
 
 def cmd_backup(cfg, conn, a):
@@ -149,7 +159,7 @@ def cmd_reconcile(cfg, conn, a):
     # for runs with unsent rows.
     for (run_id,) in conn.execute("SELECT run_id FROM dispatch WHERE state='reconciled'").fetchall():
         dispatch.archive(cfg, conn, run_id)
-    dispatch.watch(cfg, conn)  # stuck / executor-gone flags
+    dispatch.watch(cfg, conn)  # stuck / executor-gone decisions
     ingest(cfg, conn)
     for (run_id,) in conn.execute("SELECT run_id FROM dispatch WHERE state='done'").fetchall():
         reconcile.plan(cfg, conn, run_id)
@@ -161,15 +171,6 @@ def cmd_reconcile(cfg, conn, a):
 
 def cmd_archive(cfg, conn, a):
     out(dispatch.archive(cfg, conn, a.run_id))
-
-
-def cmd_flag_resolve(cfg, conn, a):
-    with db.tx(conn):
-        n = conn.execute("UPDATE flag SET resolved_at=?, resolution=? WHERE id=? AND resolved_at IS NULL",
-                         (db.now(), a.resolution, a.id)).rowcount
-    if not n:
-        raise dispatch.StageError(f"no open flag {a.id}")
-    out({"flag": a.id, "resolved": True})
 
 
 def cmd_sync(cfg, conn, a):
@@ -198,11 +199,7 @@ def cmd_status(cfg, conn, a):
                       "(SELECT value FROM json_each(?)) GROUP BY kind", json.dumps(ids)),
         "dispatches": q("SELECT run_id, state, staged_at, executing_at, done_at FROM dispatch "
                         "WHERE state <> 'archived' ORDER BY created_at"),
-        "open_flags": q("SELECT f.id, f.run_id, f.issue_id, f.kind, f.created_at, l.identifier, "
-                        "json_extract(l.raw_json, '$.title') title, json_extract(l.raw_json, '$.url') url, "
-                        "json_extract(f.detail_json, '$.op') op, "
-                        "coalesce(json_extract(f.detail_json, '$.reason'), json_extract(f.detail_json, '$.stderr')) reason "
-                        "FROM flag f LEFT JOIN linear_latest l USING (issue_id) WHERE f.resolved_at IS NULL ORDER BY f.id"),
+        "decisions": decide.rows(conn),  # everything waiting on a person, with options and a recommendation
         "kanban": cfg.kanban,
         # Last stage of the lifecycle: what the factory closed out recently.
         "archived": q("SELECT d.run_id, d.archived_at, group_concat(t.identifier, ', ') tickets, "
@@ -235,6 +232,8 @@ def dispatch_status(cfg, conn, run_id):
             "SELECT identifier, card_status, kanban_card_id, pr_url FROM dispatch_ticket WHERE run_id=?", (run_id,))],
         "transitions": [dict(r) for r in conn.execute(
             "SELECT from_state, to_state, actor, at FROM transition_log WHERE run_id=? ORDER BY id", (run_id,))],
+        "decisions": decide.rows(conn, run_id, open_only=False),
+        "writes": reconcile.show(conn, run_id)["writes"],  # what reconcile wrote (or holds) in Linear
     }
 
 
@@ -338,7 +337,7 @@ def main(argv=None):
                                         "the review window (emergency: at once); hand off approved dispatches")
     s.add_argument("--announce", action="store_true", help="print only the announcement text (for cron delivery)")
     s.set_defaults(fn=cmd_propose)
-    dr = sub.add_parser("draft", help="review a draft dispatch: plan, notes, approve, hold, reject").add_subparsers(
+    dr = sub.add_parser("draft", help="a draft dispatch's plan and notes (approve/hold/reject: `decide`)").add_subparsers(
         dest="dcmd", required=True)
     s = dr.add_parser("plan", help="planner agent: write the plan tree once")
     s.add_argument("run_id")
@@ -348,16 +347,27 @@ def main(argv=None):
     s.add_argument("--node", default="root")
     s.add_argument("--body", required=True)
     s.add_argument("--actor", default="user")
-    for name, hlp in (("hold", "stop the auto-start clock until approved"), ("reject", "discard the draft")):
-        s = dr.add_parser(name, help=hlp)
-        s.add_argument("run_id")
-        s.add_argument("--reason", required=True)
-        s.add_argument("--actor", default="user")
-    s = dr.add_parser("approve", help="freeze the draft (plan + notes) into dispatch.md and start it")
-    s.add_argument("run_id")
-    s.add_argument("--actor", default="user")
     dr.add_parser("gate", help="Hermes pre-check for the factory-plan job (last line = wakeAgent JSON)")
     sub.choices["draft"].set_defaults(fn=cmd_draft)
+    x = sub.add_parser("decide", help="decisions waiting on a person: options, what each leads to, a recommendation"
+                       ).add_subparsers(dest="xcmd", required=True)
+    s = x.add_parser("list", help="open decisions (JSON), or all of one dispatch with --all")
+    s.add_argument("run_id", nargs="?")
+    s.add_argument("--all", action="store_true", help="answered and withdrawn ones too")
+    s = x.add_parser("choose", help="answer a decision; its effect runs (review approve starts the dispatch)")
+    s.add_argument("id", type=int)
+    s.add_argument("option")
+    s.add_argument("--note", help="the text an option asks for (a reason, guidance)")
+    s.add_argument("--actor", default="user")
+    s = x.add_parser("ask", help="executor: ask the captain mid-run; the answer is typed into the executor pane")
+    s.add_argument("run_id")
+    s.add_argument("--node", default="root", help="root, a ticket id or a step id")
+    s.add_argument("--question", required=True)
+    s.add_argument("--option", action="append", required=True, help="'id|label|what it leads to' (2-5 times)")
+    s.add_argument("--recommend", required=True, help="the option id you recommend")
+    s.add_argument("--why", required=True, help="why you recommend it")
+    s.add_argument("--actor", default="executor")
+    sub.choices["decide"].set_defaults(fn=cmd_decide)
     s = sub.add_parser("backup", help="consistent, integrity-checked copy of factory.db; keeps the newest N")
     s.add_argument("--keep", type=int, default=14)
     s.set_defaults(fn=cmd_backup)
@@ -385,7 +395,7 @@ def main(argv=None):
     s.add_argument("--op", required=True, choices=("state", "comment", "description", "create"))
     s.add_argument("--body", help="new prose; must keep every URL, commit and ticket id of the draft")
     s.add_argument("--flag", help="downgrade this write to a flag for the user, with the reason")
-    s = r.add_parser("apply", help="send planned writes (gates re-checked live), raise flags, close the run")
+    s = r.add_parser("apply", help="send planned writes (gates re-checked live), ask about held ones, close the run")
     s.add_argument("run_id")
     s = r.add_parser("followup", help="queue a new ticket split out of an owned one; reconcile creates it")
     s.add_argument("parent")
@@ -398,11 +408,6 @@ def main(argv=None):
     s = sub.add_parser("archive", help="reconciled -> archived; move to _archived/ and commit")
     s.add_argument("run_id")
     s.set_defaults(fn=cmd_archive)
-    fl = sub.add_parser("flag", help="flags raised for the user").add_subparsers(dest="fcmd", required=True)
-    s = fl.add_parser("resolve", help="mark a flag handled, with what was decided (never writes Linear)")
-    s.add_argument("id", type=int)
-    s.add_argument("--resolution", required=True)
-    s.set_defaults(fn=cmd_flag_resolve)
     v = sub.add_parser("verdict").add_subparsers(dest="vcmd", required=True)
     s = v.add_parser("put", help="record a verdict with evidence (JSON list from file or -)")
     s.add_argument("identifier")

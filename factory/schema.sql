@@ -257,7 +257,8 @@ BEGIN SELECT RAISE(ABORT, 'card_event is append-only'); END;
 
 -- ---------------------------------------------------------------- reconcile
 -- One row per planned Linear write. Only `factory reconcile apply` sends; the reconcile agent may edit
--- comment/description prose and downgrade apply -> flag, nothing else.
+-- comment/description prose and downgrade apply -> flag, nothing else. A held (flag) write goes back to apply
+-- only when a person chose "apply anyway" on its decision (approved_by).
 CREATE TABLE writeback (
   run_id       TEXT NOT NULL,               -- dispatch run_id, or sweep-<ts> for verdict write-backs
   issue_id     TEXT NOT NULL,
@@ -268,11 +269,13 @@ CREATE TABLE writeback (
   reason       TEXT,
   status       TEXT NOT NULL CHECK (status IN ('planned', 'sent', 'confirmed', 'failed')),
   linear_ref   TEXT,
+  approved_by  TEXT,
   PRIMARY KEY (run_id, issue_id, op)
 );
 CREATE TRIGGER writeback_no_upgrade BEFORE UPDATE OF decision ON writeback
 WHEN NEW.decision IS NOT OLD.decision AND NOT (OLD.decision = 'apply' AND NEW.decision = 'flag')
-BEGIN SELECT RAISE(ABORT, 'writeback decision may only be downgraded apply -> flag'); END;
+  AND NOT (OLD.decision = 'flag' AND NEW.decision = 'apply' AND OLD.approved_by IS NULL AND NEW.approved_by IS NOT NULL)
+BEGIN SELECT RAISE(ABORT, 'writeback decision may only be downgraded apply -> flag, or re-applied by a person'); END;
 
 -- updatedAt values produced by reconcile's own writes: not a ticket change, so no re-verification.
 CREATE TABLE linear_own_write (
@@ -281,13 +284,58 @@ CREATE TABLE linear_own_write (
   PRIMARY KEY (issue_id, updated_at)
 );
 
-CREATE TABLE flag (
-  id          INTEGER PRIMARY KEY,
-  run_id      TEXT,
-  issue_id    TEXT,
-  kind        TEXT NOT NULL,
-  detail_json TEXT NOT NULL CHECK (json_valid(detail_json)),
-  created_at  TEXT NOT NULL,
-  resolved_at TEXT,
-  resolution  TEXT
+-- ---------------------------------------------------------------- decisions
+-- Every choice the factory needs from a person: >= 2 options, each saying what it leads to, one recommended
+-- with why. Answered once (chosen) or withdrawn once when the question stops applying (void); never edited.
+-- node_id places it in its dispatch's graph (root, a ticket id, a step id); run_id may be a sweep-/followup- run.
+CREATE TABLE decision (
+  id           INTEGER PRIMARY KEY,
+  run_id       TEXT,
+  node_id      TEXT NOT NULL DEFAULT 'root',
+  issue_id     TEXT,
+  kind         TEXT NOT NULL CHECK (kind IN
+    ('review', 'plan', 'blocked', 'executor-gone', 'dispatch-stuck', 'writeback', 'ask')),
+  ref          TEXT,                         -- kind-specific key, e.g. the writeback op
+  question     TEXT NOT NULL CHECK (length(trim(question)) > 0),
+  options_json TEXT NOT NULL CHECK (json_valid(options_json) AND json_array_length(options_json) >= 2),
+  recommended  TEXT NOT NULL,
+  why          TEXT NOT NULL CHECK (length(trim(why)) > 0),
+  detail_json  TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(detail_json)),
+  created_at   TEXT NOT NULL,
+  created_by   TEXT NOT NULL,
+  chosen       TEXT,
+  chosen_by    TEXT,
+  chosen_at    TEXT,
+  chosen_note  TEXT,                         -- text an option asks for (a reason, guidance)
+  void_reason  TEXT,
+  void_at      TEXT,
+  CHECK ((chosen IS NULL) = (chosen_by IS NULL) AND (chosen IS NULL) = (chosen_at IS NULL)),
+  CHECK ((void_reason IS NULL) = (void_at IS NULL) AND (chosen IS NULL OR void_reason IS NULL))
 );
+CREATE INDEX decision_open ON decision(run_id) WHERE chosen IS NULL AND void_reason IS NULL;
+CREATE TRIGGER decision_valid BEFORE INSERT ON decision
+WHEN NEW.chosen IS NOT NULL OR NEW.void_reason IS NOT NULL
+  OR EXISTS (SELECT 1 FROM json_each(NEW.options_json) WHERE json_type(value) <> 'object'
+             OR length(trim(coalesce(json_extract(value, '$.id'), ''))) = 0
+             OR length(trim(coalesce(json_extract(value, '$.label'), ''))) = 0
+             OR length(trim(coalesce(json_extract(value, '$.leads_to'), ''))) = 0)
+  OR (SELECT count(DISTINCT json_extract(value, '$.id')) FROM json_each(NEW.options_json))
+     <> json_array_length(NEW.options_json)
+  OR NOT EXISTS (SELECT 1 FROM json_each(NEW.options_json) WHERE json_extract(value, '$.id') = NEW.recommended)
+BEGIN SELECT RAISE(ABORT, 'a decision needs >= 2 distinct options (id, label, leads_to) and recommends one of them'); END;
+CREATE TRIGGER decision_answer_once BEFORE UPDATE ON decision
+WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
+  OR NEW.run_id IS NOT OLD.run_id OR NEW.node_id IS NOT OLD.node_id OR NEW.issue_id IS NOT OLD.issue_id
+  OR NEW.kind IS NOT OLD.kind OR NEW.ref IS NOT OLD.ref OR NEW.question IS NOT OLD.question
+  OR NEW.options_json IS NOT OLD.options_json OR NEW.recommended IS NOT OLD.recommended OR NEW.why IS NOT OLD.why
+  OR NEW.detail_json IS NOT OLD.detail_json OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.created_by IS NOT OLD.created_by
+  OR (NEW.chosen IS NULL AND NEW.void_reason IS NULL)
+  OR (NEW.chosen IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(OLD.options_json)
+                                             WHERE json_extract(value, '$.id') = NEW.chosen))
+  OR (NEW.chosen IS NOT NULL AND length(trim(coalesce(NEW.chosen_note, ''))) = 0
+      AND EXISTS (SELECT 1 FROM json_each(OLD.options_json)
+                  WHERE json_extract(value, '$.id') = NEW.chosen AND json_extract(value, '$.note') IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'a decision is answered (with one of its options, and the text it asks for) or withdrawn once'); END;
+CREATE TRIGGER decision_no_delete BEFORE DELETE ON decision
+BEGIN SELECT RAISE(ABORT, 'decisions are never deleted'); END;

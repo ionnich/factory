@@ -2,10 +2,10 @@
 
 Rules (code, not prompt):
 - Dispatch card done   -> state review_state + Completion block in the description (finks-ddd).
-- Dispatch card blocked -> comment with the reason + flag; state untouched.
+- Dispatch card blocked -> comment with the reason; state untouched (the block's own decision asks what next).
 - already-done verdict -> state done_state + comment;   duplicate-of -> canceled_state + comment naming the target.
   State writes only when the verdict is fresh against Linear's current updatedAt AND the ticket is unassigned
-  or assigned to linear.lead; otherwise comment + flag.
+  or assigned to linear.lead; otherwise comment + a held write, which becomes a decision for the user.
 - needs-clarification / invalid-references / valid / stale: never written.
 Every gate is re-checked against a live read immediately before each state write.
 """
@@ -15,7 +15,8 @@ from datetime import UTC, datetime
 
 from . import db, linear, prune
 from .config import Config
-from .dispatch import StageError, flag
+from . import decide
+from .dispatch import StageError
 
 ISSUE_QUERY = "query($id: String!) { issue(id: $id) { %s } }" % linear.ISSUE_FIELDS
 STATES_QUERY = "query($id: String!) { team(id: $id) { states { nodes { id name type } } } }"
@@ -71,7 +72,6 @@ def _dispatch_rows(cfg: Config, conn, run_id: str) -> list:
             rows.append(_row(run_id, t["issue_id"], "comment",
                              {"body": f"Factory dispatch {run_id} stopped on this ticket: {ev['body']}"},
                              "apply", "card-blocked"))
-            rows.append(_row(run_id, t["issue_id"], "state", {}, "flag", "card-blocked", ev["body"]))
     return rows
 
 
@@ -149,7 +149,8 @@ def show(conn, run_id: str) -> dict:
 
 
 def resolve(conn, run_id: str, identifier: str, op: str, body: str | None, flag_reason: str | None) -> dict:
-    """Agent edits: prose of comment/description rows, or downgrade apply -> flag. Nothing else."""
+    """Agent edits: prose of comment/description rows, or downgrade apply -> flag. Nothing else, and never a write
+    a person chose to apply."""
     w = conn.execute("SELECT w.* FROM writeback w JOIN linear_latest l USING (issue_id) "
                      "WHERE w.run_id=? AND l.identifier=? AND w.op=?", (run_id, identifier, op)).fetchone()
     if w is None or w["status"] != "planned":
@@ -168,6 +169,8 @@ def resolve(conn, run_id: str, identifier: str, op: str, body: str | None, flag_
             conn.execute("UPDATE writeback SET payload_json=? WHERE run_id=? AND issue_id=? AND op=?",
                          (json.dumps({**payload, key: body}), run_id, w["issue_id"], op))
         if flag_reason is not None:  # writeback_no_upgrade trigger also refuses anything but apply -> flag
+            if w["approved_by"]:
+                raise StageError(f"{w['approved_by']} chose to apply this {op} write; it is not held again")
             if w["decision"] != "apply":
                 raise StageError(f"{op} write for {identifier} is already {w['decision']}")
             conn.execute("UPDATE writeback SET decision='flag', reason=? WHERE run_id=? AND issue_id=? AND op=?",
@@ -187,7 +190,7 @@ def _state_id(cfg: Config, issue: dict, name: str, cache: dict) -> str:
 
 
 def apply(cfg: Config, conn, run_id: str) -> dict:
-    """Send planned apply rows (state first: a comment would bump updatedAt), raise flags, close the run."""
+    """Send planned apply rows (state first: a comment would bump updatedAt), ask about held ones, close the run."""
     order = "CASE op WHEN 'state' THEN 0 WHEN 'description' THEN 1 WHEN 'create' THEN 2 ELSE 3 END"
     states: dict = {}
     touched: set[str] = set()
@@ -233,8 +236,8 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
                     r = r["commentCreate"]
                     conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
                                  ("confirmed" if r["success"] else "failed", r["comment"]["id"], *key))
-            if decision == "flag":
-                flag(conn, run_id, w["issue_id"], f"reconcile:{w['rule']}", {"op": w["op"], "reason": reason, **p})
+            if decision == "flag":  # held: the user decides (apply anyway / skip / do it in Linear)
+                decide.writeback(conn, run_id, w["issue_id"], w["op"], p, reason)
             if decision in ("flag", "skip"):
                 conn.execute("UPDATE writeback SET status='confirmed' WHERE run_id=? AND issue_id=? AND op=?", key)
         except Exception as e:  # one bad write never blocks the rest; failed rows retry on the next apply

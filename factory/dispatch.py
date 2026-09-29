@@ -10,7 +10,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import db, prune
+from . import db, decide, prune
 from .config import Config, secret
 
 HERMES = str(Path.home() / ".local/bin/hermes")
@@ -55,10 +55,13 @@ def candidates(cfg: Config, conn) -> dict:
         assignee = (raw["assignee"] or {}).get("email")
         held = next((p for p, text in holds.items() if _names(text, ident)), None)
         # A verdict is dispatched at most once: a done card already landed, a blocked one needs the ticket to
-        # change (new verdict) first. Without this, archived tickets in Ready for QA would be restaged forever.
+        # change (new verdict) first, unless the user chose "retry" on the block. Without this, archived tickets in
+        # Ready for QA would be restaged forever.
         prior = v and conn.execute(
             "SELECT t.run_id, CASE WHEN d.rejected_reason IS NOT NULL THEN 'rejected in review' ELSE t.card_status END "
-            "card_status FROM dispatch_ticket t JOIN dispatch d USING (run_id) WHERE t.verdict_id=?", (v["id"],)).fetchone()
+            "card_status FROM dispatch_ticket t JOIN dispatch d USING (run_id) WHERE t.verdict_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM decision x WHERE x.run_id=t.run_id AND x.issue_id=t.issue_id "
+            "AND x.kind='blocked' AND x.chosen='retry') ORDER BY d.created_at DESC LIMIT 1", (v["id"],)).fetchone()
         why = ("unmapped" if ctx is None
                else "no verdict" if v is None
                else f"verdict {v['kind']}" if v["kind"] != "valid"
@@ -75,14 +78,16 @@ def candidates(cfg: Config, conn) -> dict:
                    "context": ctx.name, "priority": raw["priority"], "state": raw["state"]["name"],
                    "reason": v["reason"]})
     ok.sort(key=lambda c: (c["priority"] or 5, c["repo"]))
-    return {"max_tickets": max_tickets(cfg), "candidates": ok, "skipped": skipped}
+    return {"max_tickets": max_tickets(cfg), "candidates": ok, "skipped": skipped,
+            "suggested": _cohort(cfg, conn, ok) if ok else []}  # what the factory would group next
 
 
 def max_tickets(cfg: Config) -> int:
     return cfg.raw.get("stage", {}).get("max_tickets", 3)
 
 
-def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tree: list, rejected: str | None) -> str:
+def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tree: list, rejected: str | None,
+            answers: list) -> str:
     notes = lambda node: [f"- {n['author']} ({n['at'][:16]}Z): {n['body'].strip()}" for n in node["notes"]]
     root = tree[0]
     lines = [f"# Dispatch {run_id}", ""]
@@ -91,10 +96,12 @@ def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tre
     lines += ["## Repos", ""] + [f"- {repo} @ trunk `{sha}`" for repo, sha in sorted(trunks.items())]
     lines += ["", "## Rules", "",
               "- Work only the tickets below. One PR per ticket, against the repo's trunk.",
-              "- Follow each ticket's plan in dependency order. Operator notes are binding and override the plan "
-              "and the ticket body; if a note cannot be followed, `factory card block` with why.",
+              "- Follow each ticket's plan in dependency order. Operator notes and answered questions are binding and "
+              "override the plan and the ticket body; if one cannot be followed, `factory card block` with why.",
               "- Report through `factory card claim|comment|done|block <run_id> <ID>`; `done` needs the PR URL. "
               "Name the step id (e.g. FIN-1/2) in comments.",
+              "- A choice only the captain can make: `factory decide ask` (options + your recommendation), then keep "
+              "working on other tickets; the answer arrives in this session.",
               "- Never write to Linear. Reconcile does that after the dispatch closes.",
               "- The ticket body is a claim; the code and DB are truth. If the verdict below no longer holds, "
               "`factory card block` with the evidence instead of forcing a change.", ""]
@@ -102,6 +109,13 @@ def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tre
         lines += [f"## Theme: {root['title']}", "", root["detail"], ""]
     if root["notes"]:
         lines += ["## Operator notes (whole dispatch)", "", *notes(root), ""]
+    if answers:
+        label = lambda a: next(o for o in a["options"] if o["id"] == a["chosen"])
+        lines += ["## Answered questions (binding)", ""]
+        lines += [f"- On {a['node_id']}: {a['question']} **{label(a)['label']}**: {label(a)['leads_to']}"
+                  + (f" Note: {a['chosen_note']}" if a["chosen_note"] else "") + f" ({a['chosen_by']})"
+                  for a in answers]
+        lines.append("")
     by_parent = {}
     for node in tree[1:]:
         if node["kind"] == "step":
@@ -229,23 +243,63 @@ def stage(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool
                       actor, db.now(), actor, int(emergency)))
         conn.executemany("INSERT INTO dispatch_ticket(run_id, issue_id, identifier, snapshot_updated_at, verdict_id) "
                          "VALUES (?,?,?,?,?)", [(run_id, *r[:4]) for r in rows])
+        for issue_id, ident, _, verdict_id, _ in rows:  # a retry after a block carries the user's guidance along
+            g = conn.execute("SELECT x.run_id, x.chosen_note, x.chosen_by, json_extract(x.detail_json, '$.reason') "
+                             "reason FROM decision x JOIN dispatch_ticket t ON t.run_id=x.run_id AND "
+                             "t.issue_id=x.issue_id WHERE x.issue_id=? AND x.kind='blocked' AND x.chosen='retry' AND "
+                             "t.verdict_id=? ORDER BY x.id DESC LIMIT 1", (issue_id, verdict_id)).fetchone()
+            if g:
+                conn.execute("INSERT INTO dispatch_note(run_id, node_id, author, body, at) VALUES (?,?,?,?,?)",
+                             (run_id, ident, g["chosen_by"], f"Retry of {g['run_id']}, which blocked: {g['reason']}\n"
+                                                             f"Guidance: {g['chosen_note']}", db.now()))
     return {"run_id": run_id, "state": "draft", "tickets": identifiers, "emergency": emergency}
+
+
+PLAN_QUESTIONS_MAX = 6
+
+
+def _plan_questions(qs: list, node_ids: set) -> list:
+    """Planner questions: each a real choice with consequences and a recommendation, like every decision."""
+    if len(qs) > PLAN_QUESTIONS_MAX:
+        raise StageError(f"{len(qs)} questions; at most {PLAN_QUESTIONS_MAX}. Decide the rest in the plan")
+    out = []
+    for q in qs:
+        on, text, opts = str(q.get("on") or "root"), str(q.get("question", "")).strip(), q.get("options")
+        if on not in node_ids:
+            raise StageError(f"question {text[:40]!r}: on must be root, a kept ticket or a step id")
+        if not 1 <= len(text) <= 300 or not str(q.get("why", "")).strip():
+            raise StageError("a question needs question (1-300 chars) and why (your reason for the recommendation)")
+        if (not isinstance(opts, list) or not 2 <= len(opts) <= 5
+                or not all(isinstance(o, dict) and set(o) == {"id", "label", "leads_to"}
+                           and all(str(o[k]).strip() for k in o) for o in opts)):
+            raise StageError(f"question {text[:40]!r}: 2-5 options, each exactly {{id, label, leads_to}}")
+        if q.get("recommend") not in {o["id"] for o in opts}:
+            raise StageError(f"question {text[:40]!r}: recommend must be one of its option ids")
+        out.append({"on": on, "question": text, "why": str(q["why"]).strip(), "recommend": q["recommend"],
+                    "options": [decide.option(str(o["id"]), str(o["label"]), str(o["leads_to"])) for o in opts]})
+    return out
 
 
 def plan(conn, run_id: str, nodes: list) -> dict:
     """Planner agent: write the draft's plan tree once. Entries (JSON list):
-      {"id": "root", "title": theme, "detail": why these tickets belong in one dispatch}      optional
+      {"id": "root", "title": theme, "detail": why these tickets belong in one dispatch,
+       "recommend": "approve"|"hold"|"reject", "why": your review recommendation}             optional
       {"id": "FIN-1", "detail": its role, "under": "FIN-2", "depends_on": ["FIN-3"]}        optional per ticket
       {"id": "FIN-1", "exclude": "why it does not fit this dispatch"}                         drops the ticket
       {"id": "FIN-1/2" or "FIN-1/2.1", "title", "detail", "depends_on": [node ids]}           steps, 1-12 per ticket
-    `under` nests a ticket under another (a tree); depends_on is ordering (a DAG). Both must be acyclic."""
-    _draft(conn, run_id)
-    if conn.execute("SELECT planned_at FROM dispatch WHERE run_id=?", (run_id,)).fetchone()[0]:
+      {"question": text, "on": node id, "options": [{"id", "label", "leads_to"}, ...], "recommend": option id,
+       "why": reason}                                                                        a choice for the reviewer
+    `under` nests a ticket under another (a tree); depends_on is ordering (a DAG). Both must be acyclic.
+    Questions the reviewer leaves open take their recommendation at approval."""
+    d = _draft(conn, run_id)
+    if d["planned_at"]:
         raise StageError(f"{run_id} already has a plan")
     tickets = [r[0] for r in conn.execute("SELECT identifier FROM dispatch_ticket WHERE run_id=? ORDER BY rowid",
                                           (run_id,))]
     if not isinstance(nodes, list) or not nodes or not all(isinstance(n, dict) for n in nodes):
         raise StageError("the plan must be a non-empty JSON list of objects")
+    questions = [n for n in nodes if "question" in n]
+    nodes = [n for n in nodes if "question" not in n]
     seen, text_ok = set(), lambda n, t: len(str(n.get("title", ""))) <= 200 and len(str(n.get("detail", ""))) <= 2000
     for n in nodes:
         i = str(n.get("id", ""))
@@ -297,6 +351,14 @@ def plan(conn, run_id: str, nodes: list) -> dict:
                 state[x] = 2
         for x in graph:
             visit(x)
+    qs = _plan_questions(questions, ids | {"root"})
+    root = next((n for n in nodes if n["id"] == "root"), {})
+    recommend = root.get("recommend", "approve")
+    if recommend not in ("approve", "hold", "reject"):
+        raise StageError("root recommend must be approve, hold or reject")
+    review_why = str(root.get("why") or "").strip() or (
+        f"The plan covers {len(kept)} ticket(s) in {len(steps)} step(s)"
+        + (f"; dropped {', '.join(excluded)} as misfits" if excluded else "") + ". Nothing has changed since the draft.")
     with db.tx(conn):
         for t, why in excluded.items():
             conn.execute("DELETE FROM dispatch_ticket WHERE run_id=? AND identifier=?", (run_id, t))
@@ -314,7 +376,12 @@ def plan(conn, run_id: str, nodes: list) -> dict:
             conn.execute("UPDATE dispatch SET repos_json=? WHERE run_id=?",
                          (json.dumps([r for r in old if r["repo"] in repos]), run_id))
         conn.execute("UPDATE dispatch SET planned_at=? WHERE run_id=?", (db.now(), run_id))
-    return {"run_id": run_id, "tickets": kept, "excluded": excluded, "steps": len(steps)}
+        decide.review(conn, run_id, recommend, review_why, "agent:factory-plan")
+        for q in qs:
+            decide.open_(conn, "plan", q["question"], q["options"], q["recommend"], q["why"], "agent:factory-plan",
+                         run_id=run_id, node_id=q["on"])
+    return {"run_id": run_id, "tickets": kept, "excluded": excluded, "steps": len(steps), "questions": len(qs),
+            "recommend": recommend}
 
 
 def note(conn, run_id: str, node: str, body: str, actor: str) -> dict:
@@ -364,12 +431,17 @@ def _tickets_for_render(cfg: Config, conn, run_id: str, check: bool) -> tuple[li
         conn.execute("SELECT repos_json FROM dispatch WHERE run_id=?", (run_id,)).fetchone()[0])}
 
 
-def approve(cfg: Config, conn, run_id: str, actor: str, start: bool = True) -> dict:
-    """Review done: freeze the draft (plan + notes rendered into an immutable dispatch.md) and try to start it."""
+def _answers(conn, run_id: str) -> list:
+    return [a for a in decide.rows(conn, run_id, open_only=False) if a["kind"] == "plan" and a["chosen"]]
+
+
+def approve(cfg: Config, conn, run_id: str, actor: str) -> dict:
+    """Review done (the review decision's `approve`): freeze the draft (plan, notes, answered questions) into an
+    immutable dispatch.md. `start` then hands it to the executor."""
     _draft(conn, run_id)
     tickets, trunks = _tickets_for_render(cfg, conn, run_id, check=True)
     now = db.now()
-    body = _render(run_id, now, actor, trunks, tickets, tree(conn, run_id), None).encode()
+    body = _render(run_id, now, actor, trunks, tickets, tree(conn, run_id), None, _answers(conn, run_id)).encode()
     path = cfg.dispatches / run_id / "dispatch.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     with db.tx(conn):
@@ -377,25 +449,32 @@ def approve(cfg: Config, conn, run_id: str, actor: str, start: bool = True) -> d
         conn.execute("UPDATE dispatch SET state='staged', body_sha256=?, staged_at=?, approved_by=?, last_actor=? "
                      "WHERE run_id=?", (hashlib.sha256(body).hexdigest(), now, actor, actor, run_id))
     os.chflags(path, stat.UF_IMMUTABLE)
-    res = {"run_id": run_id, "path": str(path), "handoff": None, "handoff_error": None,
+    return {"run_id": run_id, "path": str(path)}
+
+
+def start(cfg: Config, conn, run_id: str) -> dict:
+    """After approval: optional Kanban mirror, then hand off. A busy or starting executor is not an error here;
+    factory-propose retries the handoff every run."""
+    tickets, _ = _tickets_for_render(cfg, conn, run_id, check=False)
+    res = {"handoff": None, "handoff_error": None,
            "kanban": mirror_cards(cfg, conn, run_id, {t["identifier"]: t for t in tickets})}
-    if start:
-        try:
-            res["handoff"] = handoff(cfg, conn, run_id)
-        except StageError as e:  # executor busy/starting: factory-propose retries every run
-            res["handoff_error"] = str(e)
+    try:
+        res["handoff"] = handoff(cfg, conn, run_id)
+    except StageError as e:
+        res["handoff_error"] = str(e)
     return res
 
 
 def reject(cfg: Config, conn, run_id: str, reason: str, actor: str) -> dict:
-    """Discard a draft. It is rendered (with plan and notes) into _archived/ as the record; its tickets are not
-    drafted again until their verdict changes."""
+    """Discard a draft (the review decision's `reject`). It is rendered (plan, notes, answers) into _archived/ as
+    the record; its tickets are not drafted again until their verdict changes."""
     _draft(conn, run_id)
     if not reason.strip():
         raise StageError("say why it is rejected")
     tickets, trunks = _tickets_for_render(cfg, conn, run_id, check=False)
     now = db.now()
-    body = _render(run_id, now, actor, trunks, tickets, tree(conn, run_id), reason.strip()).encode()
+    body = _render(run_id, now, actor, trunks, tickets, tree(conn, run_id), reason.strip(),
+                   _answers(conn, run_id)).encode()
     path = cfg.dispatches / "_archived" / run_id / "dispatch.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     with db.tx(conn):
@@ -407,7 +486,7 @@ def reject(cfg: Config, conn, run_id: str, reason: str, actor: str) -> dict:
 
 
 def mirror_cards(cfg: Config, conn, run_id: str, tickets: dict) -> list:
-    """Optional Kanban mirror. Failure never unstages: it raises a flag instead."""
+    """Optional Kanban mirror. Failure never unstages; it is reported in the result (the mirror is not a record)."""
     if not cfg.kanban.get("enabled"):
         return []
     board, res = cfg.kanban.get("board", "factory"), []
@@ -422,12 +501,10 @@ def mirror_cards(cfg: Config, conn, run_id: str, tickets: dict) -> list:
             card = json.loads(r.stdout)["id"] if r.returncode == 0 else None
         except (json.JSONDecodeError, KeyError, TypeError):
             card = None
-        if card is None:
-            flag(conn, run_id, t["issue_id"], "kanban-mirror", {"op": "create", "stderr": r.stderr[-400:]})
-        else:
+        if card is not None:
             conn.execute("UPDATE dispatch_ticket SET kanban_card_id=? WHERE run_id=? AND identifier=?",
                          (card, run_id, ident))
-        res.append({"identifier": ident, "card": card})
+        res.append({"identifier": ident, "card": card, **({} if card else {"error": r.stderr[-400:]})})
     return res
 
 
@@ -464,6 +541,12 @@ def _executor(want: str, wait: float = 180) -> dict:
     raise StageError(f"started factory-primary in {panes[0]['pane_id']} but omp was not idle within {wait:.0f}s")
 
 
+def _send(pane_id: str, texts: list[str]) -> None:
+    for text in texts:
+        _herdr("pane", "send-text", pane_id, text)
+        _herdr("pane", "send-keys", pane_id, "enter")
+        time.sleep(3)
+
 
 def handoff(cfg: Config, conn, run_id: str) -> dict:
     """Hand a staged dispatch to the executor: fresh omp session (/new), then `run dispatch-intake <run_id>`."""
@@ -475,15 +558,38 @@ def handoff(cfg: Config, conn, run_id: str) -> dict:
     pane = _executor(cfg.raw.get("executor", {}).get("workspace", "factory"))
     if pane.get("agent_status") not in ("idle", "done"):
         raise StageError(f"executor pane {pane['pane_id']} is {pane.get('agent_status')}; not resetting a busy session")
-    for text in ("/new", f"run dispatch-intake {run_id}"):  # session reset at every dispatch boundary
-        _herdr("pane", "send-text", pane["pane_id"], text)
-        _herdr("pane", "send-keys", pane["pane_id"], "enter")
-        time.sleep(3)
-    return {"run_id": run_id, "executor_pane": pane["pane_id"], "sent": ["/new", f"run dispatch-intake {run_id}"]}
+    sent = ["/new", f"run dispatch-intake {run_id}"]  # session reset at every dispatch boundary
+    _send(pane["pane_id"], sent)
+    return {"run_id": run_id, "executor_pane": pane["pane_id"], "sent": sent}
+
+
+def resume(cfg: Config, conn, run_id: str) -> dict:
+    """The "restart the executor" choice on an executing dispatch: start factory-primary if it is gone, interrupt it if it is
+    stuck mid-turn, then a fresh session runs intake again (`execute` re-attaches; finished cards stay finished)."""
+    d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+    if d is None or d["state"] != "executing":
+        raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not executing")
+    pane = _executor(cfg.raw.get("executor", {}).get("workspace", "factory"))
+    if pane.get("agent_status") not in ("idle", "done"):
+        _herdr("pane", "send-keys", pane["pane_id"], "esc")
+        time.sleep(2)
+    sent = ["/new", f"run dispatch-intake {run_id}"]
+    _send(pane["pane_id"], sent)
+    return {"run_id": run_id, "executor_pane": pane["pane_id"], "sent": sent}
+
+
+def tell_executor(conn, run_id: str, text: str) -> str:
+    """Type a message (an answer to its question) into the executor's pane; omp queues it if mid-turn."""
+    d = conn.execute("SELECT executor_pane FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+    if not d or not d["executor_pane"]:
+        raise StageError(f"dispatch {run_id} has no executor pane")
+    _send(d["executor_pane"], [text])
+    return d["executor_pane"]
 
 
 def execute(cfg: Config, conn, run_id: str, actor: str) -> dict:
-    """staged -> executing, only from a pane in the executor's herdr workspace, only on an intact file."""
+    """staged -> executing, only from a pane in the executor's herdr workspace, only on an intact file. On an
+    executing dispatch (after "restart the executor") it re-attaches this pane, unless another live omp owns it."""
     want = cfg.raw.get("executor", {}).get("workspace", "factory")
     ws, pane = os.environ.get("HERDR_WORKSPACE_ID"), os.environ.get("HERDR_PANE_ID")
     if not ws or not pane:
@@ -493,14 +599,21 @@ def execute(cfg: Config, conn, run_id: str, actor: str) -> dict:
     if label != want:
         raise StageError(f"caller workspace {ws} is {label!r}, not the executor workspace {want!r}")
     d = conn.execute("SELECT * FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
-    if d is None or d["state"] != "staged":
+    if d is None or d["state"] not in ("staged", "executing"):
         raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not staged")
     path = cfg.dispatches / run_id / "dispatch.md"
     if hashlib.sha256(path.read_bytes()).hexdigest() != d["body_sha256"]:
         raise StageError(f"{path} does not match its staged sha256; refusing")
-    with db.tx(conn):  # one_executing unique index refuses a second executing dispatch
-        conn.execute("UPDATE dispatch SET state='executing', executing_at=?, executor_pane=?, last_actor=? "
-                     "WHERE run_id=?", (db.now(), pane, actor, run_id))
+    if d["state"] == "executing":
+        owner = {p["pane_id"]: p for p in _herdr("pane", "list")["result"]["panes"]}.get(d["executor_pane"]) or {}
+        if d["executor_pane"] != pane and owner.get("agent") == "omp":
+            raise StageError(f"{run_id} is executing in live pane {d['executor_pane']}; not taking it over")
+        with db.tx(conn):
+            conn.execute("UPDATE dispatch SET executor_pane=?, last_actor=? WHERE run_id=?", (pane, actor, run_id))
+    else:
+        with db.tx(conn):  # one_executing unique index refuses a second executing dispatch
+            conn.execute("UPDATE dispatch SET state='executing', executing_at=?, executor_pane=?, last_actor=? "
+                         "WHERE run_id=?", (db.now(), pane, actor, run_id))
     return {"run_id": run_id, "path": str(path), "executor_pane": pane,
             "tickets": [dict(r) for r in conn.execute(
                 "SELECT t.identifier, v.repo, t.card_status FROM dispatch_ticket t JOIN verdict v ON v.id=t.verdict_id "
@@ -538,8 +651,9 @@ def _hermes_kanban(cfg: Config, *args: str) -> subprocess.CompletedProcess:
 
 
 def card(cfg: Config, conn, run_id: str, ident: str, kind: str, actor: str,
-         body: str | None = None, pr: str | None = None) -> dict:
-    """claim|comment|done|block one card. Legal edges + auto-done are triggers; the CI gate is here."""
+         body: str | None = None, pr: str | None = None, ask: bool = True) -> dict:
+    """claim|comment|done|block one card. Legal edges + auto-done are triggers; the CI gate is here. A block asks
+    the user what next (`ask=False` when the user already decided, e.g. stopping the dispatch)."""
     t = conn.execute("SELECT t.*, d.state, v.repo FROM dispatch_ticket t JOIN dispatch d USING (run_id) "
                      "JOIN verdict v ON v.id = t.verdict_id WHERE t.run_id=? AND t.identifier=?",
                      (run_id, ident)).fetchone()
@@ -577,7 +691,16 @@ def card(cfg: Config, conn, run_id: str, ident: str, kind: str, actor: str,
         conn.execute("INSERT INTO card_event(run_id, issue_id, kind, actor, body, metadata_json, at) "
                      "VALUES (?,?,?,?,?,?,?)", (run_id, t["issue_id"], kind, actor, body,
                                                json.dumps(meta) if meta else None, db.now()))
-    if cfg.kanban.get("enabled") and t["kanban_card_id"]:
+        if kind == "block" and ask:
+            decide.blocked(conn, run_id, ident, t["issue_id"], body, actor)
+        d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+        if d["state"] != "executing":  # last card closed the dispatch: run-time questions no longer apply
+            decide.void(conn, "run_id=? AND kind IN ('executor-gone','dispatch-stuck','ask')", (run_id,),
+                        "the dispatch finished")
+    res = {"run_id": run_id, "identifier": ident, "event": kind,
+           "card_status": conn.execute("SELECT card_status FROM dispatch_ticket WHERE run_id=? AND identifier=?",
+                                       (run_id, ident)).fetchone()[0], "dispatch_state": d["state"]}
+    if cfg.kanban.get("enabled") and t["kanban_card_id"]:  # optional mirror: a failure is reported, not recorded
         cid = t["kanban_card_id"]
         r = _hermes_kanban(cfg, *{
             "claim": ["claim", cid],
@@ -586,16 +709,8 @@ def card(cfg: Config, conn, run_id: str, ident: str, kind: str, actor: str,
             "block": ["block", cid, body or ""],
         }[kind])
         if r.returncode:
-            flag(conn, run_id, t["issue_id"], "kanban-mirror", {"op": kind, "stderr": r.stderr[-400:]})
-    d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
-    return {"run_id": run_id, "identifier": ident, "event": kind,
-            "card_status": conn.execute("SELECT card_status FROM dispatch_ticket WHERE run_id=? AND identifier=?",
-                                        (run_id, ident)).fetchone()[0], "dispatch_state": d["state"]}
-
-
-def flag(conn, run_id: str | None, issue_id: str | None, kind: str, detail: dict) -> None:
-    conn.execute("INSERT INTO flag(run_id, issue_id, kind, detail_json, created_at) VALUES (?,?,?,?,?)",
-                 (run_id, issue_id, kind, json.dumps(detail), db.now()))
+            res["kanban_error"] = r.stderr[-400:]
+    return res
 
 
 PROPOSE = "factory:propose"
@@ -631,8 +746,9 @@ def _cohort(cfg: Config, conn, auto: list) -> list[str]:
 def propose(cfg: Config, conn) -> dict:
     """Cron: move one dispatch at a time through review. Drafts a cohort of related `auto`-repo candidates; once the
     planner has written its plan, announces it (result["announce"], delivered to the factory Bot Chat / Hermex)
-    and starts it after REVIEW unless held. Emergency drafts start as soon as they are planned. A person's draft
-    is never started here. Staged (approved) dispatches are handed off, retried every run."""
+    and, after REVIEW, takes its review decision's recommendation unless someone answered or held it first.
+    Emergency drafts start as soon as they are planned. A person's draft is never decided here. Staged (approved)
+    dispatches are handed off, retried every run."""
     live = conn.execute("SELECT * FROM dispatch WHERE state <> 'archived' ORDER BY created_at").fetchall()
     if any(d["state"] in ("executing", "done", "reconciled") for d in live):
         return {"action": "wait", "dispatches": [{"run_id": d["run_id"], "state": d["state"]} for d in live]}
@@ -658,8 +774,12 @@ def propose(cfg: Config, conn) -> dict:
         return {"action": "planning", "run_id": run_id}
     if d["held_reason"]:
         return {"action": "held", "run_id": run_id, "reason": d["held_reason"]}
+    rd = decide.open_review(conn, run_id)
+    if rd is None:
+        return {"action": "wait", "reason": "no open review decision", "run_id": run_id}
     what = "; ".join(f"{n['id']} {n['title']}" for n in tree(conn, run_id) if n["kind"] == "ticket")
     url = cfg.raw.get("notify", {}).get("url", "")
+    rec = next(o for o in rd["options"] if o["id"] == rd["recommended"])
     now = datetime.now(UTC)
     if not d["emergency"] and d["review_until"] is None:
         until = now + REVIEW
@@ -667,17 +787,23 @@ def propose(cfg: Config, conn) -> dict:
             conn.execute("UPDATE dispatch SET notified_at=?, review_until=? WHERE run_id=?",
                          (db.now(), until.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), run_id))
         return {"action": "in-review", "run_id": run_id, "review_until": until.isoformat(),
-                "announce": f"Dispatch {run_id} is ready for review: {what}. It starts by itself at "
-                            f"{until.astimezone():%H:%M} unless you hold it. {url}"}
+                "announce": f"Dispatch {run_id} is ready for review: {what}. Recommended: {rec['label']} "
+                            f"({rd['why']}). At {until.astimezone():%H:%M} the factory takes that recommendation "
+                            f"unless you choose first. {url}"}
     if not d["emergency"] and now < datetime.fromisoformat(d["review_until"]):
         return {"action": "in-review", "run_id": run_id, "review_until": d["review_until"]}
-    actor = f"{PROPOSE} ({'emergency: no review window' if d['emergency'] else 'review window elapsed'})"
+    choice = "approve" if d["emergency"] else rd["recommended"]
+    actor = f"{PROPOSE} ({'emergency: no review window' if d['emergency'] else 'review window elapsed; took the recommendation'})"
     try:
-        res = approve(cfg, conn, run_id, actor)
+        res = decide.choose(cfg, conn, rd["id"], choice, actor, note=f"review window elapsed: {rd['why']}")
     except StageError as e:  # ticket or verdict moved during review: the reviewed plan is void
-        reject(cfg, conn, run_id, f"not started: {e}", PROPOSE)
+        decide.choose(cfg, conn, rd["id"], "reject", PROPOSE, note=f"not started: {e}")
         return {"action": "rejected", "run_id": run_id, "reason": str(e),
                 "announce": f"Dispatch {run_id} was dropped instead of started: {e}."}
+    if choice != "approve":
+        return {"action": choice, "run_id": run_id, **res,
+                "announce": f"Dispatch {run_id}: the review window ended and the factory took its recommendation, "
+                            f"{rec['label']} ({rd['why']}). {url}"}
     head = "Emergency dispatch" if d["emergency"] else "Dispatch"
     tail = "without review" if d["emergency"] else "after the review window"
     return {"action": "started", "run_id": run_id, **res,
@@ -685,27 +811,36 @@ def propose(cfg: Config, conn) -> dict:
 
 
 def watch(cfg: Config, conn) -> list:
-    """Flag an executing dispatch whose executor pane is gone, or with no card activity for
-    executor.stuck_hours (default 6). One open flag per dispatch and kind."""
+    """Ask about an executing dispatch whose executor pane is gone, or with no card activity for
+    executor.stuck_hours (default 6): one open decision per dispatch and kind, not re-asked for stuck_hours after
+    "wait", withdrawn once the condition clears or the dispatch stops executing."""
     stuck_h = cfg.raw.get("executor", {}).get("stuck_hours", 6)
     try:
         panes = {p["pane_id"]: p for p in _herdr("pane", "list")["result"]["panes"]}
     except (StageError, OSError, subprocess.TimeoutExpired):
         panes = None  # herdr down: the pane check can't tell, the idle check still runs
     raised = []
+    with db.tx(conn):
+        decide.void(conn, "kind IN ('executor-gone','dispatch-stuck','ask') AND run_id NOT IN "
+                          "(SELECT run_id FROM dispatch WHERE state='executing')", (), "the dispatch is no longer executing")
     for d in conn.execute("SELECT * FROM dispatch WHERE state='executing'").fetchall():
         last = conn.execute("SELECT max(at) FROM card_event WHERE run_id=?", (d["run_id"],)).fetchone()[0]
         idle_h = (datetime.now(UTC) - datetime.fromisoformat(max(filter(None, (last, d["executing_at"]))))
                   ).total_seconds() / 3600
-        checks = {"executor-gone": panes is not None and (panes.get(d["executor_pane"]) or {}).get("agent") != "omp",
+        checks = {"executor-gone": None if panes is None else
+                  (panes.get(d["executor_pane"]) or {}).get("agent") != "omp",
                   "dispatch-stuck": idle_h > stuck_h}
         for kind, bad in checks.items():
-            if bad and not conn.execute("SELECT 1 FROM flag WHERE run_id=? AND kind=? AND resolved_at IS NULL",
-                                        (d["run_id"], kind)).fetchone():
-                reason = (f"executor pane {d['executor_pane']} no longer runs omp; the dispatch cannot finish"
-                          if kind == "executor-gone" else
-                          f"no card activity for {idle_h:.1f}h (limit {stuck_h}h); check the factory workspace")
-                with db.tx(conn):
-                    flag(conn, d["run_id"], None, kind, {"reason": reason})
-                raised.append({"run_id": d["run_id"], "kind": kind, "reason": reason})
+            if bad is None:
+                continue
+            asked = conn.execute(f"SELECT 1 FROM decision WHERE run_id=? AND kind=? AND {decide.OPEN}",
+                                 (d["run_id"], kind)).fetchone()
+            with db.tx(conn):
+                if not bad and asked:
+                    decide.void(conn, "run_id=? AND kind=?", (d["run_id"], kind), "no longer the case")
+                elif bad and not asked and not decide.snoozed(conn, d["run_id"], kind, stuck_h):
+                    reason = (f"executor pane {d['executor_pane']} no longer runs omp; the dispatch cannot finish"
+                              if kind == "executor-gone" else f"no card activity for {idle_h:.1f}h (limit {stuck_h}h)")
+                    decide.executor(conn, d["run_id"], kind, reason, stuck_h)
+                    raised.append({"run_id": d["run_id"], "kind": kind, "reason": reason})
     return raised

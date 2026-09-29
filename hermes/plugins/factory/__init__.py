@@ -1,9 +1,10 @@
 """`factory` tool for the Hermes `factory` chat profile. The only surface that agent gets.
 
-Reads are free. `stage` makes a draft dispatch (a planner adds a plan; nothing runs yet). `note`, `hold` and
-`reject` only touch drafts. `approve` freezes a draft and starts real work on real repos, so it asks the human
-through Hermes's approval prompt every time; with no human channel it refuses and returns the command to paste
-instead.
+Reads are free. `stage` makes a draft dispatch (a planner adds a plan and a review decision; nothing runs yet).
+`note` only touches drafts. `decide` answers a decision (every choice the factory needs from the user: review a
+draft, a planner or executor question, a blocked ticket, a stuck executor, a held Linear write). Choices that
+start or stop real work or write Linear ask the human through Hermes's approval prompt every time; with no human
+channel they are refused and the command to paste is returned instead.
 """
 import json
 import os
@@ -21,26 +22,26 @@ SCHEMA = {
         "Operate the software factory. Actions: status [run_id] (overview or one dispatch); tickets (owned tickets "
         "with verdicts); candidates (what can be staged, and why the rest cannot); ticket <identifier>; "
         "stage <identifiers> (a cohort of related tickets, up to 8, into a draft dispatch; a planner adds a plan; nothing runs yet); "
-        "draft <run_id> (one dispatch with its review state and plan tree: node ids, steps, dependencies, notes); "
-        "note <run_id> <node> <body> (add the user's note to a draft; node ids look like `root` (whole dispatch), "
-        "`FIN-3788` (a ticket), `FIN-3788/2` (a step); the executor reads it verbatim); approve <run_id> (freeze the draft and "
-        "start it on the executor fleet: real branches and PRs; the user must approve); hold <run_id> <reason> "
-        "(stop a draft's auto-start until approved); reject <run_id> <reason> (discard a draft); "
-        "resolve_flag <flag_id> <resolution> (mark a 'needs you' flag handled with what the user decided; "
-        "does not change Linear); followup <identifier> <title> <body> [repo] (queue a new ticket split out of an owned one; reconcile creates it in Linear)."),
+        "draft <run_id> (one dispatch: review state, plan tree with node ids, steps, dependencies, notes, its "
+        "decisions and Linear writes); note <run_id> <node> <body> (add the user's note to a draft; node ids look "
+        "like `root` (whole dispatch), `FIN-3788` (a ticket), `FIN-3788/2` (a step); the executor reads it "
+        "verbatim); decisions [run_id] (what waits on the user: each has options with what they lead to, a "
+        "recommended option and why); decide <decision_id> <option> [note] (answer one with the user's choice; "
+        "some options need a note, e.g. a reason to hold or reject); followup <identifier> <title> <body> [repo] "
+        "(queue a new ticket split out of an owned one; reconcile creates it in Linear)."),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["status", "tickets", "candidates", "ticket", "stage", "draft",
-                                                  "note", "approve", "hold", "reject", "resolve_flag", "followup"]},
-            "run_id": {"type": "string", "description": "dispatch run id for status/draft/note/approve/hold/reject"},
+                                                  "note", "decisions", "decide", "followup"]},
+            "run_id": {"type": "string", "description": "dispatch run id for status/draft/note/decisions"},
             "identifier": {"type": "string", "description": "ticket id for `ticket`, e.g. FIN-3481"},
             "identifiers": {"type": "array", "items": {"type": "string"}, "description": "tickets for `stage`"},
             "node": {"type": "string", "description": "plan node id for `note`, from the `draft` tree: `root` (whole "
                                                      "dispatch), `FIN-3788` (a ticket), `FIN-3788/2` or `FIN-3788/2.1` (a step)"},
-            "reason": {"type": "string", "description": "the user's reason, for `hold`/`reject`"},
-            "flag_id": {"type": "integer", "description": "flag id for `resolve_flag`"},
-            "resolution": {"type": "string", "description": "what the user decided, for `resolve_flag`"},
+            "decision_id": {"type": "integer", "description": "decision id for `decide`"},
+            "option": {"type": "string", "description": "the option id the user chose, for `decide`"},
+            "note": {"type": "string", "description": "text the chosen option asks for (a reason, guidance)"},
             "title": {"type": "string", "description": "new ticket title, for `followup`"},
             "body": {"type": "string", "description": "note text for `note`; new ticket body (markdown) for `followup`"},
             "repo": {"type": "string", "description": "optional repo the new ticket maps to, for `followup`"},
@@ -97,38 +98,45 @@ def handle(params: dict, **_) -> str:
     if action == "stage":
         ids = [i.strip().upper() for i in params.get("identifiers") or [] if i.strip()]
         return _run("stage", *ids, "--actor", "agent:factory-chat") if ids else '{"ok": false, "error": "no identifiers"}'
-    if action == "resolve_flag":
-        if not params.get("flag_id") or not (params.get("resolution") or "").strip():
-            return '{"ok": false, "error": "flag_id and resolution required"}'
-        return _run("flag", "resolve", str(int(params["flag_id"])), "--resolution", params["resolution"].strip())
+    if action == "decisions":
+        return _run("decide", "list", *([run_id, "--all"] if run_id else []))
+    if action == "decide":
+        return _decide(params)
     if action == "followup":
         parent, title, body = params.get("identifier"), params.get("title"), params.get("body")
         if not (parent and title and body):
             return '{"ok": false, "error": "identifier (parent), title and body required"}'
         return _run("reconcile", "followup", parent, "--title", title, "--body", body,
                     *(["--repo", params["repo"]] if params.get("repo") else []), "--actor", "agent:factory-chat")
-    if action in ("note", "hold", "reject", "approve") and not run_id:
-        return '{"ok": false, "error": "run_id required"}'
     if action == "note":
         node, body = (params.get("node") or "").strip(), (params.get("body") or "").strip()
-        if not (node and body):
-            return '{"ok": false, "error": "node and body required"}'
+        if not (run_id and node and body):
+            return '{"ok": false, "error": "run_id, node and body required"}'
         return _run("draft", "note", run_id, "--node", node, f"--body={body}", "--actor", "agent:factory-chat")
-    if action in ("hold", "reject"):
-        reason = (params.get("reason") or "").strip()
-        if not reason:
-            return '{"ok": false, "error": "reason required"}'
-        return _run("draft", action, run_id, f"--reason={reason}", "--actor", "agent:factory-chat")
-    if action == "approve":
-        command = f"factory draft approve {run_id}"
-        why = _approve(command, f"Approve factory dispatch {run_id} and start it on factory-fleet: freezes the plan, "
-                                "resets the executor session and begins real work (branches, PRs, merges) on the "
-                                "dispatch's repos.")
-        if why:
-            return json.dumps({"ok": False, "error": f"dispatch not approved: {why}. "
-                               f"The user can run it themselves: ~/.local/bin/{command}"})
-        return _run("draft", "approve", run_id, "--actor", "user:factory-chat")
     return json.dumps({"ok": False, "error": f"unknown action {action!r}"})
+
+
+def _decide(params: dict) -> str:
+    did, choice = params.get("decision_id"), (params.get("option") or "").strip()
+    note = (params.get("note") or "").strip()
+    if not did or not choice:
+        return '{"ok": false, "error": "decision_id and option required"}'
+    listed = json.loads(_run("decide", "list"))
+    d = next((x for x in listed if isinstance(x, dict) and x.get("id") == int(did)), None) if isinstance(listed, list) else None
+    if d is None:
+        return json.dumps({"ok": False, "error": f"no open decision {did}; list them with `decisions`"})
+    opt = next((o for o in d["options"] if o["id"] == choice), None)
+    if opt is None:
+        return json.dumps({"ok": False, "error": f"choose one of {[o['id'] for o in d['options']]}"})
+    args = ["decide", "choose", str(int(did)), choice, *([f"--note={note}"] if note else [])]
+    if opt.get("weighty"):  # starts/stops real work or writes Linear: a human confirms this one operation
+        command = "factory " + " ".join(args)
+        why = _approve(command, f"{d['question']} {opt['label']}: {opt['leads_to']}.")
+        if why:
+            return json.dumps({"ok": False, "error": f"not done: {why}. The user can run it themselves: "
+                                                     f"~/.local/bin/{command}"})
+        return _run(*args, "--actor", "user:factory-chat")
+    return _run(*args, "--actor", "agent:factory-chat (for the user)")
 
 
 def register(ctx):

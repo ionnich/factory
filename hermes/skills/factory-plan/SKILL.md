@@ -1,6 +1,6 @@
 ---
 name: factory-plan
-description: "Software-factory plan job: shape a draft dispatch (a cohort of related tickets) into a reviewable tree: theme, nested tickets, misfits excluded, steps with dependencies; written once with `factory draft plan`."
+description: "Software-factory plan job: shape a draft dispatch (a cohort of related tickets) into a reviewable tree: theme, nested tickets, misfits excluded, steps with dependencies, open questions with options and a recommendation, and a review recommendation; written once with `factory draft plan`."
 version: 1.0.0
 author: nich
 platforms: [macos]
@@ -51,11 +51,21 @@ switching. Your job is to shape the cohort into a tree:
    console origin returns 200", "Open PR against main; CI green". Nested steps
    (`FIN-1/2.1`) only when a step has distinct sub-parts. Shared work goes in
    the first ticket that needs it; later tickets depend on that step.
+4. Questions: when the code leaves a real choice the reviewer should make (two
+   viable approaches, a scope call), add a question on the node it affects,
+   with 2-5 options, what each leads to, and the one you recommend with why.
+   At most 6; decide everything else in the plan itself. An unanswered
+   question takes your recommendation when the dispatch is approved, so
+   recommend what you would do.
+5. Review recommendation on `root`: `approve` (default), `hold` (a person
+   should look before it starts, e.g. the verdict looks shaky), or `reject`
+   (the cohort should not run as drafted), with why in one sentence. If nobody
+   answers during the review window of an automatic draft, the factory takes it.
 
 ## Record it (once per draft)
 
 ```bash
-~/.local/bin/factory draft plan <run_id> --steps '[{"id":"root","title":"Console CORS on the commercial API","detail":"Both tickets change the same origin allowlist."},{"id":"FIN-2","under":"FIN-1","detail":"Extends FIN-1 to /v2."},{"id":"FIN-3","exclude":"Different repo surface (billing); not atomic with the CORS change."},{"id":"FIN-1/1","title":"Add X to app/y.py:z","detail":"why/how in one or two sentences","depends_on":[]},{"id":"FIN-2/1","title":"Reuse FIN-1/1 for /v2 routes","detail":"...","depends_on":["FIN-1/1"]}]'
+~/.local/bin/factory draft plan <run_id> --steps '[{"id":"root","title":"Console CORS on the commercial API","detail":"Both tickets change the same origin allowlist.","recommend":"approve","why":"Two small changes on one allowlist, both covered by tests."},{"question":"Allow preview origins too?","on":"FIN-1/1","options":[{"id":"prod","label":"Production console only","leads_to":"previews stay blocked; smallest change"},{"id":"both","label":"Production and preview","leads_to":"previews work; wildcard subdomain to review"}],"recommend":"prod","why":"The ticket names only the production console."},{"id":"FIN-2","under":"FIN-1","detail":"Extends FIN-1 to /v2."},{"id":"FIN-3","exclude":"Different repo surface (billing); not atomic with the CORS change."},{"id":"FIN-1/1","title":"Add X to app/y.py:z","detail":"why/how in one or two sentences","depends_on":[]},{"id":"FIN-2/1","title":"Reuse FIN-1/1 for /v2 routes","detail":"...","depends_on":["FIN-1/1"]}]'
 ```
 
 Ids: `root`, a ticket id, or a step `<TICKET>/<n>[.<m>]`. Every kept ticket
@@ -70,4 +80,4 @@ what it names and retry; never retry the same payload.
 - If the evidence shows the work is already done or the ticket is unclear,
   still write the plan, and make step 1 "Confirm ..." with what to check; the
   reviewer decides.
-- Finish with one line: `<run_id>: <theme>; kept <tickets>; dropped <tickets or none>; N steps`.
+- Finish with one line: `<run_id>: <theme>; kept <tickets>; dropped <tickets or none>; N steps; N questions; recommend <approve|hold|reject>`.
