@@ -49,3 +49,21 @@
 .fx h2 .hint { font-weight: 400; font-size: .85rem; color: var(--color-muted-foreground); margin-left: .25rem; }
 .fx .cards { list-style: none; padding: 0; margin: .4rem 0 0; display: grid; gap: .3rem; }
 .fx .cards .chip { font-size: .72rem; padding: .05rem .45rem; }
+
+/* actions: stage / hand off / resolve; errors (API refusal text) sit next to the button */
+.fx .act { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: .45rem 0; cursor: auto; }
+.fx .act input[type=text] { flex: 1; min-width: 12rem; padding: .3rem .55rem; font: inherit; font-size: .9rem;
+                            color: inherit; background: transparent; border: 1px solid var(--color-border);
+                            border-radius: 6px; }
+.fx .act-err { color: #ef4444; font-size: .85rem; }
+.fx .pick { margin: 0 .5rem 0 0; vertical-align: middle; cursor: pointer; }
+
+/* throughput */
+.fx .stats { display: flex; flex-wrap: wrap; gap: .5rem 1.75rem; margin: .25rem 0 .5rem; }
+.fx .stat .v { font-size: 1.3rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.fx .stat .k { font-size: .82rem; color: var(--color-muted-foreground); }
+.fx .tbl { width: 100%; border-collapse: collapse; margin-top: .75rem; font-size: .9rem; font-variant-numeric: tabular-nums;
+           background: var(--color-card); border: 1px solid var(--color-border); }
+.fx .tbl th, .fx .tbl td { padding: .35rem .75rem; border-top: 1px solid var(--color-border); text-align: left; }
+.fx .tbl th { font-weight: 500; color: var(--color-muted-foreground); }
+.fx .tbl .r { text-align: right; }
