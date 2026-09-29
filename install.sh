@@ -38,6 +38,22 @@ for dest in "$hermes_home" "$hermes_home/profiles/factory"; do
 done
 [ -d "$hermes_home/profiles/factory" ] && cp "$here/hermes/profiles/factory/SOUL.md" "$hermes_home/profiles/factory/SOUL.md"
 
+# The planner bot (profile `planner`, created once by hand, see README.md): SOUL, its gate script and skill in its
+# own home (a profile's cron runs only scripts from its own scripts/), and its routine in its own cron store.
+pl="$hermes_home/profiles/planner"
+if [ -d "$pl" ]; then
+  cp "$here/hermes/profiles/planner/SOUL.md" "$pl/SOUL.md"
+  mkdir -p "$pl/scripts" "$pl/skills/factory"
+  install -m 0755 "$here/hermes/profiles/planner/scripts/factory-plan-gate.sh" "$pl/scripts/factory-plan-gate.sh"
+  rm -rf "$pl/skills/factory/factory-plan" && cp -R "$here/hermes/profiles/planner/skills/factory-plan" "$pl/skills/factory/"
+  planner_jobs="$(hermes -p planner cron list 2>/dev/null || true)"
+  grep -qF "[bot:planner] Plan drafts" <<<"$planner_jobs" || hermes -p planner cron create "every 10m" \
+    "$(cat "$here/hermes/prompts/plan.md")" \
+    --script factory-plan-gate.sh --skill factory-plan --workdir "$hermes_home/factory/mirrors" \
+    --provider "$provider" --model "$model" --reasoning-effort medium \
+    --name "[bot:planner] Plan drafts" --deliver local
+fi
+
 # factory-fleet primary: local charter + dispatch-intake skill (home data/ and the skill are untracked there)
 fp="$HOME/.local/share/factory-fleet/homes/factory-primary"
 if [ -d "$fp" ]; then
@@ -75,11 +91,5 @@ have_job factory-backup || hermes cron create "0 3 * * *" --no-agent \
 # pushes / the twice-daily digest (delivered to the factory Bot Chat, i.e. Hermex). Pause this job to stop it.
 have_job factory-propose || hermes cron create "every 10m" --no-agent \
   --script factory-propose.sh --name factory-propose --deliver bot-chat:factory
-
-# Writes the plan tree of each new draft so it can be reviewed.
-have_job factory-plan || hermes cron create "every 10m" "$(cat "$here/hermes/prompts/plan.md")" \
-  --script factory-plan-gate.sh --skill factory-plan --workdir "$hermes_home/factory/mirrors" \
-  --provider "$provider" --model "$model" --reasoning-effort medium \
-  --name factory-plan --deliver local
 
 hermes cron list

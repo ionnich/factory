@@ -12,7 +12,8 @@ propose (cron) drafts for `auto` repos, takes ★ on decisions whose time came, 
 ## Install
 
 `./install.sh` (idempotent): venv, `factory` on PATH, Hermes scripts/skills/cron jobs (`factory-ingest`,
-`factory-prune`, `factory-plan`, `factory-reconcile`, `factory-propose`, `factory-backup`), the `factory` plugin (dashboard tab +
+`factory-prune`, `factory-reconcile`, `factory-propose`, `factory-backup`), the planner bot's files and routine
+(`[bot:planner] Plan drafts`, in the `planner` profile's own cron store), the `factory` plugin (dashboard tab +
 chat tool), factory-fleet primary files.
 
 One-time, by hand:
@@ -21,6 +22,10 @@ One-time, by hand:
 - Chat profile: `hermes profile create factory --clone --no-alias`, then in its `config.yaml`:
   `model.default deepseek-v4-pro`, `model.provider deepseek`, `plugins.enabled: [factory]`,
   `platform_toolsets.cli: [factory]`. Run `./install.sh` again to copy the plugin and `SOUL.md`.
+- Planner bot: `hermes profile create planner --clone --no-alias --description "…"`, then
+  `hermes -p planner config set model.default deepseek-v4-pro`, `model.provider deepseek`, `plugins.enabled '[]'`,
+  and in its `profile.yaml` `ui_meta: {hermes-bots: {title: Planner}}` (makes this a Bot Mode install, which gives
+  every Bot Chat `message_agent`). Restart the gateway so it serves the profile, run `./install.sh` again.
 - factory-fleet: see `fleet/`. Primary runs in herdr workspace `factory`. `handoff` starts it there with
   `fleet/launch-factory-primary.sh` when the workspace or agent is missing (reboot, crash, closed pane).
 
@@ -44,7 +49,9 @@ One-time, by hand:
 - Chat: `hermes -p factory`, also on the iPhone through Hermex (Bot Mode, factory profile; the web dashboard has
   no Bot Mode yet, so digests and pushes are read and answered there or in the Factory tab). It shows drafts,
   takes notes ("note FIN-3788/2: …") and answers decisions (weighty ones through the Hermes approval prompt);
-  "ok" to a digest takes every ★ in it with one confirmation.
+  "ok" to a digest takes every ★ in it with one confirmation. The **planner** bot (`hermes -p planner`, or its
+  Bot Chat in Hermex) wrote the plans and explains them ("why 3 steps for FIN-3661?"); it changes nothing.
+  The factory bot hands it "ask the planner …" with `message_agent` and relays the reply.
 - Decisions (`factory decide list|choose|ok|ask`): every choice the factory needs from you is a decision with 2+
   options, what each leads to, and one recommended with why. Kinds: a draft's review (approve / hold / reject),
   planner questions (at most 2 per draft), executor questions mid-run (`decide ask`; the answer is typed into its
@@ -58,7 +65,7 @@ One-time, by hand:
   everything else, at `notify.digest` (09:00, 17:00), one line each with what silence does. Silence takes ★ 2h
   (review of a factory draft) or 24h (blocked ticket, held write, quiet executor) after the digest, unless your
   last answer of that kind overrode ★; then it waits for you. A person's draft always waits.
-- Review: `factory stage` makes a **draft**. `factory-plan` (agent, every 10m) writes its plan tree: a theme,
+- Review: `factory stage` makes a **draft**. The planner bot's routine (every 10m) writes its plan tree: a theme,
   tickets nested under the ones they build on (misfits dropped with a reason), steps per ticket (`FIN-1/2`,
   nested `FIN-1/2.1`) with `depends_on` edges, questions, and a review recommendation. You add notes to the
   dispatch (`root`), a ticket or a step, and answer questions; approving the review decision renders plan, notes

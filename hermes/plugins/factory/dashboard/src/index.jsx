@@ -646,7 +646,7 @@ function Tickets({ data, onDone }) {
 }
 
 // ---- health + throughput -------------------------------------------------------------------------------------
-const JOB_NAME = { "factory-ingest": "Linear sync", "factory-prune": "Verification", "factory-plan": "Planning",
+const JOB_NAME = { "factory-ingest": "Linear sync", "factory-prune": "Verification", "[bot:planner] Plan drafts": "Planning",
                    "factory-propose": "Proposals", "factory-reconcile": "Write-back", "factory-backup": "Backup" };
 function Health({ jobs }) {
   const name = (j) => JOB_NAME[j.name] || j.name;

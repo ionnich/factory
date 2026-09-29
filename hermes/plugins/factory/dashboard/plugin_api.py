@@ -45,15 +45,21 @@ async def factory(*args: str, timeout: float = 60):
     return json.loads(out)
 
 
+# The factory's cron jobs (default profile) and the planner bot's routine (its own cron store).
+JOB_FILES = (HERMES_HOME / "cron" / "jobs.json", HERMES_HOME / "profiles" / "planner" / "cron" / "jobs.json")
+
+
 def jobs() -> list[dict]:
-    path = HERMES_HOME / "cron" / "jobs.json"
-    if not path.exists():
-        return []
-    data = json.loads(path.read_text())
     keep = ("name", "schedule_display", "last_run_at", "last_status", "last_error", "next_run_at",
             "paused_at", "enabled")
-    return [{k: j.get(k) for k in keep} for j in (data.get("jobs", data) if isinstance(data, dict) else data)
-            if str(j.get("name", "")).startswith("factory-")]
+    out = []
+    for path in JOB_FILES:
+        if not path.exists():
+            continue
+        data = json.loads(path.read_text())
+        out += [{k: j.get(k) for k in keep} for j in (data.get("jobs", data) if isinstance(data, dict) else data)
+                if str(j.get("name", "")).startswith(("factory-", "[bot:planner]"))]
+    return out
 
 
 @router.get("/overview")
@@ -64,9 +70,8 @@ async def overview():
 def _stamp(conn: sqlite3.Connection) -> tuple:
     """Moves when another connection commits to factory.db (PRAGMA data_version on this connection; reads don't
     move it) or a cron job record changes."""
-    jobs_file = HERMES_HOME / "cron" / "jobs.json"
     return (conn.execute("PRAGMA data_version").fetchone()[0],
-            jobs_file.stat().st_mtime_ns if jobs_file.exists() else None)
+            *(p.stat().st_mtime_ns if p.exists() else None for p in JOB_FILES))
 
 
 @router.get("/stream")
