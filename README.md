@@ -1,4 +1,4 @@
-# planner: software factory control plane
+# factory: software factory control plane
 
 Linear tickets in niko's domains are checked against code and data, frozen into small dispatches, executed by
 factory-fleet, and written back to Linear. `~/.hermes/factory.db` is the only authoritative tracker.

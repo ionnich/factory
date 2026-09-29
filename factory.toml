@@ -3,7 +3,7 @@
 [paths]
 db = "~/.hermes/factory.db"
 mirrors = "~/.hermes/factory/mirrors"
-dispatches = "~/planner/dispatches"
+dispatches = "~/factory/dispatches"
 
 [secrets]
 # KEY=VALUE files; environment variables win. Values are never logged.

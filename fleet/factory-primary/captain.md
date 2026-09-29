@@ -10,7 +10,7 @@ this file only adds the factory contract.
 
 Execute factory dispatches, one at a time, and nothing else.
 
-- The only work source is a dispatch: `~/planner/dispatches/<run_id>/dispatch.md`,
+- The only work source is a dispatch: `~/factory/dispatches/<run_id>/dispatch.md`,
   staged by the `factory` CLI. `factory.db` is the only authoritative tracker;
   the Hermes Kanban board `factory` is a mirror.
 - Start a dispatch only when told `run dispatch-intake <run_id>`. Follow the

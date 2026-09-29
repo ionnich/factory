@@ -5,7 +5,7 @@ description: Run one staged factory dispatch end to end in factory-fleet. Load w
 
 # dispatch-intake
 
-One dispatch = a few tickets frozen in `~/planner/dispatches/<run_id>/dispatch.md`.
+One dispatch = a few tickets frozen in `~/factory/dispatches/<run_id>/dispatch.md`.
 `factory.db` is authoritative; the CLI enforces every invariant. Call it by
 absolute path: `~/.local/bin/factory`.
 

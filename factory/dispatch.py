@@ -251,7 +251,7 @@ def execute(cfg: Config, conn, run_id: str, actor: str) -> dict:
 
 
 def archive(cfg: Config, conn, run_id: str) -> dict:
-    """reconciled -> archived: unlock, move to _archived/, commit it to the planner repo."""
+    """reconciled -> archived: unlock, move to _archived/, commit it to the factory repo."""
     d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
     if d is None or d["state"] != "reconciled":
         raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not reconciled")
