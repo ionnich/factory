@@ -18,7 +18,8 @@ One-time, by hand:
 - Chat profile: `hermes profile create factory --clone --no-alias`, then in its `config.yaml`:
   `model.default deepseek-v4-pro`, `model.provider deepseek`, `plugins.enabled: [factory]`,
   `platform_toolsets.cli: [factory]`. Run `./install.sh` again to copy the plugin and `SOUL.md`.
-- factory-fleet: see `fleet/`. Primary runs in herdr workspace `factory` via `fleet/launch-factory-primary.sh`.
+- factory-fleet: see `fleet/`. Primary runs in herdr workspace `factory`. `handoff` starts it there with
+  `fleet/launch-factory-primary.sh` when the workspace or agent is missing (reboot, crash, closed pane).
 
 ## Use
 

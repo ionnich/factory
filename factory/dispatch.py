@@ -181,6 +181,33 @@ def _herdr(*args: str) -> dict:
     return json.loads(r.stdout) if r.stdout.strip().startswith("{") else {}
 
 
+LAUNCH = Path(__file__).resolve().parents[1] / "fleet" / "launch-factory-primary.sh"
+
+
+def _executor(want: str, wait: float = 180) -> dict:
+    """The one omp pane in workspace `want`. Missing workspace or agent (reboot, crash, closed pane): create it
+    and start factory-primary with the launch script, then wait until omp reports idle."""
+    def omp_panes():
+        ws = [w["workspace_id"] for w in _herdr("workspace", "list")["result"]["workspaces"] if w["label"] == want]
+        panes = [p for p in _herdr("pane", "list")["result"]["panes"] if p["workspace_id"] in ws]
+        return ws, panes, [p for p in panes if p.get("agent") == "omp"]
+    ws, panes, omp = omp_panes()
+    if len(ws) > 1 or len(omp) > 1:
+        raise StageError(f"expected one workspace {want!r} with one omp pane, found {len(ws)} and {len(omp)}")
+    if omp:
+        return omp[0]
+    if not ws:
+        panes = [_herdr("workspace", "create", "--label", want, "--cwd", str(Path.home()), "--no-focus")["result"]["root_pane"]]
+    _herdr("pane", "run", panes[0]["pane_id"], str(LAUNCH))
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        time.sleep(5)
+        if (omp := omp_panes()[2]) and omp[0].get("agent_status") in ("idle", "done"):
+            return omp[0]
+    raise StageError(f"started factory-primary in {panes[0]['pane_id']} but omp was not idle within {wait:.0f}s")
+
+
+
 def handoff(cfg: Config, conn, run_id: str) -> dict:
     """Hand a staged dispatch to the executor: fresh omp session (/new), then `run dispatch-intake <run_id>`."""
     d = conn.execute("SELECT * FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
@@ -188,12 +215,7 @@ def handoff(cfg: Config, conn, run_id: str) -> dict:
         raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not staged")
     if busy := conn.execute("SELECT run_id FROM dispatch WHERE state='executing'").fetchone():
         raise StageError(f"dispatch {busy[0]} is still executing")
-    want = cfg.raw.get("executor", {}).get("workspace", "factory")
-    ws = [w["workspace_id"] for w in _herdr("workspace", "list")["result"]["workspaces"] if w["label"] == want]
-    panes = [p for p in _herdr("pane", "list")["result"]["panes"] if p["workspace_id"] in ws and p.get("agent") == "omp"]
-    if len(panes) != 1:
-        raise StageError(f"expected one omp pane in workspace {want!r}, found {len(panes)}")
-    pane = panes[0]
+    pane = _executor(cfg.raw.get("executor", {}).get("workspace", "factory"))
     if pane.get("agent_status") not in ("idle", "done"):
         raise StageError(f"executor pane {pane['pane_id']} is {pane.get('agent_status')}; not resetting a busy session")
     for text in ("/new", f"run dispatch-intake {run_id}"):  # session reset at every dispatch boundary
