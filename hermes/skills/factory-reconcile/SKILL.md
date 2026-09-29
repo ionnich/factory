@@ -60,7 +60,6 @@ Linear any other way: everything you need is in the gate JSON and
    against live Linear, sends state first, then description, then new
    follow-up tickets, then comments, and raises flags. Exit 1 means some writes
    failed; they retry next run.
-   and raises flags. Exit 1 means some writes failed; they retry next run.
 
 Never write to Linear any other way. Finish with one line per run:
 `<run_id>: N applied, M flagged, K failed`.
