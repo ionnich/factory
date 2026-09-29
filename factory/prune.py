@@ -1,6 +1,7 @@
 """Verdict freshness, the prune gate, and validated verdict writes."""
 import json
 import re
+from datetime import UTC, datetime, timedelta
 
 from . import db, repos, witness
 from .config import Config, Context
@@ -9,6 +10,7 @@ KINDS = ("valid", "already-done", "stale", "duplicate-of", "invalid-references",
 NO_WITNESS_KINDS = {"valid", "needs-clarification"}
 PR_URL = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/pull/\d+$")
 MAP_ACTOR = "factory:map"
+VALID_TTL = timedelta(days=7)
 
 
 class VerdictError(Exception):
@@ -49,9 +51,13 @@ def owned(cfg: Config, conn, snapshot) -> bool:
 
 
 def owned_in_scope(cfg: Config, conn) -> list:
+    """Owned active tickets, minus those in their team's review_state: those wait on a human (QA), and the factory
+    neither re-judges, restages nor closes them."""
     if not conn.execute("SELECT 1 FROM linear_project LIMIT 1").fetchone():
         raise NotOwned("linear_project is empty; run factory ingest")
-    return [s for s in conn.execute("SELECT * FROM linear_latest WHERE in_scope=1") if owned(cfg, conn, s)]
+    review = {k: t.get("review_state") for k, t in cfg.linear.get("team", {}).items()}
+    return [s for s in conn.execute("SELECT * FROM linear_latest WHERE in_scope=1") if owned(cfg, conn, s)
+            and (raw := json.loads(s["raw_json"]))["state"]["name"] != review.get(raw["team"]["key"])]
 
 
 def issue_fields(snapshot) -> tuple[str | None, list[str], list[str]]:
@@ -95,6 +101,10 @@ def staleness(cfg: Config, conn, snapshot, ctx: Context | None) -> str | None:
         return "ticket-changed"
     if v["context"] != (ctx.name if ctx else None):
         return "context-changed"
+    # Evidence paths catch trunk changes that touch what the verdict read; a fix landing elsewhere doesn't.
+    # So a `valid` verdict (the one that gets staged) is also redone once it is a week old.
+    if v["kind"] == "valid" and datetime.fromisoformat(v["created_at"]) < datetime.now(UTC) - VALID_TTL:
+        return "aged"
     paths = set(json.loads(v["evidence_paths_json"]))
     if ctx is None or not paths:
         return None

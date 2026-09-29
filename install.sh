@@ -64,4 +64,12 @@ have_job factory-reconcile || hermes cron create "every 20m" "$(cat "$here/herme
   --provider "$provider" --model "$model" --reasoning-effort low \
   --name factory-reconcile --deliver local
 
+# Nightly consistent copy of factory.db to ~/.hermes/factory/backups (newest 14 kept).
+have_job factory-backup || hermes cron create "0 3 * * *" --no-agent \
+  --script factory-backup.sh --name factory-backup --deliver local
+
+# Autonomous staging + handoff for repos marked `auto` in factory.toml. Pause this job to stop it.
+have_job factory-propose || hermes cron create "every 20m" --no-agent \
+  --script factory-propose.sh --name factory-propose --deliver local
+
 hermes cron list

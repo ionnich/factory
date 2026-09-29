@@ -1,9 +1,13 @@
 """factory: control-plane CLI. Exit 0 ok, 1 refused/invalid, 2 config/infra error."""
 import argparse
+import collections
 import hashlib
 import json
+import re
 import sqlite3
+import statistics
 import sys
+from datetime import UTC, datetime, timedelta
 
 from . import config, db, dispatch, linear, prune, reconcile, repos, witness
 
@@ -45,6 +49,59 @@ def cmd_handoff(cfg, conn, a):
     out(dispatch.handoff(cfg, conn, a.run_id))
 
 
+def cmd_propose(cfg, conn, a):
+    ingest(cfg, conn)
+    out(dispatch.propose(cfg, conn))
+
+
+def cmd_backup(cfg, conn, a):
+    out(db.backup(conn, cfg.db.parent / "factory" / "backups", f"{datetime.now(UTC):%Y-%m-%d}", a.keep))
+
+
+def _p50(xs):
+    return round(statistics.median(xs), 1) if xs else None
+
+
+def cmd_metrics(cfg, conn, a):
+    """Throughput over the last N days, from transition_log, dispatch_ticket, writeback and verdict."""
+    since = (datetime.now(UTC) - timedelta(days=a.days)).strftime("%Y-%m-%dT%H:%M:%S")
+    q = lambda sql, *p: [dict(r) for r in conn.execute(sql, p)]
+    at = {(r["run_id"], r["to_state"]): r["at"] for r in q("SELECT run_id, to_state, at FROM transition_log")}
+    hours = lambda a_, b: (datetime.fromisoformat(b) - datetime.fromisoformat(a_)).total_seconds() / 3600
+    staged = [r for (r, s), t in at.items() if s == "staged" and t >= since]
+    to_done = [hours(at[(r, "staged")], at[(r, "done")]) for r in staged if (r, "done") in at]
+    to_arch = [hours(at[(r, "done")], at[(r, "archived")]) for r in staged if (r, "done") in at and (r, "archived") in at]
+    tickets = q("SELECT t.run_id, t.card_status, v.repo, e.at FROM dispatch_ticket t JOIN verdict v ON v.id=t.verdict_id "
+                "JOIN card_event e ON e.run_id=t.run_id AND e.issue_id=t.issue_id AND e.kind IN ('done','block') "
+                "WHERE e.at >= ?", since)
+    n = collections.Counter(t["card_status"] for t in tickets)
+    week = lambda ts: (datetime.fromisoformat(ts).date() - timedelta(days=datetime.fromisoformat(ts).weekday())).isoformat()
+    weeks = collections.defaultdict(collections.Counter)
+    for r in staged:
+        weeks[week(at[(r, "staged")])]["staged"] += 1
+    for t in tickets:
+        weeks[week(t["at"])][t["card_status"]] += 1
+    repos_ = collections.defaultdict(collections.Counter)
+    for t in tickets:
+        repos_[t["repo"]][t["card_status"]] += 1
+    wb = collections.Counter(  # writeback has no timestamp; every run_id embeds its YYYYMMDD-HHMMSS
+        "flagged" if r["decision"] == "flag" else r["status"]
+        for r in q("SELECT run_id, decision, status FROM writeback WHERE decision <> 'skip'")
+        if (m := re.search(r"(\d{8})-\d{6}", r["run_id"])) and m[1] >= since[:10].replace("-", ""))
+    out({"days": a.days,
+         "dispatches": {"staged": len(staged), "archived": sum((r, "archived") in at for r in staged)},
+         "tickets": {"done": n["done"], "blocked": n["blocked"]},
+         "block_rate": round(n["blocked"] / (n["done"] + n["blocked"]), 2) if n["done"] + n["blocked"] else None,
+         "hours": {"stage_to_done_p50": _p50(to_done), "stage_to_done_max": round(max(to_done), 1) if to_done else None,
+                   "done_to_archived_p50": _p50(to_arch)},
+         "per_week": [{"week": w, "staged": c["staged"], "done": c["done"], "blocked": c["blocked"]}
+                      for w, c in sorted(weeks.items())],
+         "per_repo": [{"repo": r, "done": c["done"], "blocked": c["blocked"]} for r, c in sorted(repos_.items())],
+         "writeback": {k: wb.get(k, 0) for k in ("confirmed", "failed", "flagged")},
+         "verdicts": {r["kind"]: r["n"] for r in q("SELECT kind, count(*) n FROM verdict WHERE created_at >= ? "
+                                                   "GROUP BY kind", since)}})
+
+
 def cmd_reconcile(cfg, conn, a):
     if a.rcmd == "plan":
         ingest(cfg, conn)  # Linear + trunk as they are now
@@ -61,6 +118,7 @@ def cmd_reconcile(cfg, conn, a):
     # for runs with unsent rows.
     for (run_id,) in conn.execute("SELECT run_id FROM dispatch WHERE state='reconciled'").fetchall():
         dispatch.archive(cfg, conn, run_id)
+    dispatch.watch(cfg, conn)  # stuck / executor-gone flags
     ingest(cfg, conn)
     for (run_id,) in conn.execute("SELECT run_id FROM dispatch WHERE state='done'").fetchall():
         reconcile.plan(cfg, conn, run_id)
@@ -242,6 +300,14 @@ def main(argv=None):
     s = sub.add_parser("handoff", help="reset the executor's omp session (/new) and tell it to run the dispatch")
     s.add_argument("run_id")
     s.set_defaults(fn=cmd_handoff)
+    sub.add_parser("propose", help="cron: stage the top candidate in an `auto` repo and hand it off, when idle"
+                   ).set_defaults(fn=cmd_propose)
+    s = sub.add_parser("backup", help="consistent, integrity-checked copy of factory.db; keeps the newest N")
+    s.add_argument("--keep", type=int, default=14)
+    s.set_defaults(fn=cmd_backup)
+    s = sub.add_parser("metrics", help="throughput over the last N days (JSON)")
+    s.add_argument("--days", type=int, default=28)
+    s.set_defaults(fn=cmd_metrics)
     s = sub.add_parser("execute", help="staged -> executing; only from the executor's herdr workspace")
     s.add_argument("run_id")
     s.add_argument("--actor", default="executor")

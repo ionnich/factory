@@ -5,12 +5,14 @@ factory-fleet, and written back to Linear. `~/.hermes/factory.db` is the only au
 
 ```
 ingest (cron) -> prune verdicts (cron, DeepSeek) -> stage -> handoff -> execute (factory-fleet) -> reconcile (cron) -> archive
+                                                   \_ propose (cron) does both for `auto` repos
 ```
 
 ## Install
 
 `./install.sh` (idempotent): venv, `factory` on PATH, Hermes scripts/skills/cron jobs (`factory-ingest`,
-`factory-prune`, `factory-reconcile`), the `factory` plugin (dashboard tab + chat tool), factory-fleet primary files.
+`factory-prune`, `factory-reconcile`, `factory-propose`, `factory-backup`), the `factory` plugin (dashboard tab +
+chat tool), factory-fleet primary files.
 
 One-time, by hand:
 
@@ -23,9 +25,15 @@ One-time, by hand:
 
 ## Use
 
-- Dashboard: Hermes dashboard, **Factory** tab (read-only).
+- Dashboard: Hermes dashboard, **Factory** tab: status per lifecycle stage, stage / hand off / resolve flags, and
+  throughput (`factory metrics`). A click there is the approval.
 - Chat: `hermes -p factory`. It can read status, stage, and hand off; handoff raises the Hermes approval prompt.
-- CLI: `factory status|tickets|candidates|stage|handoff|execute|card|reconcile|archive` (`--help` on each).
+- Autonomous: `factory-propose` (every 20m) stages the top candidate in a repo with `auto = true` in
+  `factory.toml` (one ticket) and hands it off, only when no dispatch is past staging and none was staged by a
+  person. Stop it with `hermes cron pause factory-propose`.
+- Backups: `factory-backup` (03:00) writes `~/.hermes/factory/backups/factory-YYYY-MM-DD.db` (newest 14), and every
+  schema migration first writes `factory-pre-vN.db`. Same disk: protects against bad writes, not disk loss.
+- CLI: `factory status|tickets|candidates|stage|handoff|propose|execute|card|reconcile|archive|metrics|backup`.
 
 ## Invariants (in code: `factory/schema.sql` triggers + CLI checks)
 
@@ -35,3 +43,7 @@ One-time, by hand:
 - Only `reconcile` writes Linear. State changes need an unassigned-or-lead ticket (and, for verdicts, an unchanged
   `updatedAt`); otherwise comment + flag. The reconcile agent may only reword prose or downgrade apply -> flag.
 - `stage` skips tickets named in nix-fleet backlogs or nix-fleet herdr workspace labels.
+- A verdict is dispatched at most once (a blocked card needs the ticket to change first); `valid` verdicts expire
+  after 7 days. Tickets in the team's review state (Ready for QA) are out of scope: they wait on a human.
+- The reconcile gate flags an executing dispatch whose executor pane is gone or with no card activity for
+  `executor.stuck_hours`.

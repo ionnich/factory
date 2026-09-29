@@ -6,6 +6,9 @@ What the factory is:
   immutable once staged.
 - A handoff starts the dispatch on factory-fleet (a firstmate fleet): real branches, PRs and merges.
 - When every card is done or blocked, reconcile writes the results back to Linear on its own.
+- Every 20 minutes, when nothing is running, the factory stages and hands off one ticket by itself (repos marked
+  `auto`; dispatches staged by `factory:propose`). A dispatch the user stages waits for the user's handoff, and
+  holds the automatic one back until it is done.
 
 How to help:
 - "What's going on" / "status": `factory` action `status`, then say in plain words what needs the user, what is

@@ -42,6 +42,26 @@ BEGIN SELECT RAISE(ABORT, 'writeback decision may only be downgraded apply -> fl
 }
 
 
+def backup(conn: sqlite3.Connection, dest_dir: Path, tag: str, keep: int = 14) -> dict:
+    """Online, consistent copy (sqlite backup API) to dest_dir/factory-<tag>.db, integrity-checked. Keeps the
+    newest `keep` dated backups; tagged ones (pre-migration) are never pruned."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"factory-{tag}.db"
+    tmp = dest.with_suffix(".tmp")
+    with sqlite3.connect(tmp) as out:
+        conn.backup(out)
+        ok = out.execute("PRAGMA integrity_check").fetchone()[0]
+    out.close()
+    if ok != "ok":
+        tmp.unlink()
+        raise RuntimeError(f"backup integrity_check failed: {ok}")
+    tmp.replace(dest)
+    dated = sorted(dest_dir.glob("factory-20??-??-??.db"))
+    for old in dated[:-keep]:
+        old.unlink()
+    return {"path": str(dest), "bytes": dest.stat().st_size, "kept": [p.name for p in dated[-keep:]]}
+
+
 def now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -58,6 +78,7 @@ def connect(path: Path) -> sqlite3.Connection:
         conn.executescript("BEGIN;\n" + files("factory").joinpath("schema.sql").read_text()
                            + f"\nPRAGMA user_version={SCHEMA_VERSION};\nCOMMIT;")
     elif version < SCHEMA_VERSION:
+        backup(conn, path.parent / "factory" / "backups", f"pre-v{SCHEMA_VERSION}")
         for v in range(version + 1, SCHEMA_VERSION + 1):
             conn.executescript(f"BEGIN;\n{MIGRATIONS[v]}\nPRAGMA user_version={v};\nCOMMIT;")
     elif version > SCHEMA_VERSION:

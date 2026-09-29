@@ -54,11 +54,16 @@ def candidates(cfg: Config, conn) -> dict:
                          (s["issue_id"],)).fetchone()
         assignee = (raw["assignee"] or {}).get("email")
         held = next((p for p, text in holds.items() if _names(text, ident)), None)
+        # A verdict is dispatched at most once: a done card already landed, a blocked one needs the ticket to
+        # change (new verdict) first. Without this, archived tickets in Ready for QA would be restaged forever.
+        prior = v and conn.execute("SELECT run_id, card_status FROM dispatch_ticket WHERE verdict_id=?",
+                                   (v["id"],)).fetchone()
         why = ("unmapped" if ctx is None
                else "no verdict" if v is None
                else f"verdict {v['kind']}" if v["kind"] != "valid"
                else f"verdict stale ({r})" if (r := prune.staleness(cfg, conn, s, ctx))
                else "in a live dispatch" if s["issue_id"] in live
+               else f"already dispatched on this verdict ({prior['run_id']}: {prior['card_status']})" if prior
                else f"assigned to {assignee}" if assignee not in (None, lead)
                else f"held by another fleet ({held})" if held
                else None)
@@ -337,3 +342,55 @@ def card(cfg: Config, conn, run_id: str, ident: str, kind: str, actor: str,
 def flag(conn, run_id: str | None, issue_id: str | None, kind: str, detail: dict) -> None:
     conn.execute("INSERT INTO flag(run_id, issue_id, kind, detail_json, created_at) VALUES (?,?,?,?,?)",
                  (run_id, issue_id, kind, json.dumps(detail), db.now()))
+
+
+PROPOSE = "factory:propose"
+
+
+def propose(cfg: Config, conn) -> dict:
+    """Cron: keep one small dispatch moving without a human. Stages the top candidate in a repo marked
+    `auto = true` and hands it off; retries its own handoff while it waits. Never touches a dispatch a
+    person staged, and does nothing while any dispatch is past staging. Pause the cron job to stop it."""
+    busy = conn.execute("SELECT run_id, state, last_actor FROM dispatch WHERE state NOT IN ('draft', 'archived') "
+                        "ORDER BY created_at").fetchall()
+    if busy and not (len(busy) == 1 and busy[0]["state"] == "staged" and busy[0]["last_actor"] == PROPOSE):
+        return {"action": "wait", "dispatches": [dict(d) for d in busy]}
+    if busy:
+        run_id, staged = busy[0]["run_id"], None
+    else:
+        auto = [c for c in candidates(cfg, conn)["candidates"] if cfg.repos.get(c["repo"], {}).get("auto")]
+        if not auto:
+            return {"action": "idle", "reason": "no candidate in an auto repo"}
+        staged = stage(cfg, conn, [auto[0]["identifier"]], PROPOSE)  # ponytail: one ticket per auto dispatch
+        run_id = staged["run_id"]
+    try:
+        return {"action": "handoff", "staged": staged, "handoff": handoff(cfg, conn, run_id)}
+    except StageError as e:  # executor busy or not starting: stays staged, retried next run
+        return {"action": "staged", "staged": staged, "run_id": run_id, "handoff_error": str(e)}
+
+
+def watch(cfg: Config, conn) -> list:
+    """Flag an executing dispatch whose executor pane is gone, or with no card activity for
+    executor.stuck_hours (default 6). One open flag per dispatch and kind."""
+    stuck_h = cfg.raw.get("executor", {}).get("stuck_hours", 6)
+    try:
+        panes = {p["pane_id"]: p for p in _herdr("pane", "list")["result"]["panes"]}
+    except (StageError, OSError, subprocess.TimeoutExpired):
+        panes = None  # herdr down: the pane check can't tell, the idle check still runs
+    raised = []
+    for d in conn.execute("SELECT * FROM dispatch WHERE state='executing'").fetchall():
+        last = conn.execute("SELECT max(at) FROM card_event WHERE run_id=?", (d["run_id"],)).fetchone()[0]
+        idle_h = (datetime.now(UTC) - datetime.fromisoformat(max(filter(None, (last, d["executing_at"]))))
+                  ).total_seconds() / 3600
+        checks = {"executor-gone": panes is not None and (panes.get(d["executor_pane"]) or {}).get("agent") != "omp",
+                  "dispatch-stuck": idle_h > stuck_h}
+        for kind, bad in checks.items():
+            if bad and not conn.execute("SELECT 1 FROM flag WHERE run_id=? AND kind=? AND resolved_at IS NULL",
+                                        (d["run_id"], kind)).fetchone():
+                reason = (f"executor pane {d['executor_pane']} no longer runs omp; the dispatch cannot finish"
+                          if kind == "executor-gone" else
+                          f"no card activity for {idle_h:.1f}h (limit {stuck_h}h); check the factory workspace")
+                with db.tx(conn):
+                    flag(conn, d["run_id"], None, kind, {"reason": reason})
+                raised.append({"run_id": d["run_id"], "kind": kind, "reason": reason})
+    return raised

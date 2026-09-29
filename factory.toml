@@ -42,23 +42,35 @@ max_tickets = 3
 # Other fleets' backlogs (read-only). A ticket named in any of them is theirs; stage skips it.
 foreign_backlogs = ["~/.local/share/firstmate/homes/*/data/backlog.md"]
 
+[executor]
+# herdr workspace of factory-primary; `watch` flags an executing dispatch with no card activity this long.
+workspace = "factory"
+stuck_hours = 6
+
 # ---------------------------------------------------------------- repos
+# auto = `factory propose` (cron) may stage and hand off this repo's tickets without a human: repos where
+# factory-fleet may merge on green (+yolo in its projects.md). finks-portfolio-service/core-rs/overwatch: never.
 # trunk = the branch PRs land on. Verified with git ls-remote 2026-09-29: repo-map's
 # dev_target "dev" is stale for finks-prism and finks-insights-service (no dev branch).
 [repos."Finks-ai/finks-dagster"]
 trunk = "main"
+auto = true
 [repos."Finks-ai/finks-api"]
 trunk = "main"
+auto = true
 [repos."Finks-ai/finks-prism"]
 trunk = "main"
+auto = true
 [repos."Finks-ai/finks-insights-service"]
 trunk = "main"
+auto = true
 [repos."Finks-ai/finks-overwatch"]
 trunk = "main"
 [repos."Finks-ai/finks-portfolio-service"]
 trunk = "main"
 [repos."Finks-ai/finks-clustering-service"]
 trunk = "main"
+auto = true
 
 # ---------------------------------------------------------------- bounded contexts
 # Keyed on the ticket body's canonical `Domain:` project (finks-ddd: Domain decides
@@ -109,11 +121,12 @@ domains = ["Connected Portfolios"]
 witnesses = ["clickhouse-serving"]
 
 # Added 2026-09-29 by operator decision. SEC Filings tickets reach it only via `Repo: finks-clustering-service`
-# (FIN-4115). No witness: factory_witness has no grant on clustering_prod.*.
+# (FIN-4115).
 [[context]]
 name = "news-clustering"
 repo = "Finks-ai/finks-clustering-service"
 domains = ["News Clustering", "SEC Filings"]
+witnesses = ["clickhouse-serving"]
 
 # ---------------------------------------------------------------- witnesses (all read-only)
 [witness.dagster-prod]
@@ -125,7 +138,7 @@ token_env = "DAGSTER_CLOUD_API_TOKEN"
 # User factory_witness (created 2026-09-29 via /finks/prod/clickhouse-uri `default`): settings profile
 # readonly=2, max_execution_time<=5, max_result_rows<=200; SELECT only on system.{tables,parts,columns},
 # filings.*, evidence_fabric.*, insights.*, ck_dev.* (market data; the prod secret points here),
-# user_data_prod.* (per-user holdings). One Cloud service holds every env's databases.
+# user_data_prod.* (per-user holdings), clustering_prod.* (granted 2026-09-29 for news-clustering). One Cloud service holds every env's databases.
 [witness.clickhouse-serving]
 kind = "clickhouse"
 readonly = true
