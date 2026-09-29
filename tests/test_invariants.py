@@ -91,7 +91,7 @@ class Ownership(unittest.TestCase):
                      contexts=[], repos={}, witnesses={})
 
         def snap(body):
-            return {"raw_json": json.dumps({"description": body, "labels": {"nodes": []}})}
+            return {"identifier": "FIN-1", "raw_json": json.dumps({"description": body, "labels": {"nodes": []}})}
         cases = [
             ("Domain: [Entity Graph](https://linear.app/j/project/entity-graph-44941f276414)", True),  # slug id
             (f"Domain: [Discover](<https://linear.app/j/project/discover-{uuid}>)", False),           # uuid, other lead
