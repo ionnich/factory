@@ -12,8 +12,8 @@ const { useState, useEffect, useCallback, useRef, useMemo } = SDK.hooks;
 const { Button, Badge, Card, CardContent, Input, Tabs, TabsList, TabsTrigger, Toast } = SDK.components;
 const h = React.createElement;
 const Fragment = React.Fragment;  // for <>…</>
-const REFRESH_MS = 30000;
 const API = "/api/plugins/factory";
+
 
 const ago = (iso) => (iso ? SDK.utils.isoTimeAgo(iso) : "never");
 const epochAgo = (v) => (v == null ? "never" : typeof v === "number" ? SDK.utils.timeAgo(v) : ago(v));
@@ -136,6 +136,12 @@ function Answered({ d }) {
   );
 }
 
+function Silence({ d }) {
+  if (!d.on_timeout) return null;
+  const when = d.deadline ? ` until ${localTime(d.deadline)} (in ${until(d.deadline)})` : "";
+  return <div className="fx-hint">If you stay silent{when}: {d.on_timeout}.</div>;
+}
+
 function DecisionBody({ d, onChoose, busy, err, compact }) {
   if (!d.open) return <Answered d={d} />;
   return (
@@ -143,7 +149,7 @@ function DecisionBody({ d, onChoose, busy, err, compact }) {
       <div className="fx-why"><span className="star">★</span> {d.options.find((o) => o.id === d.recommended)?.label}: {d.why}</div>
       <div className="fx-opts">{sortOptions(d).map((o) => <Option key={o.id} d={d} o={o} busy={busy} onChoose={onChoose} />)}</div>
       <ActErr err={err} />
-      {!compact ? <div className="fx-hint">{d.deadline ? `If nobody answers by ${localTime(d.deadline)} (in ${until(d.deadline)}), ${d.on_timeout.replace(/ when .*$/, "")}.` : `If nobody answers, ${d.on_timeout}.`}</div> : null}
+      {!compact ? <Silence d={d} /> : null}
     </>
   );
 }
@@ -159,22 +165,44 @@ function useChoose(d, onDone) {
   return { busy, err, choose };
 }
 
-// The deck: the top card is live; two more peek out behind it.
+// The deck: the top card is live; two more peek out behind it. A tap answers at once: the card flies off and the
+// next one is live while the server confirms; if it refuses, the card comes back on top with the reason.
 function Deck({ decisions, context, onDone, onOpen }) {
   const [order, setOrder] = useState([]);
   const [gone, setGone] = useState({});
+  const [flying, setFlying] = useState([]);
+  const [errs, setErrs] = useState({});
   const ids = decisions.map((d) => d.id).filter((id) => !gone[id]);
   const seq = [...order.filter((id) => ids.includes(id)), ...ids.filter((id) => !order.includes(id))];
   const byId = Object.fromEntries(decisions.map((d) => [d.id, d]));
   const later = () => setOrder([...seq.slice(1), seq[0]]);
-  const done = (r, d, dir) => { setGone((g) => ({ ...g, [d.id]: dir || "right" })); onDone(r, d); };
+  const drop = (map, id) => { const { [id]: _, ...rest } = map; return rest; };
+  const choose = (d, option, note) => {
+    setGone((g) => ({ ...g, [d.id]: true }));
+    setErrs((e) => drop(e, d.id));
+    setFlying((f) => [...f, d]);
+    setTimeout(() => setFlying((f) => f.filter((x) => x.id !== d.id)), 340);
+    post(`/decisions/${d.id}`, { option, note }).then((r) => onDone(r, d), (e) => {
+      setGone((g) => drop(g, d.id));
+      setErrs((x) => ({ ...x, [d.id]: errText(e) }));
+      setOrder((o) => [d.id, ...o.filter((id) => id !== d.id)]);  // back on top, with why
+    });
+  };
+  const flyers = flying.map((d) => (
+    <div key={`fly-${d.id}`} className="fx-card fx-top fx-fly leave-right" aria-hidden="true">
+      <span className="fx-k">{KIND[d.kind]}</span><div className="fx-q">{d.question}</div>
+    </div>
+  ));
   if (!seq.length) {
     return (
       <div className="fx-deck">
-        <Card className="fx-card fx-clear"><CardContent><div className="fx-bounce">✓</div>
-          <div className="fx-title">Nothing needs you</div>
-          <div className="fx-hint">New questions land here as cards. The factory keeps going on its own meanwhile.</div>
-        </CardContent></Card>
+        <div className="fx-stack">
+          <Card className="fx-card fx-clear"><CardContent><div className="fx-bounce">✓</div>
+            <div className="fx-title">Nothing needs you</div>
+            <div className="fx-hint">New questions land here as cards. The factory keeps going on its own meanwhile.</div>
+          </CardContent></Card>
+          {flyers}
+        </div>
       </div>
     );
   }
@@ -186,18 +214,18 @@ function Deck({ decisions, context, onDone, onOpen }) {
             <span className="fx-k">{KIND[byId[id].kind]}</span>
           </div>
         ))}
-        <TopCard key={seq[0]} d={byId[seq[0]]} ctx={context(byId[seq[0]])} onDone={done} onLater={later}
-                 onOpen={onOpen} pos={`1 of ${seq.length}`} canLater={seq.length > 1} />
+        <TopCard key={seq[0]} d={byId[seq[0]]} ctx={context(byId[seq[0]])} err={errs[seq[0]]} onChoose={choose}
+                 onLater={later} onOpen={onOpen} pos={`1 of ${seq.length}`} canLater={seq.length > 1} />
+        {flyers}
       </div>
     </div>
   );
 }
 
-function TopCard({ d, ctx, onDone, onLater, onOpen, pos, canLater }) {
+function TopCard({ d, ctx, err, onChoose, onLater, onOpen, pos, canLater }) {
   const [dx, setDx] = useState(0);
   const [leaving, setLeaving] = useState(null);
   const drag = useRef(null);
-  const c = useChoose(d, (r) => { setLeaving("right"); setTimeout(() => onDone(r, d), 320); });
   const rec = d.options.find((o) => o.id === d.recommended);
   const down = (e) => {
     if (e.target.closest("button, input, a")) return;
@@ -209,7 +237,7 @@ function TopCard({ d, ctx, onDone, onLater, onOpen, pos, canLater }) {
     if (!drag.current) return;
     drag.current = null;
     if (dx < -110 && canLater) { setLeaving("left"); setTimeout(() => { setLeaving(null); setDx(0); onLater(); }, 280); return; }
-    if (dx > 110 && rec && !rec.note && !rec.weighty) { setDx(0); c.choose(rec.id).catch(() => {}); return; }
+    if (dx > 110 && rec && !rec.note && !rec.weighty) { setDx(0); onChoose(d, rec.id); return; }
     setDx(0);  // weighty or needs words: swipe only points at it; tap the ★ option
   };
   const style = leaving ? undefined : dx ? { transform: `translateX(${dx}px) rotate(${dx / 24}deg)`, transition: "none" } : undefined;
@@ -219,17 +247,32 @@ function TopCard({ d, ctx, onDone, onLater, onOpen, pos, canLater }) {
       <CardContent className="fx-stack-v">
         {dx > 40 ? <div className="fx-swipe right">★ {rec?.label}</div> : dx < -40 && canLater ? <div className="fx-swipe left">Later</div> : null}
         <div className="fx-row between">
-          <span className="fx-row"><Tone tone={d.kind === "writeback" || d.kind === "blocked" ? "red" : "amber"}>{KIND[d.kind]}</Tone>
+          <span className="fx-row"><Tone tone={d.tier === "now" || d.kind === "writeback" || d.kind === "blocked" ? "red" : "amber"}>{KIND[d.kind]}</Tone>
+            {d.tier === "now" ? <span className="fx-urgent">work waits on you</span> : null}
             {d.deadline ? <span className="fx-clock">⏱ {until(d.deadline)}</span> : null}</span>
           <span className="fx-hint">{pos}</span>
         </div>
         {ctx ? <button className="fx-ctx" onClick={() => onOpen(d)}>{ctx} ›</button> : null}
         <div className="fx-q">{d.question}</div>
         {d.detail?.reason && d.kind !== "writeback" ? <div className="fx-hint">{d.detail.reason}</div> : null}
-        <DecisionBody d={d} busy={c.busy} err={c.err} onChoose={(o, n) => c.choose(o, n).catch(() => {})} />
+        <DecisionBody d={d} err={err} onChoose={(o, n) => onChoose(d, o, n)} />
         <div className="fx-hint fx-gesture">Swipe right for ★{canLater ? ", left for later" : ""}</div>
       </CardContent>
     </Card>
+  );
+}
+
+// What the factory answered on its own this week (earned, nothing to weigh, silence past its deadline).
+function DoneForYou({ items }) {
+  const label = (d) => d.options.find((o) => o.id === d.chosen)?.label || d.chosen;
+  const why = (d) => d.chosen_by.replace(/^factory:auto \((.*)\)$/, "$1");
+  return (
+    <ul className="fx-done">
+      {[...items].reverse().map((d) => (
+        <li key={d.id}><span className="tick">✓</span> <b>{label(d)}</b> · {d.question}
+          <div className="fx-hint">{why(d)} · {ago(d.chosen_at)}</div></li>
+      ))}
+    </ul>
   );
 }
 
@@ -629,17 +672,30 @@ function FactoryPage() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loadedAt, setLoadedAt] = useState(null);
+  const [live, setLive] = useState(false);
   const [sel, setSel] = useState(null);
   const [focus, setFocus] = useState(null);
   const [toast, setToast] = useState(null);
   const [showTp, setShowTp] = useState(false);
   const [, tick] = useState(0);
   const flowRef = useRef(null);
-  const load = useCallback(() => {
-    SDK.fetchJSON(`${API}/overview`).then((d) => { setData(d); setError(null); setLoadedAt(new Date().toISOString()); },
-                                          (e) => setError(errText(e)));
+  const inflight = useRef(false);
+  const again = useRef(false);
+  const load = useCallback(() => {  // one refresh at a time; a change mid-flight refreshes once more after
+    if (inflight.current) { again.current = true; return; }
+    inflight.current = true;
+    SDK.fetchJSON(`${API}/overview`)
+      .then((d) => { setData(d); setError(null); setLoadedAt(new Date().toISOString()); }, (e) => setError(errText(e)))
+      .finally(() => { inflight.current = false; if (again.current) { again.current = false; load(); } });
   }, []);
-  useEffect(() => { load(); const t = setInterval(load, REFRESH_MS); return () => clearInterval(t); }, [load]);
+  useEffect(() => {  // the server says when factory.db changed; no polling
+    load();
+    const es = new EventSource(`${API}/stream`);
+    es.addEventListener("change", load);
+    es.onopen = () => { setLive(true); load(); };
+    es.onerror = () => setLive(false);
+    return () => es.close();
+  }, [load]);
   useEffect(() => { const t = setInterval(() => tick((x) => x + 1), 30000); return () => clearInterval(t); }, []);
   useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(null), 3500); return () => clearTimeout(t); }, [toast]);
   const titles = useMemo(() => {
@@ -651,15 +707,24 @@ function FactoryPage() {
 
   if (!data) return <div className="fx">{error ? <div className="fx-err">{error}</div> : <div className="fx-hint">Loading…</div>}</div>;
 
-  const decisions = [...data.status.decisions].sort((a, b) =>
-    (a.deadline ? Date.parse(a.deadline) : Infinity) - (b.deadline ? Date.parse(b.deadline) : Infinity)
+  // The deck holds what needs a person: pushed (work waits) and digest ones. The factory takes the auto ones itself;
+  // planner questions ride along with their review (★ on approval) and hang off their step in the flow.
+  const open = data.status.decisions;
+  const decisions = open.filter((x) => x.tier !== "auto" && x.kind !== "plan").sort((a, b) =>
+    (b.tier === "now") - (a.tier === "now")
+    || (a.deadline ? Date.parse(a.deadline) : Infinity) - (b.deadline ? Date.parse(b.deadline) : Infinity)
     || KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind) || a.id - b.id);
   const byRun = Object.fromEntries(data.dispatches.map((d) => [d.run_id, d]));
   const skipped = Object.fromEntries((data.candidates?.skipped || []).map((x) => [x.identifier, x.reason]));
   const answers = data.tickets.filter((t) => ticketGroup(t, skipped).group === "answer").length;
   const needs = decisions.length;
   const current = byRun[sel] || data.dispatches.find((d) => decisions.some((x) => x.run_id === d.run_id)) || data.dispatches[0];
-  const context = (x) => (byRun[x.run_id] ? clip(dispatchTitle(byRun[x.run_id], titles), 60) : x.identifier ? `${x.identifier} ${clip(x.title, 50)}` : null);
+  const context = (x) => {
+    const base = byRun[x.run_id] ? clip(dispatchTitle(byRun[x.run_id], titles), 60) : x.identifier ? `${x.identifier} ${clip(x.title, 50)}` : null;
+    const qs = x.kind === "review" ? open.filter((y) => y.kind === "plan" && y.run_id === x.run_id).length : 0;
+    return qs ? `${base} · ${plural(qs, "planner question")}, ★ on approval` : base;
+  };
+  const done4u = data.status.done_for_you || [];
   const done = (r, d, msg) => {
     const o = d && d.options.find((x) => x.id === r?.chosen);
     setToast({ type: r?.after_error || r?.handoff_error ? "error" : "success",
@@ -680,7 +745,8 @@ function FactoryPage() {
         <div className={`fx-hello${needs ? " you" : ""}`}>{needs ? `${plural(needs, "thing")} need${needs === 1 ? "s" : ""} you` : "All clear"}</div>
         <div className="fx-row fx-hint">
           <Health jobs={data.jobs} /><span>·</span>
-          <button className="fx-link-btn" onClick={load} title="Refreshes every 30 seconds">updated {loadedAt ? ago(loadedAt) : ""}</button>
+          <button className="fx-link-btn" onClick={load} title="Updates the moment something changes">
+            <span className={`fx-live${live ? " on" : ""}`} />{live ? "live" : "reconnecting"} · {loadedAt ? ago(loadedAt) : ""}</button>
           {answers ? <><span>·</span><span>{plural(answers, "ticket")} need answers in Linear</span></> : null}
         </div>
         {error ? <div className="fx-err">Last refresh failed: {error}</div> : null}
@@ -694,7 +760,7 @@ function FactoryPage() {
           <div className="fx-carousel">
             {data.dispatches.map((d) => (
               <DispatchChip key={d.run_id} d={d} title={dispatchTitle(d, titles)} selected={current?.run_id === d.run_id}
-                            needs={decisions.filter((x) => x.run_id === d.run_id).length} onClick={() => { setSel(d.run_id); setFocus(null); }} />
+                            needs={open.filter((x) => x.run_id === d.run_id && x.tier !== "auto").length} onClick={() => { setSel(d.run_id); setFocus(null); }} />
             ))}
           </div>
           {current ? <Flow key={current.run_id} d={current} titles={titles} onDone={done} focusNode={focus} /> : null}
@@ -705,6 +771,13 @@ function FactoryPage() {
         <h2>Tickets <span className="fx-hint">not in a dispatch</span></h2>
         <Tickets data={data} onDone={done} />
       </section>
+
+      {done4u.length ? (
+        <details className="fx-sec fx-fold">
+          <summary>Done for you <span className="fx-count">{done4u.length}</span> <span className="fx-hint">this week</span></summary>
+          <DoneForYou items={done4u} />
+        </details>
+      ) : null}
 
       <details className="fx-sec fx-fold" onToggle={(e) => setShowTp(e.currentTarget.open)}>
         <summary>Throughput</summary>

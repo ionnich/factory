@@ -2,14 +2,17 @@
 truth, which enforces the invariants) plus Hermes's own cron job records. Writes: stage (a draft), draft notes,
 and answering decisions (approve/hold/reject a draft, questions, blocked tickets, held Linear writes, executor). The dashboard sits behind Hermes login on the tailnet, so a click by
 the logged-in user is the human approval. POSTs take JSON bodies only (a cross-site form or no-cors fetch can't
-send application/json)."""
+send application/json). /stream tells an open tab when factory.db or the cron jobs changed, so it refreshes at
+once instead of polling."""
 import asyncio
 import json
 import os
 import re
+import sqlite3
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 router = APIRouter()
@@ -17,6 +20,7 @@ router = APIRouter()
 HOME = Path.home()
 FACTORY = str(HOME / ".local/bin/factory")
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", HOME / ".hermes"))
+DB = Path(os.environ.get("FACTORY_DB", HOME / ".hermes/factory.db"))  # factory.toml [paths] db
 # factory shells out to git for evidence freshness; the dashboard may run with a minimal PATH.
 ENV = {**os.environ, "PATH": ":".join([str(HOME / ".local/bin"), "/etc/profiles/per-user/nich/bin",
                                        "/run/current-system/sw/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"])}
@@ -54,12 +58,37 @@ def jobs() -> list[dict]:
 
 @router.get("/overview")
 async def overview():
-    status, tickets, candidates = await asyncio.gather(factory("status"), factory("tickets"), factory("candidates"))
-    # live dispatches, plus finished ones something still waits on you for (e.g. a blocked ticket)
-    runs = list(dict.fromkeys([d["run_id"] for d in status["dispatches"]] +
-                              [x["run_id"] for x in status["decisions"] if x["run_id"] and x["kind"] == "blocked"]))
-    dispatches = await asyncio.gather(*(factory("status", r) for r in runs if RUN_ID.match(r)))
-    return {"status": status, "tickets": tickets, "candidates": candidates, "dispatches": dispatches, "jobs": jobs()}
+    return {**await factory("overview"), "jobs": jobs()}
+
+
+def _stamp(conn: sqlite3.Connection) -> tuple:
+    """Moves when another connection commits to factory.db (PRAGMA data_version on this connection; reads don't
+    move it) or a cron job record changes."""
+    jobs_file = HERMES_HOME / "cron" / "jobs.json"
+    return (conn.execute("PRAGMA data_version").fetchone()[0],
+            jobs_file.stat().st_mtime_ns if jobs_file.exists() else None)
+
+
+@router.get("/stream")
+async def stream(request: Request):
+    async def events():
+        conn = sqlite3.connect(DB, isolation_level=None, timeout=5)
+        try:
+            last, idle = _stamp(conn), 0
+            yield "retry: 3000\n\n"
+            while not await request.is_disconnected():
+                await asyncio.sleep(1)
+                now = _stamp(conn)
+                if now != last:
+                    last, idle = now, 0
+                    yield "event: change\ndata: {}\n\n"
+                elif (idle := idle + 1) >= 15:  # keep proxies from closing a quiet stream
+                    idle = 0
+                    yield ": ping\n\n"
+        finally:
+            conn.close()
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 class Stage(BaseModel):

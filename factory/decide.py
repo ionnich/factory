@@ -1,7 +1,10 @@
 """Decisions: every choice the factory needs from a person. Each has >= 2 options that say what they lead to and
-one recommendation with why. A person answers it (or, for a draft's review and plan questions, the recommendation
-is taken when time runs out); the answer's effect runs here. Shape and answer-once live in schema triggers
-(decision_valid, decision_answer_once)."""
+one recommendation with why. Shape and answer-once live in schema triggers (decision_valid, decision_answer_once).
+
+Asking less: each decision gets a tier when it is asked (see _tier). `sweep` takes the recommendation (★) on the
+ones whose time came; `notify` pushes the ones that stop work and puts the rest in a digest twice a day. Silence
+takes ★ only for kinds where the user's last answer agreed with it; EARNED_AFTER straight ★ answers and the
+factory stops asking that kind."""
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -12,6 +15,56 @@ from . import db, dispatch
 WEIGHTY = {("review", "approve"), ("writeback", "apply"), ("executor-gone", "restart"), ("executor-gone", "stop"),
            ("dispatch-stuck", "restart"), ("dispatch-stuck", "stop")}
 OPEN = "chosen IS NULL AND void_reason IS NULL"
+AUTO = "factory:auto"
+EARNED_AFTER = 5  # straight answers taking ★ before the factory takes it without asking
+# Kinds where silence takes ★, and how long after the user was told. Every other kind waits for the user.
+SILENT = {"review": timedelta(hours=2), "blocked": timedelta(hours=24), "writeback": timedelta(hours=24),
+          "dispatch-stuck": timedelta(hours=24)}
+
+
+def _iso(t: datetime) -> str:
+    return t.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _human(by: str | None) -> bool:
+    """A choice a person made (dashboard, chat, CLI). Not the factory's, and not implicit ones: plan questions
+    taken along with an approval, flags resolved before decisions existed."""
+    return bool(by) and by.startswith(("user", "agent:factory-chat")) and not by.endswith(
+        ("(approved with the recommendation)", "(flag resolution)"))
+
+
+def streak(conn, kind: str) -> int | None:
+    """How many of the user's latest answers of this kind in a row took ★ (counted up to EARNED_AFTER); None when
+    they never answered one."""
+    n = None
+    for chosen, rec, by in conn.execute("SELECT chosen, recommended, chosen_by FROM decision WHERE kind=? AND "
+                                        "chosen IS NOT NULL ORDER BY chosen_at DESC, id DESC", (kind,)):
+        if not _human(by):
+            continue
+        if chosen != rec:
+            return n or 0
+        n = (n or 0) + 1
+        if n >= EARNED_AFTER:
+            return n
+    return n
+
+
+def _tier(conn, kind: str, run_id: str | None, options: list) -> str:
+    """auto: nothing for a person to weigh, or ★ earned. now: work is stopped until the user answers. digest: it
+    can wait for the next digest. A person's draft, or one they held, is never started without them."""
+    earned = kind != "plan" and (streak(conn, kind) or 0) >= EARNED_AFTER
+    if kind == "review":
+        d = conn.execute("SELECT drafted_by, emergency, held_reason FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+        own = d is not None and d["drafted_by"] == dispatch.PROPOSE and not d["held_reason"]
+        return "auto" if own and (d["emergency"] or earned) else "digest"
+    if kind == "writeback" and "apply" not in {o["id"] for o in options}:
+        return "auto"  # a code check held it (assignee, ticket changed): skipping is the only real answer
+    if kind == "executor-gone":  # the first crash is restarted; a second one is the user's
+        again = conn.execute("SELECT 1 FROM decision WHERE run_id=? AND kind='executor-gone'", (run_id,)).fetchone()
+        return "now" if again else "auto"
+    if earned:
+        return "auto"
+    return "now" if kind == "ask" else "digest"
 
 
 def option(id: str, label: str, leads_to: str, note: str | None = None) -> dict:
@@ -22,11 +75,12 @@ def option(id: str, label: str, leads_to: str, note: str | None = None) -> dict:
 def open_(conn, kind: str, question: str, options: list, recommended: str, why: str, created_by: str, *,
           run_id: str | None = None, node_id: str = "root", issue_id: str | None = None, ref: str | None = None,
           detail: dict | None = None) -> int:
+    tier, now = _tier(conn, kind, run_id, options), db.now()
     return conn.execute(
         "INSERT INTO decision(run_id, node_id, issue_id, kind, ref, question, options_json, recommended, why, "
-        "detail_json, created_at, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "detail_json, created_at, created_by, tier, due_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (run_id, node_id, issue_id, kind, ref, question, json.dumps(options), recommended, why,
-         json.dumps(detail or {}), db.now(), created_by)).lastrowid
+         json.dumps(detail or {}), now, created_by, tier, now if tier == "auto" else None)).lastrowid
 
 
 def void(conn, where: str, params: tuple, reason: str) -> int:
@@ -122,15 +176,33 @@ def ask(conn, run_id: str, node: str, question: str, options: list, recommended:
 
 
 # ---- reading ---------------------------------------------------------------------------------------------------
-def _deadline(conn, d) -> tuple[str | None, str]:
-    """When the recommendation is taken without you, and what happens if nobody answers."""
+def _silent(conn, d) -> timedelta | None:
+    """How long after the user was told silence takes ★; None: it waits for them."""
+    if d["tier"] != "digest" or d["kind"] not in SILENT:
+        return None
     if d["kind"] == "review":
-        r = conn.execute("SELECT drafted_by, review_until, held_reason, emergency FROM dispatch WHERE run_id=?",
-                         (d["run_id"],)).fetchone()
-        if r and r["drafted_by"] == dispatch.PROPOSE and not r["held_reason"]:
-            return r["review_until"], "the factory takes the recommendation when the review window ends"
+        r = conn.execute("SELECT drafted_by, held_reason FROM dispatch WHERE run_id=?", (d["run_id"],)).fetchone()
+        if r is None or r["drafted_by"] != dispatch.PROPOSE or r["held_reason"]:
+            return None  # a person's draft, or one they held
+    if streak(conn, d["kind"]) == 0:
+        return None  # their last answer of this kind overrode ★: silence isn't consent here
+    return SILENT[d["kind"]]
+
+
+def _deadline(conn, d) -> tuple[str | None, str]:
+    """When ★ is taken without the user, and what happens if they stay silent."""
+    if d["tier"] == "auto":
+        return d["due_at"], "the factory takes ★ on its next pass (a few minutes)"
+    if d["due_at"]:
+        return d["due_at"], "the factory takes ★"
     if d["kind"] == "plan":
-        return None, "the recommendation is taken when the dispatch is approved"
+        return None, "★ is taken when the dispatch is approved"
+    if d["tier"] == "now":
+        return None, "it waits for you; that work is stopped until you answer"
+    if (s := _silent(conn, d)) and not d["notified_at"]:
+        return None, f"it goes in the next digest; ★ is taken {s.total_seconds() / 3600:g}h after that"
+    if d["kind"] in SILENT and streak(conn, d["kind"]) == 0:
+        return None, "it waits for you (you overrode ★ on this kind last time)"
     return None, "it waits for you"
 
 
@@ -139,7 +211,7 @@ def _row(conn, r) -> dict:
     d["options"] = [{**o, "weighty": (d["kind"], o["id"]) in WEIGHTY} for o in json.loads(d.pop("options_json"))]
     d["detail"] = json.loads(d.pop("detail_json"))
     d["open"] = d["chosen"] is None and d["void_reason"] is None
-    d["deadline"], d["on_timeout"] = _deadline(conn, r)
+    d["deadline"], d["on_timeout"] = _deadline(conn, r) if d["open"] else (None, None)
     return d
 
 
@@ -271,3 +343,156 @@ def snoozed(conn, run_id: str, kind: str, hours: float) -> bool:
     since = (datetime.now(UTC) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
     return conn.execute("SELECT 1 FROM decision WHERE run_id=? AND kind=? AND chosen='wait' AND chosen_at >= ?",
                         (run_id, kind, since)).fetchone() is not None
+
+
+def ok(cfg, conn, ids: list[int], actor: str) -> list[dict]:
+    """The user's "ok" to a digest or push: take ★ on each (options that ask for words get the ★ reason)."""
+    out = []
+    for did in ids:
+        try:
+            d = one(conn, did)
+            if d is None:
+                raise dispatch.StageError(f"no decision {did}")
+            out.append(choose(cfg, conn, did, d["recommended"], actor, note=f"ok to ★: {d['why']}"))
+        except dispatch.StageError as e:
+            out.append({"decision": did, "error": str(e)})
+    return out
+
+
+# ---- the factory's own answers -----------------------------------------------------------------------------------
+def _because(conn, d) -> str:
+    if d["tier"] != "auto":
+        return "you were silent after it reached you"
+    if d["kind"] == "review" and conn.execute("SELECT emergency FROM dispatch WHERE run_id=?", (d["run_id"],)).fetchone()[0]:
+        return "emergency: Urgent in Linear and a small change"
+    if d["kind"] == "writeback" and "apply" not in {o["id"] for o in d["options"]}:
+        return "a code check held it; nothing to weigh"
+    if d["kind"] == "executor-gone":
+        return "first crash of this dispatch: restarted once"
+    return f"earned: you took ★ the last {EARNED_AFTER} times"
+
+
+def sweep(cfg, conn) -> list[dict]:
+    """Take ★ on every open decision whose time came: auto ones, and silent ones past their deadline. A review
+    that can no longer start (a ticket moved under the plan) is rejected instead; anything else that no longer
+    applies is withdrawn."""
+    done = []
+    for (did,) in conn.execute(f"SELECT id FROM decision WHERE {OPEN} AND due_at <= ? ORDER BY id", (db.now(),)).fetchall():
+        d = one(conn, did)
+        if not d["open"]:
+            continue  # an earlier answer in this pass withdrew it (a rejected draft's questions)
+        because = _because(conn, d)
+        try:
+            res = choose(cfg, conn, did, d["recommended"], f"{AUTO} ({because})", note=f"{because}. {d['why']}")
+        except dispatch.StageError as e:
+            if d["kind"] == "review" and d["recommended"] == "approve":
+                res = choose(cfg, conn, did, "reject", f"{AUTO} (could not start)", note=f"not started: {e}")
+            else:
+                with db.tx(conn):
+                    void(conn, "id=?", (did,), f"★ could not be taken: {e}")
+                res = {"voided": str(e)}
+        done.append({"id": did, "kind": d["kind"], "question": d["question"], "because": because, **res})
+    return done
+
+
+def done_for_you(conn, since: str) -> list[dict]:
+    """What the factory answered on its own since `since`."""
+    return [_row(conn, r) for r in conn.execute(
+        f"{_SELECT} WHERE d.chosen_by LIKE 'factory:%' AND d.kind <> 'plan' AND d.chosen_at > ? ORDER BY d.id", (since,))]
+
+
+# ---- telling the user (factory Bot Chat on Hermex) -----------------------------------------------------------------
+def _clip(s: str, n: int) -> str:
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[:n - 1].rstrip() + "…"
+
+
+def _local(iso: str, now: datetime) -> str:
+    t = datetime.fromisoformat(iso).astimezone()
+    return f"{t:%H:%M}" if t.date() == now.astimezone().date() else f"{t:%a %H:%M}"
+
+
+def _slot(now: datetime, times: list[str]) -> str | None:
+    """The latest digest time (local 'HH:MM') at or before now, as 'YYYY-MM-DD HH:MM'."""
+    local = now.astimezone()
+    for day in (local, local - timedelta(days=1)):
+        past = [t for t in sorted(times) if day.date() < local.date() or t <= f"{local:%H:%M}"]
+        if past:
+            return f"{day:%Y-%m-%d} {past[-1]}"
+    return None
+
+
+def _line(conn, d, due: str | None, now: datetime) -> str:
+    """One decision in one line: the question, ★ and why, and what silence does."""
+    rec = next(o for o in d["options"] if o["id"] == d["recommended"])
+    if d["kind"] == "review":
+        ids = [r[0] for r in conn.execute("SELECT identifier FROM dispatch_ticket WHERE run_id=? ORDER BY rowid",
+                                          (d["run_id"],))]
+        qs = conn.execute(f"SELECT count(*) FROM decision WHERE run_id=? AND kind='plan' AND {OPEN}",
+                          (d["run_id"],)).fetchone()[0]
+        q = f"Start {', '.join(ids)}?" + (f" (+{qs} planner question{'s' * (qs != 1)}, ★ on approval)" if qs else "")
+    elif d["kind"] == "ask":
+        q = f"Executor asks on {d['node_id']}: {d['question']}"
+    else:
+        q = d["question"]
+    silent = ("waits for you" if not due else
+              f"starts {_local(due, now)}" if rec["id"] == "approve" else f"★ at {_local(due, now)}")
+    return f"#{d['id']} {q} ★ {rec['label']}: {_clip(d['why'], 70)} Silent: {silent}"
+
+
+def _mark(conn, ds: list, dues: dict, now: datetime) -> None:
+    """They reached the user: set each clock once (the silence window starts now)."""
+    for d in ds:
+        conn.execute("UPDATE decision SET notified_at=? WHERE id=? AND notified_at IS NULL", (_iso(now), d["id"]))
+        if dues.get(d["id"]) and not d["due_at"]:
+            conn.execute("UPDATE decision SET due_at=? WHERE id=? AND due_at IS NULL", (dues[d["id"]], d["id"]))
+
+
+def notify(cfg, conn, swept: list | None = None, now: datetime | None = None) -> list[str]:
+    """Messages for the factory Bot Chat now. A push when work is stopped on the user (at most
+    notify.interrupts_per_day a day; the rest wait for the digest) or an emergency started without review; the
+    digest at notify.digest times (local): everything waiting, what silence does, what the factory did on its own."""
+    n = cfg.raw.get("notify", {})
+    now = now or datetime.now(UTC)
+    url, msgs = n.get("url", ""), []
+    with db.tx(conn):
+        midnight = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        pushed = conn.execute("SELECT count(*) FROM notice WHERE kind='push' AND at >= ?", (_iso(midnight),)).fetchone()[0]
+        push = [f"Emergency: dispatch {s.get('run_id')} started without review ({s['because']})."
+                for s in swept or () if s["kind"] == "review" and s["because"].startswith("emergency")
+                and s.get("chosen") == "approve"]
+        urgent = [d for d in rows(conn) if d["tier"] == "now" and not d["notified_at"]]
+        if urgent and pushed < n.get("interrupts_per_day", 3):
+            push += ["Factory · needs you now", *(_line(conn, d, None, now) for d in urgent),
+                     f'Reply "ok" to take ★, or "#{urgent[0]["id"]} <option>". {url}'.rstrip()]
+            _mark(conn, urgent, {}, now)
+        if push:
+            conn.execute("INSERT INTO notice(kind, body, at) VALUES ('push', ?, ?)", ("\n".join(push), _iso(now)))
+            msgs.append("\n".join(push))
+        slot = _slot(now, n.get("digest", ["09:00", "17:00"]))
+        if slot and not conn.execute("SELECT 1 FROM notice WHERE slot=?", (slot,)).fetchone():
+            listed = sorted((d for d in rows(conn) if d["tier"] != "auto" and d["kind"] != "plan"),
+                            key=lambda d: (d["tier"] != "now", d["id"]))
+            dues = {d["id"]: d["due_at"] or ((s := _silent(conn, d)) and _iso(now + s)) for d in listed}
+            last = conn.execute("SELECT max(at) FROM notice WHERE kind='digest'").fetchone()[0]
+            auto = done_for_you(conn, max(filter(None, [last, _iso(now - timedelta(days=1))])))
+            lines = []
+            if listed or auto:
+                urgent_n = sum(d["tier"] == "now" for d in listed)
+                lines.append(f"Factory digest · {now.astimezone():%H:%M} · " + (
+                    f"{len(listed)} waiting on you" + (f" ({urgent_n} urgent)" if urgent_n else "") if listed
+                    else "nothing waiting on you"))
+                lines += [_line(conn, d, dues[d["id"]], now) for d in listed]
+                if listed:
+                    lines.append(f'Reply "ok" to take every ★, or "#{listed[0]["id"]} <option>", '
+                                 f'"#{listed[0]["id"]} hold: why". {url}'.rstrip())
+                if auto:
+                    lines.append("Done for you: " + "; ".join(
+                        f"#{d['id']} {_clip(d['question'], 50)} → {next(o['label'] for o in d['options'] if o['id'] == d['chosen'])}"
+                        f" ({d['chosen_by'].removeprefix(AUTO).strip(' ()') or d['chosen_by']})" for d in auto))
+            _mark(conn, listed, dues, now)
+            conn.execute("INSERT INTO notice(kind, slot, body, at) VALUES ('digest', ?, ?, ?)",
+                         (slot, "\n".join(lines), _iso(now)))
+            if lines:
+                msgs.append("\n".join(lines))
+    return msgs

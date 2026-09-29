@@ -71,8 +71,8 @@ have_job factory-reconcile || hermes cron create "every 20m" "$(cat "$here/herme
 have_job factory-backup || hermes cron create "0 3 * * *" --no-agent \
   --script factory-backup.sh --name factory-backup --deliver local
 
-# Drafts dispatches for `auto` repos, announces them for review (to the factory Bot Chat, i.e. Hermex), starts
-# them after the review window, hands off approved ones. Pause this job to stop it.
+# Drafts dispatches for `auto` repos, hands off approved ones, takes ★ on decisions whose time came, and prints
+# pushes / the twice-daily digest (delivered to the factory Bot Chat, i.e. Hermex). Pause this job to stop it.
 have_job factory-propose || hermes cron create "every 10m" --no-agent \
   --script factory-propose.sh --name factory-propose --deliver bot-chat:factory
 

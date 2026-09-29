@@ -2,9 +2,10 @@
 
 Reads are free. `stage` makes a draft dispatch (a planner adds a plan and a review decision; nothing runs yet).
 `note` only touches drafts. `decide` answers a decision (every choice the factory needs from the user: review a
-draft, a planner or executor question, a blocked ticket, a stuck executor, a held Linear write). Choices that
-start or stop real work or write Linear ask the human through Hermes's approval prompt every time; with no human
-channel they are refused and the command to paste is returned instead.
+draft, a planner or executor question, a blocked ticket, a stuck executor, a held Linear write); `ok` takes the
+recommendation on several (the user's "ok" to a digest). Choices that start or stop real work or write Linear ask
+the human through Hermes's approval prompt (once per call); with no human channel they are refused and the command
+to paste is returned instead.
 """
 import json
 import os
@@ -27,19 +28,22 @@ SCHEMA = {
         "like `root` (whole dispatch), `FIN-3788` (a ticket), `FIN-3788/2` (a step); the executor reads it "
         "verbatim); decisions [run_id] (what waits on the user: each has options with what they lead to, a "
         "recommended option and why); decide <decision_id> <option> [note] (answer one with the user's choice; "
-        "some options need a note, e.g. a reason to hold or reject); followup <identifier> <title> <body> [repo] "
-        "(queue a new ticket split out of an owned one; reconcile creates it in Linear)."),
+        "some options need a note, e.g. a reason to hold or reject); ok <decision_ids> (the user said ok / yes to "
+        "a digest or push: take the recommended option on each of those decisions); followup <identifier> <title> "
+        "<body> [repo] (queue a new ticket split out of an owned one; reconcile creates it in Linear)."),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["status", "tickets", "candidates", "ticket", "stage", "draft",
-                                                  "note", "decisions", "decide", "followup"]},
+                                                  "note", "decisions", "decide", "ok", "followup"]},
             "run_id": {"type": "string", "description": "dispatch run id for status/draft/note/decisions"},
             "identifier": {"type": "string", "description": "ticket id for `ticket`, e.g. FIN-3481"},
             "identifiers": {"type": "array", "items": {"type": "string"}, "description": "tickets for `stage`"},
             "node": {"type": "string", "description": "plan node id for `note`, from the `draft` tree: `root` (whole "
                                                      "dispatch), `FIN-3788` (a ticket), `FIN-3788/2` or `FIN-3788/2.1` (a step)"},
             "decision_id": {"type": "integer", "description": "decision id for `decide`"},
+            "decision_ids": {"type": "array", "items": {"type": "integer"},
+                             "description": "for `ok`: the #ids of the digest or push the user said ok to"},
             "option": {"type": "string", "description": "the option id the user chose, for `decide`"},
             "note": {"type": "string", "description": "text the chosen option asks for (a reason, guidance)"},
             "title": {"type": "string", "description": "new ticket title, for `followup`"},
@@ -102,6 +106,8 @@ def handle(params: dict, **_) -> str:
         return _run("decide", "list", *([run_id, "--all"] if run_id else []))
     if action == "decide":
         return _decide(params)
+    if action == "ok":
+        return _ok(params)
     if action == "followup":
         parent, title, body = params.get("identifier"), params.get("title"), params.get("body")
         if not (parent and title and body):
@@ -116,13 +122,39 @@ def handle(params: dict, **_) -> str:
     return json.dumps({"ok": False, "error": f"unknown action {action!r}"})
 
 
+def _open() -> dict:
+    listed = json.loads(_run("decide", "list"))
+    return {x["id"]: x for x in listed if isinstance(x, dict)} if isinstance(listed, list) else {}
+
+
+def _refused(why: str, command: str) -> str:
+    return json.dumps({"ok": False, "error": f"not done: {why}. The user can run it themselves: ~/.local/bin/{command}"})
+
+
+def _ok(params: dict) -> str:
+    ids = sorted({int(i) for i in params.get("decision_ids") or []})
+    if not ids:
+        return '{"ok": false, "error": "decision_ids required"}'
+    open_ = _open()
+    if missing := [i for i in ids if i not in open_]:
+        return json.dumps({"ok": False, "error": f"no open decision {missing}; list them with `decisions`"})
+    rec = {i: next(o for o in open_[i]["options"] if o["id"] == open_[i]["recommended"]) for i in ids}
+    args = ["decide", "ok", *map(str, ids)]
+    weighty = [i for i in ids if rec[i].get("weighty")]
+    if weighty:  # one confirmation covers the batch
+        command = "factory " + " ".join(args)
+        why = _approve(command, "Take the recommendation on: " + "; ".join(
+            f"#{i} {open_[i]['question']} {rec[i]['label']}: {rec[i]['leads_to']}" for i in weighty) + ".")
+        return _refused(why, command) if why else _run(*args, "--actor", "user:factory-chat")
+    return _run(*args, "--actor", "agent:factory-chat (for the user)")
+
+
 def _decide(params: dict) -> str:
     did, choice = params.get("decision_id"), (params.get("option") or "").strip()
     note = (params.get("note") or "").strip()
     if not did or not choice:
         return '{"ok": false, "error": "decision_id and option required"}'
-    listed = json.loads(_run("decide", "list"))
-    d = next((x for x in listed if isinstance(x, dict) and x.get("id") == int(did)), None) if isinstance(listed, list) else None
+    d = _open().get(int(did))
     if d is None:
         return json.dumps({"ok": False, "error": f"no open decision {did}; list them with `decisions`"})
     opt = next((o for o in d["options"] if o["id"] == choice), None)
@@ -133,8 +165,7 @@ def _decide(params: dict) -> str:
         command = "factory " + " ".join(args)
         why = _approve(command, f"{d['question']} {opt['label']}: {opt['leads_to']}.")
         if why:
-            return json.dumps({"ok": False, "error": f"not done: {why}. The user can run it themselves: "
-                                                     f"~/.local/bin/{command}"})
+            return _refused(why, command)
         return _run(*args, "--actor", "user:factory-chat")
     return _run(*args, "--actor", "agent:factory-chat (for the user)")
 

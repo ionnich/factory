@@ -16,12 +16,24 @@ def out(obj) -> None:
     print(json.dumps(obj, indent=2, default=str))
 
 
-def ingest(cfg, conn, full=False) -> dict:
+def ingest(cfg, conn, full=False, only: set[str] | None = None) -> dict:
+    """Linear (incremental) and the trunk mirrors. `only`: just these repos and no project refresh, the fast path
+    before drafting or approving (the cron keeps everything else fresh)."""
     res = linear.ingest(cfg, conn, full=full)
-    res["projects"] = linear.sync_projects(cfg, conn)
-    with db.tx(conn):
-        res["trunks"] = {r: sha[:12] for r, sha in repos.sync_all(cfg, conn).items()}
+    if only is None:
+        res["projects"] = linear.sync_projects(cfg, conn)
+    res["trunks"] = {r: sha[:12] for r, sha in repos.sync_all(cfg, conn, only).items()}
     return res
+
+
+def _repos_of(cfg, conn, identifiers) -> set[str]:
+    """Repos the named tickets map to now (unknown ones are refused later, with the reason)."""
+    found = set()
+    for i in identifiers:
+        s = conn.execute("SELECT * FROM linear_latest WHERE identifier=?", (i,)).fetchone()
+        if s is not None and (ctx := prune.map_context(cfg, s)[0]):
+            found.add(ctx.repo)
+    return found
 
 
 def cmd_ingest(cfg, conn, a):
@@ -33,7 +45,7 @@ def cmd_candidates(cfg, conn, a):
 
 
 def cmd_stage(cfg, conn, a):
-    ingest(cfg, conn)  # stage against Linear and trunk as they are now
+    ingest(cfg, conn, only=_repos_of(cfg, conn, a.identifiers))  # stage against Linear and trunk as they are now
     out(dispatch.stage(cfg, conn, a.identifiers, a.actor))
 
 
@@ -50,12 +62,15 @@ def cmd_handoff(cfg, conn, a):
 
 
 def cmd_propose(cfg, conn, a):
+    """Cron: ingest, move dispatches along, take ★ where its time came, and say what the user needs to hear."""
     ingest(cfg, conn)
     res = dispatch.propose(cfg, conn)
+    res["swept"] = decide.sweep(cfg, conn)
+    msgs = decide.notify(cfg, conn, res["swept"])
     if not a.announce:
-        return out(res)
-    if res.get("announce"):  # cron stdout -> bot-chat:factory (Hermex); silence otherwise
-        print(f"[factory] {res['announce']}")
+        return out({**res, "messages": msgs})
+    if msgs:  # cron stdout -> bot-chat:factory (Hermex); nothing to say = no message
+        print("\n\n".join(msgs))
 
 
 def cmd_draft(cfg, conn, a):
@@ -89,10 +104,21 @@ def cmd_decide(cfg, conn, a):
                 raise dispatch.StageError(f"--option {o!r}: want 'id|label|what it leads to'")
             opts.append(decide.option(*parts))
         return out(decide.ask(conn, a.run_id, a.node, a.question, opts, a.recommend, a.why, a.actor))
+    if a.xcmd == "ok":
+        runs = [d["run_id"] for i in a.ids if (d := decide.one(conn, i)) and d["kind"] == "review"
+                and d["recommended"] == "approve"]
+        if runs:
+            ingest(cfg, conn, only=_dispatch_repos(conn, runs))
+        return out(decide.ok(cfg, conn, a.ids, a.actor))
     d = decide.one(conn, a.id)
     if d and d["kind"] == "review" and a.option == "approve":
-        ingest(cfg, conn)  # approve: check the tickets against Linear as it is now
+        ingest(cfg, conn, only=_dispatch_repos(conn, [d["run_id"]]))  # check the tickets against Linear as it is now
     return out(decide.choose(cfg, conn, a.id, a.option, a.actor, a.note))
+
+
+def _dispatch_repos(conn, run_ids) -> set[str]:
+    return {r["repo"] for (j,) in conn.execute(f"SELECT repos_json FROM dispatch WHERE run_id IN "
+                                               f"({','.join('?' * len(run_ids))})", run_ids) for r in json.loads(j)}
 
 
 def cmd_backup(cfg, conn, a):
@@ -174,13 +200,25 @@ def cmd_archive(cfg, conn, a):
 
 
 def cmd_sync(cfg, conn, a):
-    with db.tx(conn):
-        out({r: sha for r, sha in repos.sync_all(cfg, conn).items()})
+    out({r: sha for r, sha in repos.sync_all(cfg, conn).items()})
 
 
 def cmd_status(cfg, conn, a):
-    if a.run_id:
-        return out(dispatch_status(cfg, conn, a.run_id))
+    out(dispatch_status(cfg, conn, a.run_id) if a.run_id else status(cfg, conn))
+
+
+def cmd_overview(cfg, conn, a):
+    """Everything the Factory tab shows, in one call: board, tickets, candidates, and each live dispatch (plus
+    finished ones something still waits on the user for, e.g. a blocked ticket)."""
+    st = status(cfg, conn)
+    runs = dict.fromkeys([d["run_id"] for d in st["dispatches"]] +
+                         [x["run_id"] for x in st["decisions"] if x["run_id"] and x["kind"] == "blocked"])
+    out({"status": st, "tickets": tickets(cfg, conn), "candidates": dispatch.candidates(cfg, conn),
+         "dispatches": [dispatch_status(cfg, conn, r) for r in runs
+                        if conn.execute("SELECT 1 FROM dispatch WHERE run_id=?", (r,)).fetchone()]})
+
+
+def status(cfg, conn) -> dict:
     q = lambda sql, *p: [dict(r) for r in conn.execute(sql, p)]
     fresh = {"fresh": 0, "stale": 0, "unverified": 0}
     owned = prune.owned_in_scope(cfg, conn)
@@ -189,7 +227,8 @@ def cmd_status(cfg, conn, a):
         why = prune.staleness(cfg, conn, s, ctx)
         fresh["fresh" if why is None else "unverified" if why == "new" else "stale"] += 1
     ids = [s["issue_id"] for s in owned]
-    out({
+    week = (datetime.now(UTC) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+    return {
         "sync": q("SELECT * FROM sync_cursor"),
         "trunks": q("SELECT repo, branch, substr(sha,1,12) sha, fetched_at FROM repo_trunk"),
         "lead": cfg.linear["lead"],
@@ -200,6 +239,7 @@ def cmd_status(cfg, conn, a):
         "dispatches": q("SELECT run_id, state, staged_at, executing_at, done_at FROM dispatch "
                         "WHERE state <> 'archived' ORDER BY created_at"),
         "decisions": decide.rows(conn),  # everything waiting on a person, with options and a recommendation
+        "done_for_you": decide.done_for_you(conn, week),  # what the factory answered on its own this week
         "kanban": cfg.kanban,
         # Last stage of the lifecycle: what the factory closed out recently.
         "archived": q("SELECT d.run_id, d.archived_at, group_concat(t.identifier, ', ') tickets, "
@@ -211,7 +251,7 @@ def cmd_status(cfg, conn, a):
                           "v.kind, v.target, v.written_back_run run_id FROM verdict v JOIN linear_latest l USING (issue_id) "
                           "WHERE v.written_back_run LIKE 'sweep-%' AND v.superseded_at IS NULL "
                           "ORDER BY v.written_back_run DESC LIMIT 10"),
-    })
+    }
 
 
 def dispatch_status(cfg, conn, run_id):
@@ -220,10 +260,13 @@ def dispatch_status(cfg, conn, run_id):
         raise SystemExit(f"unknown dispatch {run_id}")
     base = cfg.dispatches / ("_archived" if d["state"] == "archived" else "") / run_id / "dispatch.md"
     body = base.read_bytes() if base.exists() else None
+    rd = decide.open_review(conn, run_id)
+    due = rd["due_at"] if rd else None
     return {
         **dict(d),
         "auto": d["drafted_by"] == dispatch.PROPOSE,
-        "review": dispatch.review(d),
+        "review": dispatch.review(d, due),
+        "review_until": due,  # when its review takes ★ without the user
         "tree": dispatch.tree(conn, run_id),
         "path": str(base),
         "hash_ok": None if d["body_sha256"] is None or body is None
@@ -238,6 +281,10 @@ def dispatch_status(cfg, conn, run_id):
 
 
 def cmd_tickets(cfg, conn, a):
+    out(tickets(cfg, conn))
+
+
+def tickets(cfg, conn) -> list:
     """Owned in-scope tickets with verdict, freshness and live dispatch, for the status tab."""
     live = {r["issue_id"]: dict(r) for r in conn.execute(
         "SELECT t.issue_id, t.run_id, t.card_status, d.state FROM dispatch_ticket t JOIN dispatch d USING (run_id) "
@@ -261,7 +308,7 @@ def cmd_tickets(cfg, conn, a):
     for r in rows:
         if r["verdict"]:
             del r["verdict"]["evidence_json"]
-    out(rows)
+    return rows
 
 
 def cmd_ticket(cfg, conn, a):
@@ -323,6 +370,7 @@ def main(argv=None):
     s.add_argument("identifier")
     s.set_defaults(fn=cmd_ticket)
     sub.add_parser("tickets", help="owned tickets with verdict + freshness (JSON)").set_defaults(fn=cmd_tickets)
+    sub.add_parser("overview", help="everything the Factory tab shows, in one call (JSON)").set_defaults(fn=cmd_overview)
     sub.add_parser("prune-gate", help="Hermes pre-check for the prune job").set_defaults(fn=cmd_prune_gate)
     sub.add_parser("candidates", help="stageable tickets (JSON), and why the rest are not").set_defaults(
         fn=cmd_candidates)
@@ -333,9 +381,9 @@ def main(argv=None):
     s = sub.add_parser("handoff", help="reset the executor's omp session (/new) and tell it to run the dispatch")
     s.add_argument("run_id")
     s.set_defaults(fn=cmd_handoff)
-    s = sub.add_parser("propose", help="cron: draft the top `auto` candidate, announce it for review, start it after "
-                                        "the review window (emergency: at once); hand off approved dispatches")
-    s.add_argument("--announce", action="store_true", help="print only the announcement text (for cron delivery)")
+    s = sub.add_parser("propose", help="cron: draft the top `auto` candidate, hand off approved dispatches, take ★ on "
+                                        "decisions whose time came, and tell the user (push / digest)")
+    s.add_argument("--announce", action="store_true", help="print only the messages for the user (cron delivery)")
     s.set_defaults(fn=cmd_propose)
     dr = sub.add_parser("draft", help="a draft dispatch's plan and notes (approve/hold/reject: `decide`)").add_subparsers(
         dest="dcmd", required=True)
@@ -367,6 +415,9 @@ def main(argv=None):
     s.add_argument("--recommend", required=True, help="the option id you recommend")
     s.add_argument("--why", required=True, help="why you recommend it")
     s.add_argument("--actor", default="executor")
+    s = x.add_parser("ok", help="the user's \"ok\": take the recommendation (★) on each of these decisions")
+    s.add_argument("ids", type=int, nargs="+")
+    s.add_argument("--actor", default="user")
     sub.choices["decide"].set_defaults(fn=cmd_decide)
     s = sub.add_parser("backup", help="consistent, integrity-checked copy of factory.db; keeps the newest N")
     s.add_argument("--keep", type=int, default=14)

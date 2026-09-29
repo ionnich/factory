@@ -6,7 +6,7 @@ factory-fleet, and written back to Linear. `~/.hermes/factory.db` is the only au
 ```
 ingest (cron) -> prune verdicts (cron) -> draft -> plan (cron agent) -> review: your notes -> approve -> handoff
   -> execute (factory-fleet) -> reconcile (cron) -> archive
-propose (cron) drafts for `auto` repos, announces the review, and starts it after 2h unless you hold it
+propose (cron) drafts for `auto` repos, takes ★ on decisions whose time came, and tells you (push / digest)
 ```
 
 ## Install
@@ -26,10 +26,13 @@ One-time, by hand:
 
 ## Use
 
-- Dashboard: Hermes dashboard, **Factory** tab, phone first, a stack of cards. **Needs you** is a deck of
+- Dashboard: Hermes dashboard, **Factory** tab, phone first, a stack of cards, live (the tab refreshes the moment
+  `factory.db` changes, over `/stream`; no polling). **Needs you** is a deck of
   decisions: the question, the options with what each leads to, the recommended one marked ★ and why. Tap an
   option (a second tap confirms ones that start or stop work or write Linear; some ask for a reason), swipe
-  right to take ★, left for later. **Dispatches** are cards; open one to see it as a flow of cards down a rail:
+  right to take ★, left for later. A tap answers at once: the card flies off while the server confirms, and comes
+  back on top with the reason if it refuses. **Done for you** lists what the factory answered itself this week.
+  **Dispatches** are cards; open one to see it as a flow of cards down a rail:
   dispatch → review → tickets → steps (branching where the plan branches) → results (PR, Linear writes), with
   each decision hanging off the node it's about. Tap a card to light up what it leads to; `+ note` on a draft's
   nodes. **Tickets** not in a dispatch are a list (ready / needs answer / checking / not for us), with the
@@ -37,12 +40,21 @@ One-time, by hand:
   `hermes/plugins/factory/dashboard/src/index.jsx` (React and components come from the dashboard SDK);
   `./install.sh` bundles it with `bun build` into the gitignored `dist/` and copies the plugin.
 - Chat: `hermes -p factory`, also on the iPhone through Hermex (Bot Mode, factory profile). It shows drafts,
-  takes notes ("note FIN-3788/2: …") and answers decisions (weighty ones through the Hermes approval prompt).
-- Decisions (`factory decide list|choose|ask`): every choice the factory needs from you is a decision with 2+
+  takes notes ("note FIN-3788/2: …") and answers decisions (weighty ones through the Hermes approval prompt);
+  "ok" to a digest takes every ★ in it with one confirmation.
+- Decisions (`factory decide list|choose|ok|ask`): every choice the factory needs from you is a decision with 2+
   options, what each leads to, and one recommended with why. Kinds: a draft's review (approve / hold / reject),
-  planner questions, executor questions mid-run (`decide ask`; the answer is typed into its pane), a blocked
-  ticket (write back / retry with guidance), a missing or quiet executor (restart / wait / stop), a held Linear
-  write (apply anyway / skip / do it yourself).
+  planner questions (at most 2 per draft), executor questions mid-run (`decide ask`; the answer is typed into its
+  pane), a blocked ticket (write back / retry with guidance), a missing or quiet executor (restart / wait / stop),
+  a held Linear write (apply anyway / skip / do it yourself).
+- Asking less (`decide.py`). Each decision gets a tier when asked. **Auto**: the factory takes ★ on its next pass
+  and lists it under "Done for you": nothing to weigh (a code check held a Linear write), the executor's first
+  crash in a dispatch (restarted once), or a kind where you took ★ the last 5 times (one override and it asks
+  again). **Now**: work is stopped on you (an executor question, a second crash): pushed at once to the factory
+  Bot Chat (Hermex), at most `notify.interrupts_per_day` (3) a day, the rest wait for the digest. **Digest**:
+  everything else, at `notify.digest` (09:00, 17:00), one line each with what silence does. Silence takes ★ 2h
+  (review of a factory draft) or 24h (blocked ticket, held write, quiet executor) after the digest, unless your
+  last answer of that kind overrode ★; then it waits for you. A person's draft always waits.
 - Review: `factory stage` makes a **draft**. `factory-plan` (agent, every 10m) writes its plan tree: a theme,
   tickets nested under the ones they build on (misfits dropped with a reason), steps per ticket (`FIN-1/2`,
   nested `FIN-1/2.1`) with `depends_on` edges, questions, and a review recommendation. You add notes to the
@@ -53,14 +65,15 @@ One-time, by hand:
   voids the draft.
 - Autonomous: `factory-propose` (every 10m) drafts a cohort in `auto = true` repos: the top candidate plus those
   sharing its Linear Domain, then its repo (up to `stage.max_tickets`); the planner shapes it into a tree and may
-  drop misfits; announces it once planned to the factory Bot Chat (Hermex), and 2h later takes the review
-  decision's recommendation unless you answered first.
-  **Emergency** (no review window, a one-ticket dispatch): the ticket is Urgent in Linear (a person set it) and its verdict evidence
-  touches at most 3 files. A person's draft is never started by the cron. It also hands off approved dispatches.
+  drop misfits; its review goes in the next digest and follows the rules above.
+  **Emergency** (no review window, a one-ticket dispatch): the ticket is Urgent in Linear (a person set it) and its
+  verdict evidence touches at most 3 files; ★ is taken at once and you get a push. It also hands off approved
+  dispatches, takes ★ where it is due, and prints the push / digest (cron stdout goes to the Bot Chat).
   Stop it with `hermes cron pause factory-propose`.
 - Backups: `factory-backup` (03:00) writes `~/.hermes/factory/backups/factory-YYYY-MM-DD.db` (newest 14), and every
   schema migration first writes `factory-pre-vN.db`. Same disk: protects against bad writes, not disk loss.
-- CLI: `factory status|tickets|candidates|stage|draft|decide|handoff|propose|execute|card|reconcile|archive|metrics|backup`.
+- CLI: `factory status|overview|tickets|candidates|stage|draft|decide|handoff|propose|execute|card|reconcile|archive|metrics|backup`.
+  `stage` and approving refresh only the repos involved (parallel fetch); the cron keeps the rest fresh.
 
 ## Invariants (in code: `factory/schema.sql` triggers + CLI checks)
 
@@ -73,7 +86,9 @@ One-time, by hand:
   `updatedAt`); otherwise comment + held write. The reconcile agent may only reword prose or downgrade apply ->
   flag; a held write is re-applied only by a person (`approved_by`), and then the agent cannot hold it again.
 - A decision has >= 2 distinct options (id, label, leads_to) and recommends one; it is answered once (with the
-  text the option asks for) or withdrawn once, never edited or deleted (triggers).
+  text the option asks for) or withdrawn once, never edited or deleted; its tier is fixed when asked and its clock
+  (`notified_at`, `due_at`) is set once while open (triggers). A person's draft, or one they held, is never
+  started without them.
 - `stage` skips tickets named in nix-fleet backlogs or nix-fleet herdr workspace labels.
 - A verdict is dispatched at most once (a blocked card needs the ticket to change first, or your "retry" on
   the block, whose guidance becomes a note on the next draft); `valid` verdicts expire

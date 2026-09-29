@@ -1,6 +1,7 @@
 """Factory-owned repo mirrors at trunk. Never firstmate's projects/ clones."""
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from functools import cache
 from pathlib import Path
 
@@ -15,10 +16,8 @@ def git(path: Path, *args: str, check: bool = True) -> str:
     return r.stdout.strip()
 
 
-def sync(cfg: Config, conn, repo: str) -> str:
-    """Fetch trunk, hard-reset the mirror to it, record the SHA."""
-    # gh's git credential helper needs the token; cron/launchd envs don't carry it.
-    os.environ.setdefault("GITHUB_TOKEN", secret(cfg, "GITHUB_TOKEN"))
+def fetch(cfg: Config, repo: str) -> str:
+    """Fetch trunk and hard-reset the mirror to it; returns the SHA. Touches only the mirror (thread-safe)."""
     path, branch = cfg.mirror_path(repo), cfg.trunk(repo)
     if not (path / ".git").exists():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -27,16 +26,24 @@ def sync(cfg: Config, conn, repo: str) -> str:
     git(path, "fetch", "--quiet", "--prune", "origin", branch)
     git(path, "reset", "--quiet", "--hard", f"origin/{branch}")
     git(path, "clean", "-qfdx")
-    sha = git(path, "rev-parse", "HEAD")
-    conn.execute(
-        "INSERT INTO repo_trunk VALUES (?,?,?,?) ON CONFLICT(repo) DO UPDATE SET "
-        "branch=excluded.branch, sha=excluded.sha, fetched_at=excluded.fetched_at",
-        (repo, branch, sha, db.now()))
-    return sha
+    return git(path, "rev-parse", "HEAD")
 
 
-def sync_all(cfg: Config, conn) -> dict[str, str]:
-    return {repo: sync(cfg, conn, repo) for repo in sorted({c.repo for c in cfg.contexts})}
+def sync_all(cfg: Config, conn, only: set[str] | None = None) -> dict[str, str]:
+    """Fetch every mapped repo (or `only` these) in parallel, then record their trunk SHAs (no DB lock while git
+    runs)."""
+    # gh's git credential helper needs the token; cron/launchd envs don't carry it.
+    os.environ.setdefault("GITHUB_TOKEN", secret(cfg, "GITHUB_TOKEN"))
+    want = sorted(only if only is not None else {c.repo for c in cfg.contexts})
+    with ThreadPoolExecutor(max_workers=max(1, len(want))) as pool:
+        shas = dict(zip(want, pool.map(lambda r: fetch(cfg, r), want)))
+    with db.tx(conn):
+        for repo, sha in shas.items():
+            conn.execute(
+                "INSERT INTO repo_trunk VALUES (?,?,?,?) ON CONFLICT(repo) DO UPDATE SET "
+                "branch=excluded.branch, sha=excluded.sha, fetched_at=excluded.fetched_at",
+                (repo, cfg.trunk(repo), sha, db.now()))
+    return shas
 
 
 @cache

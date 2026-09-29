@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -190,6 +190,46 @@ SELECT run_id, 'review', 'Start this dispatch?',
        END,
        'approve', 'The plan is written and nothing has changed since it was drafted.', planned_at, 'factory:migration'
 FROM dispatch WHERE state = 'draft' AND planned_at IS NOT NULL;""",
+    # v9: less asking. Each decision gets a tier (auto / digest / now) and its own clock (notified_at, due_at),
+    # which replaces the dispatch's review window; the notice table records pushes and digests.
+    9: """DROP TRIGGER decision_answer_once;
+ALTER TABLE decision ADD COLUMN tier TEXT NOT NULL DEFAULT 'digest' CHECK (tier IN ('auto', 'digest', 'now'));
+ALTER TABLE decision ADD COLUMN notified_at TEXT;
+ALTER TABLE decision ADD COLUMN due_at TEXT;
+UPDATE decision SET tier = 'now' WHERE kind IN ('ask', 'executor-gone');
+UPDATE decision SET notified_at = d.notified_at, due_at = d.review_until FROM dispatch d
+WHERE decision.run_id = d.run_id AND decision.kind = 'review' AND decision.chosen IS NULL
+  AND decision.void_reason IS NULL AND d.review_until IS NOT NULL;
+ALTER TABLE dispatch DROP COLUMN notified_at;
+ALTER TABLE dispatch DROP COLUMN review_until;
+CREATE TRIGGER decision_answer_once BEFORE UPDATE OF run_id, node_id, issue_id, kind, ref, question, options_json,
+  recommended, why, detail_json, created_at, created_by, tier, chosen, chosen_by, chosen_at, chosen_note, void_reason,
+  void_at ON decision
+WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
+  OR NEW.run_id IS NOT OLD.run_id OR NEW.node_id IS NOT OLD.node_id OR NEW.issue_id IS NOT OLD.issue_id
+  OR NEW.kind IS NOT OLD.kind OR NEW.ref IS NOT OLD.ref OR NEW.question IS NOT OLD.question
+  OR NEW.options_json IS NOT OLD.options_json OR NEW.recommended IS NOT OLD.recommended OR NEW.why IS NOT OLD.why
+  OR NEW.detail_json IS NOT OLD.detail_json OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.created_by IS NOT OLD.created_by OR NEW.tier IS NOT OLD.tier
+  OR (NEW.chosen IS NULL AND NEW.void_reason IS NULL)
+  OR (NEW.chosen IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(OLD.options_json)
+                                             WHERE json_extract(value, '$.id') = NEW.chosen))
+  OR (NEW.chosen IS NOT NULL AND length(trim(coalesce(NEW.chosen_note, ''))) = 0
+      AND EXISTS (SELECT 1 FROM json_each(OLD.options_json)
+                  WHERE json_extract(value, '$.id') = NEW.chosen AND json_extract(value, '$.note') IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'a decision is answered (with one of its options, and the text it asks for) or withdrawn once'); END;
+CREATE TRIGGER decision_clock BEFORE UPDATE OF notified_at, due_at ON decision
+WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
+  OR (OLD.notified_at IS NOT NULL AND NEW.notified_at IS NOT OLD.notified_at)
+  OR (OLD.due_at IS NOT NULL AND NEW.due_at IS NOT OLD.due_at)
+BEGIN SELECT RAISE(ABORT, 'a decision''s clock (notified_at, due_at) is set once, while it is open'); END;
+CREATE TABLE notice (
+  id   INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('push', 'digest')),
+  slot TEXT UNIQUE,
+  body TEXT NOT NULL,
+  at   TEXT NOT NULL
+);""",
 }
 
 

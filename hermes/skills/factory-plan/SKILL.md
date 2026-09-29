@@ -51,12 +51,13 @@ switching. Your job is to shape the cohort into a tree:
    console origin returns 200", "Open PR against main; CI green". Nested steps
    (`FIN-1/2.1`) only when a step has distinct sub-parts. Shared work goes in
    the first ticket that needs it; later tickets depend on that step.
-4. Questions: when the code leaves a real choice the reviewer should make (two
-   viable approaches, a scope call), add a question on the node it affects,
-   with 2-5 options, what each leads to, and the one you recommend with why.
-   At most 6; decide everything else in the plan itself. An unanswered
-   question takes your recommendation when the dispatch is approved, so
-   recommend what you would do.
+4. Questions: only when the answer changes what gets built (two viable
+   approaches with different code, a scope call) and the code can't settle it.
+   Put it on the node it affects, with 2-5 options, what each leads to, and the
+   one you recommend with why. At most 2; every question is something a
+   person has to read, so decide everything else in the plan itself. An
+   unanswered question takes your recommendation when the dispatch is
+   approved, so recommend what you would do.
 5. Review recommendation on `root`: `approve` (default), `hold` (a person
    should look before it starts, e.g. the verdict looks shaky), or `reject`
    (the cohort should not run as drafted), with why in one sentence. If nobody

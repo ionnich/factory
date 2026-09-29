@@ -108,7 +108,8 @@ def plan(cfg: Config, conn, run_id: str | None) -> dict:
     else:
         rows = _dispatch_rows(cfg, conn, run_id)
     with db.tx(conn):
-        conn.execute("DELETE FROM writeback WHERE run_id=? AND status='planned'", (run_id,))
+        # A write a person chose to apply anyway stays as they left it; re-planning must not bring back the hold.
+        conn.execute("DELETE FROM writeback WHERE run_id=? AND status='planned' AND approved_by IS NULL", (run_id,))
         conn.executemany("INSERT OR IGNORE INTO writeback(run_id, issue_id, op, payload_json, decision, rule, reason, "
                          "status) VALUES (?,?,?,?,?,?,?,?)", rows)
     return show(conn, run_id)

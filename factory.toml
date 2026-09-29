@@ -146,8 +146,11 @@ url = "https://zqlprdmaw4.us-east-1.aws.clickhouse.cloud:8443"
 user_env = "FACTORY_CH_USER"
 password_env = "FACTORY_CH_PASSWORD"
 
-# ---------------------------------------------------------------- review notifications
-# factory-propose prints review announcements; its cron job delivers them to bot-chat:factory, which the
-# Hermex iPhone app shows (Bot Mode on the factory profile). The link goes in every announcement.
+# ---------------------------------------------------------------- telling the user
+# factory-propose (every 10 min) prints what the user needs to hear; its cron job delivers it to bot-chat:factory,
+# which the Hermex iPhone app shows (Bot Mode on the factory profile). A push only when work is stopped on the user
+# (at most interrupts_per_day; the rest wait for the digest); everything else in the digest at these local times.
 [notify]
 url = "https://nich-studio.ainu-vernier.ts.net:9119/factory"
+digest = ["09:00", "17:00"]
+interrupts_per_day = 3

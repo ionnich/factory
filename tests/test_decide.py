@@ -1,8 +1,9 @@
 """Decisions: always a real choice with a recommendation, answered once, and the review's answer carries the
-planner's open questions with it."""
+planner's open questions with it. Asking less: what is taken without asking, and what reaches the user when."""
 import sqlite3
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -99,6 +100,55 @@ class Decisions(unittest.TestCase):
             decide.choose(self.cfg, self.c, review["id"], "reject", "user", note="wrong cohort")
         left = [d for d in decide.rows(self.c, "d1", open_only=False) if d["kind"] == "plan"]
         self.assertEqual([d["void_reason"] for d in left], ["the draft was rejected"])
+
+
+class AskingLess(unittest.TestCase):
+    def setUp(self):
+        self.c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
+        self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) "
+                       "VALUES ('d1','draft','[]','x',?)", (SNAP,))
+        self.cfg = SimpleNamespace(repos={}, raw={"notify": {"interrupts_per_day": 1, "digest": ["09:00"]}})
+
+    def blocked(self):
+        return decide.blocked(self.c, "d1", "FIN-1", "i1", "no route", "executor")
+
+    def test_nothing_to_weigh_is_taken_without_asking_and_reported(self):
+        did = decide.writeback(self.c, "d1", "i1", "state", {"state": "Done"}, "assigned to someone@else")
+        self.assertEqual(decide.one(self.c, did)["tier"], "auto")
+        [res] = decide.sweep(self.cfg, self.c)
+        self.assertEqual((res["id"], res["chosen"]), (did, "skip"))
+        digest = decide.notify(self.cfg, self.c, now=datetime.now(UTC))[-1]
+        self.assertIn(f"Done for you: #{did}", digest)
+
+    def test_first_executor_crash_is_restarted_a_second_one_is_pushed(self):
+        first = decide.executor(self.c, "d1", "executor-gone", "pane gone", 6)
+        second = decide.executor(self.c, "d1", "executor-gone", "pane gone again", 6)
+        self.assertEqual([decide.one(self.c, d)["tier"] for d in (first, second)], ["auto", "now"])
+
+    def test_five_straight_stars_earn_it_and_one_override_takes_even_silence_away(self):
+        asked = [self.blocked() for _ in range(6)]
+        self.assertEqual({decide.one(self.c, d)["tier"] for d in asked}, {"digest"})
+        for did in asked[:5]:
+            decide.choose(self.cfg, self.c, did, "writeback", "user:dashboard")
+        self.assertEqual(decide.one(self.c, self.blocked())["tier"], "auto")
+        decide.choose(self.cfg, self.c, asked[5], "retry", "user:dashboard", note="try the other fleet")
+        after = decide.one(self.c, self.blocked())
+        self.assertEqual(after["tier"], "digest")
+        self.assertIn("overrode", after["on_timeout"])  # silence no longer takes ★ on this kind
+
+    def test_pushes_are_capped_per_day_and_the_rest_wait_for_the_digest(self):
+        ask = lambda: decide.open_(self.c, "ask", "Which seed?", OPTS[:1] + [decide.option("c", "C", "leads to c")],
+                                   "a", "because", "executor", run_id="d1")
+        today = datetime.now().astimezone().replace(hour=10, minute=0, second=0, microsecond=0)
+        first = ask()
+        msgs = decide.notify(self.cfg, self.c, now=today)
+        self.assertIn("needs you now", msgs[0])  # the push, then the 09:00 digest listing it too
+        self.assertIn(f"#{first}", msgs[1])
+        second = ask()
+        self.assertEqual(decide.notify(self.cfg, self.c, now=today + timedelta(minutes=10)), [])  # cap reached
+        self.assertIsNone(decide.one(self.c, second)["notified_at"])
+        tomorrow = decide.notify(self.cfg, self.c, now=today + timedelta(days=1))
+        self.assertTrue(any(f"#{second}" in m for m in tomorrow))
 
 
 if __name__ == "__main__":

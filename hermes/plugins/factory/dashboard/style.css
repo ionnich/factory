@@ -30,6 +30,10 @@
 .fx-health { display: inline-flex; align-items: center; gap: .35rem; cursor: help; }
 .fx-health i { width: .5rem; height: .5rem; border-radius: 999px; background: var(--g); box-shadow: 0 0 0 3px color-mix(in srgb, var(--g) 25%, transparent); }
 .fx-health.bad { color: var(--r); } .fx-health.bad i { background: var(--r); }
+.fx-live { display: inline-block; width: .45rem; height: .45rem; border-radius: 999px; margin-right: .3rem;
+           background: var(--n); vertical-align: middle; }
+.fx-live.on { background: var(--g); animation: fx-pulse 2.4s ease-in-out infinite; }
+@keyframes fx-pulse { 50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--g) 25%, transparent); } }
 
 /* the deck */
 .fx-deck { margin-bottom: 1.75rem; }
@@ -49,6 +53,8 @@
 @keyframes fx-rise { from { transform: translateY(16px) scale(.95); opacity: .4; } }
 @keyframes fx-fly-right { to { transform: translateX(120%) rotate(16deg); opacity: 0; } }
 @keyframes fx-fly-left { to { transform: translateX(-120%) rotate(-12deg); opacity: 0; } }
+.fx-fly { z-index: 4; pointer-events: none; padding: 1rem; border: 1px solid var(--color-border); background: var(--color-card); }
+.fx-urgent { font-size: .7rem; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; color: var(--r); }
 .fx-swipe { position: absolute; top: .9rem; padding: .2rem .6rem; border-radius: 8px; font-weight: 800; font-size: .85rem;
             border: 2px solid; transform: rotate(-8deg); z-index: 4; }
 .fx-swipe.right { left: 1rem; color: var(--g); border-color: var(--g); }
@@ -163,6 +169,8 @@
 .fx-stat { display: grid; padding: .55rem .6rem; border-radius: 12px; border: 1px solid var(--color-border); background: var(--color-card); }
 .fx-stat b { font-size: 1.2rem; font-variant-numeric: tabular-nums; }
 .fx-stat span { font-size: .72rem; color: var(--color-muted-foreground); }
+.fx-done { list-style: none; margin: 0; padding: 0; display: grid; gap: .5rem; font-size: .88rem; }
+.fx-done .tick { color: var(--g); font-weight: 800; }
 
 @media (prefers-reduced-motion: reduce) {
   .fx *, .fx *::before { animation: none !important; transition: none !important; }

@@ -5,10 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from factory import db, decide
 from factory.dispatch import StageError
-from factory.reconcile import _COMPLETION, resolve, state_gate
+from factory.reconcile import _COMPLETION, plan, resolve, state_gate
 
 LEAD = "lead@finks.ai"
 CFG = SimpleNamespace(linear={"lead": LEAD})
@@ -76,6 +77,11 @@ class Resolve(unittest.TestCase):
         did = decide.writeback(self.c, "r", "i1", "state", {"state": "Canceled"}, "reconcile agent: owner objected")
         self.assertEqual(decide.one(self.c, did)["recommended"], "skip")
         decide.choose(None, self.c, did, "apply", "user")
+        w = self.c.execute("SELECT decision, status, approved_by FROM writeback WHERE op='state'").fetchone()
+        self.assertEqual(tuple(w), ("apply", "planned", "user"))
+        held = ("r", "i1", "state", json.dumps({"state": "Canceled"}), "flag", "dup", "reconcile agent: again", "planned")
+        with mock.patch("factory.reconcile._dispatch_rows", return_value=[held]):
+            plan(None, self.c, "r")  # the reconcile gate re-plans a run that still has unsent rows
         w = self.c.execute("SELECT decision, status, approved_by FROM writeback WHERE op='state'").fetchone()
         self.assertEqual(tuple(w), ("apply", "planned", "user"))
         with self.assertRaises(StageError):

@@ -100,9 +100,10 @@ CREATE TABLE dispatch (
   created_at    TEXT NOT NULL,
   staged_at     TEXT, executing_at TEXT, done_at TEXT, reconciled_at TEXT, archived_at TEXT,
   executor_pane TEXT,
-  -- review step (draft only): planner agent writes the plan, the user leaves notes, then approve/hold/reject.
-  drafted_by    TEXT,                       -- factory:propose drafts auto-start after review_until unless held
-  planned_at    TEXT, notified_at TEXT, review_until TEXT, held_reason TEXT,
+  -- review step (draft only): planner agent writes the plan, the user leaves notes, then approve/hold/reject. The
+  -- review decision carries the clock (decision.due_at); a factory:propose draft may start without a person.
+  drafted_by    TEXT,
+  planned_at    TEXT, held_reason TEXT,
   approved_by   TEXT, rejected_reason TEXT,
   emergency     INTEGER NOT NULL DEFAULT 0, -- 1 = no review window (urgent, one ticket, tiny evidence footprint)
   CHECK (state = 'draft' OR body_sha256 IS NOT NULL)  -- rejected drafts are rendered too, as the record
@@ -288,6 +289,10 @@ CREATE TABLE linear_own_write (
 -- Every choice the factory needs from a person: >= 2 options, each saying what it leads to, one recommended
 -- with why. Answered once (chosen) or withdrawn once when the question stops applying (void); never edited.
 -- node_id places it in its dispatch's graph (root, a ticket id, a step id); run_id may be a sweep-/followup- run.
+-- tier, fixed when asked: auto = the factory takes the recommendation on its next pass (nothing for a person to
+-- weigh, or the user took it the last EARNED_AFTER times); now = work is stopped until the user answers (pushed
+-- at once); digest = it waits for the next digest. notified_at = when it first reached the user; due_at = when
+-- silence takes the recommendation (NULL: it waits for the user). Both are set once, while it is open.
 CREATE TABLE decision (
   id           INTEGER PRIMARY KEY,
   run_id       TEXT,
@@ -309,6 +314,9 @@ CREATE TABLE decision (
   chosen_note  TEXT,                         -- text an option asks for (a reason, guidance)
   void_reason  TEXT,
   void_at      TEXT,
+  tier         TEXT NOT NULL DEFAULT 'digest' CHECK (tier IN ('auto', 'digest', 'now')),
+  notified_at  TEXT,
+  due_at       TEXT,
   CHECK ((chosen IS NULL) = (chosen_by IS NULL) AND (chosen IS NULL) = (chosen_at IS NULL)),
   CHECK ((void_reason IS NULL) = (void_at IS NULL) AND (chosen IS NULL OR void_reason IS NULL))
 );
@@ -323,13 +331,15 @@ WHEN NEW.chosen IS NOT NULL OR NEW.void_reason IS NOT NULL
      <> json_array_length(NEW.options_json)
   OR NOT EXISTS (SELECT 1 FROM json_each(NEW.options_json) WHERE json_extract(value, '$.id') = NEW.recommended)
 BEGIN SELECT RAISE(ABORT, 'a decision needs >= 2 distinct options (id, label, leads_to) and recommends one of them'); END;
-CREATE TRIGGER decision_answer_once BEFORE UPDATE ON decision
+CREATE TRIGGER decision_answer_once BEFORE UPDATE OF run_id, node_id, issue_id, kind, ref, question, options_json,
+  recommended, why, detail_json, created_at, created_by, tier, chosen, chosen_by, chosen_at, chosen_note, void_reason,
+  void_at ON decision
 WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
   OR NEW.run_id IS NOT OLD.run_id OR NEW.node_id IS NOT OLD.node_id OR NEW.issue_id IS NOT OLD.issue_id
   OR NEW.kind IS NOT OLD.kind OR NEW.ref IS NOT OLD.ref OR NEW.question IS NOT OLD.question
   OR NEW.options_json IS NOT OLD.options_json OR NEW.recommended IS NOT OLD.recommended OR NEW.why IS NOT OLD.why
   OR NEW.detail_json IS NOT OLD.detail_json OR NEW.created_at IS NOT OLD.created_at
-  OR NEW.created_by IS NOT OLD.created_by
+  OR NEW.created_by IS NOT OLD.created_by OR NEW.tier IS NOT OLD.tier
   OR (NEW.chosen IS NULL AND NEW.void_reason IS NULL)
   OR (NEW.chosen IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(OLD.options_json)
                                              WHERE json_extract(value, '$.id') = NEW.chosen))
@@ -339,3 +349,18 @@ WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'a decision is answered (with one of its options, and the text it asks for) or withdrawn once'); END;
 CREATE TRIGGER decision_no_delete BEFORE DELETE ON decision
 BEGIN SELECT RAISE(ABORT, 'decisions are never deleted'); END;
+CREATE TRIGGER decision_clock BEFORE UPDATE OF notified_at, due_at ON decision
+WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
+  OR (OLD.notified_at IS NOT NULL AND NEW.notified_at IS NOT OLD.notified_at)
+  OR (OLD.due_at IS NOT NULL AND NEW.due_at IS NOT OLD.due_at)
+BEGIN SELECT RAISE(ABORT, 'a decision''s clock (notified_at, due_at) is set once, while it is open'); END;
+
+-- What the factory told the user in the factory Bot Chat (Hermex): pushes when work is stopped on them (capped
+-- per day) and the digest at notify.digest times (one per slot, recorded even when it had nothing to say).
+CREATE TABLE notice (
+  id   INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('push', 'digest')),
+  slot TEXT UNIQUE,                          -- digest: the local 'YYYY-MM-DD HH:MM' it is for
+  body TEXT NOT NULL,
+  at   TEXT NOT NULL
+);

@@ -7,7 +7,7 @@ import re
 import stat
 import subprocess
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import db, decide, prune
@@ -204,14 +204,15 @@ def tree(conn, run_id: str) -> list:
     return out
 
 
-def review(d) -> str | None:
+def review(d, due: str | None = None) -> str | None:
+    """A draft's review state; `due` is when its review decision takes ★ without the user."""
     if d["state"] != "draft":
         return None
     if d["planned_at"] is None:
         return "planning"
     if d["held_reason"]:
         return "held"
-    return "in-review" if d["review_until"] else "waiting-approval"
+    return "in-review" if due else "waiting-approval"
 
 
 def stage(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool = False) -> dict:
@@ -255,7 +256,7 @@ def stage(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool
     return {"run_id": run_id, "state": "draft", "tickets": identifiers, "emergency": emergency}
 
 
-PLAN_QUESTIONS_MAX = 6
+PLAN_QUESTIONS_MAX = 2  # each is a decision someone has to read; decide the rest in the plan
 
 
 def _plan_questions(qs: list, node_ids: set) -> list:
@@ -716,7 +717,6 @@ def card(cfg: Config, conn, run_id: str, ident: str, kind: str, actor: str,
 PROPOSE = "factory:propose"
 
 
-REVIEW = timedelta(hours=2)
 EMERGENCY_MAX_PATHS = 3
 
 
@@ -744,11 +744,10 @@ def _cohort(cfg: Config, conn, auto: list) -> list[str]:
 
 
 def propose(cfg: Config, conn) -> dict:
-    """Cron: move one dispatch at a time through review. Drafts a cohort of related `auto`-repo candidates; once the
-    planner has written its plan, announces it (result["announce"], delivered to the factory Bot Chat / Hermex)
-    and, after REVIEW, takes its review decision's recommendation unless someone answered or held it first.
-    Emergency drafts start as soon as they are planned. A person's draft is never decided here. Staged (approved)
-    dispatches are handed off, retried every run."""
+    """Cron: move one dispatch at a time. With nothing live, drafts a cohort of related `auto`-repo candidates
+    (emergency: one urgent ticket); hands off approved dispatches, retried every run. The draft's review is a
+    decision like any other: `decide.notify` puts it in the digest and `decide.sweep` takes ★ when its clock runs
+    out (an emergency or earned one at once). A person's draft is never decided without them."""
     live = conn.execute("SELECT * FROM dispatch WHERE state <> 'archived' ORDER BY created_at").fetchall()
     if any(d["state"] in ("executing", "done", "reconciled") for d in live):
         return {"action": "wait", "dispatches": [{"run_id": d["run_id"], "state": d["state"]} for d in live]}
@@ -769,45 +768,11 @@ def propose(cfg: Config, conn) -> dict:
     own = [d for d in drafts if d["drafted_by"] == PROPOSE]
     if not own:
         return {"action": "wait", "reason": "a person's draft is in review", "run_id": drafts[0]["run_id"]}
-    d, run_id = own[0], own[0]["run_id"]
+    d = own[0]
     if d["planned_at"] is None:
-        return {"action": "planning", "run_id": run_id}
-    if d["held_reason"]:
-        return {"action": "held", "run_id": run_id, "reason": d["held_reason"]}
-    rd = decide.open_review(conn, run_id)
-    if rd is None:
-        return {"action": "wait", "reason": "no open review decision", "run_id": run_id}
-    what = "; ".join(f"{n['id']} {n['title']}" for n in tree(conn, run_id) if n["kind"] == "ticket")
-    url = cfg.raw.get("notify", {}).get("url", "")
-    rec = next(o for o in rd["options"] if o["id"] == rd["recommended"])
-    now = datetime.now(UTC)
-    if not d["emergency"] and d["review_until"] is None:
-        until = now + REVIEW
-        with db.tx(conn):
-            conn.execute("UPDATE dispatch SET notified_at=?, review_until=? WHERE run_id=?",
-                         (db.now(), until.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), run_id))
-        return {"action": "in-review", "run_id": run_id, "review_until": until.isoformat(),
-                "announce": f"Dispatch {run_id} is ready for review: {what}. Recommended: {rec['label']} "
-                            f"({rd['why']}). At {until.astimezone():%H:%M} the factory takes that recommendation "
-                            f"unless you choose first. {url}"}
-    if not d["emergency"] and now < datetime.fromisoformat(d["review_until"]):
-        return {"action": "in-review", "run_id": run_id, "review_until": d["review_until"]}
-    choice = "approve" if d["emergency"] else rd["recommended"]
-    actor = f"{PROPOSE} ({'emergency: no review window' if d['emergency'] else 'review window elapsed; took the recommendation'})"
-    try:
-        res = decide.choose(cfg, conn, rd["id"], choice, actor, note=f"review window elapsed: {rd['why']}")
-    except StageError as e:  # ticket or verdict moved during review: the reviewed plan is void
-        decide.choose(cfg, conn, rd["id"], "reject", PROPOSE, note=f"not started: {e}")
-        return {"action": "rejected", "run_id": run_id, "reason": str(e),
-                "announce": f"Dispatch {run_id} was dropped instead of started: {e}."}
-    if choice != "approve":
-        return {"action": choice, "run_id": run_id, **res,
-                "announce": f"Dispatch {run_id}: the review window ended and the factory took its recommendation, "
-                            f"{rec['label']} ({rd['why']}). {url}"}
-    head = "Emergency dispatch" if d["emergency"] else "Dispatch"
-    tail = "without review" if d["emergency"] else "after the review window"
-    return {"action": "started", "run_id": run_id, **res,
-            "announce": f"{head} {run_id} started {tail}: {what}. {url}"}
+        return {"action": "planning", "run_id": d["run_id"]}
+    return {"action": "held", "run_id": d["run_id"], "reason": d["held_reason"]} if d["held_reason"] else \
+        {"action": "in-review", "run_id": d["run_id"]}
 
 
 def watch(cfg: Config, conn) -> list:
