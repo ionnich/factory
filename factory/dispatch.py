@@ -56,8 +56,9 @@ def candidates(cfg: Config, conn) -> dict:
         held = next((p for p, text in holds.items() if _names(text, ident)), None)
         # A verdict is dispatched at most once: a done card already landed, a blocked one needs the ticket to
         # change (new verdict) first. Without this, archived tickets in Ready for QA would be restaged forever.
-        prior = v and conn.execute("SELECT run_id, card_status FROM dispatch_ticket WHERE verdict_id=?",
-                                   (v["id"],)).fetchone()
+        prior = v and conn.execute(
+            "SELECT t.run_id, CASE WHEN d.rejected_reason IS NOT NULL THEN 'rejected in review' ELSE t.card_status END "
+            "card_status FROM dispatch_ticket t JOIN dispatch d USING (run_id) WHERE t.verdict_id=?", (v["id"],)).fetchone()
         why = ("unmapped" if ctx is None
                else "no verdict" if v is None
                else f"verdict {v['kind']}" if v["kind"] != "valid"
