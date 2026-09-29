@@ -441,12 +441,13 @@ function NoteBox({ run, nodeId, onDone }) {
 
 const Notes = ({ notes }) => (notes || []).map((n) => <div key={n.id} className="fx-note">{n.body}<div className="fx-hint">{n.author} · {ago(n.at)}</div></div>);
 
-function DecisionNode({ d, onDone }) {
+function DecisionNode({ d, onDone, children }) {
   const c = useChoose(d, (r, x) => onDone(r, x));
   return (
     <>
       <div className="fx-row between"><Tone tone={d.open ? "amber" : "gray"}>{KIND[d.kind]}</Tone>{d.deadline && d.open ? <span className="fx-clock">⏱ {until(d.deadline)}</span> : null}</div>
       <div className="fx-q small">{d.question}</div>
+      {children}
       <DecisionBody d={d} busy={c.busy} err={c.err} compact onChoose={(o, n) => c.choose(o, n).catch(() => {})} />
     </>
   );
@@ -471,7 +472,15 @@ function FlowCard({ n, d, open, onToggle, onDone, draft, cardRef, i }) {
           {open ? <ul className="fx-history">{(d.transitions || []).map((x, k) => <li key={k}>{x.to_state} · {x.actor} · {ago(x.at)}</li>)}</ul> : null}
         </>);
       }
-      case "gate": return <DecisionNode d={n.decision} onDone={onDone} />;
+      case "gate": {
+        const qs = n.decision.open ? (d.decisions || []).filter((x) => x.kind === "plan" && x.open).length : 0;
+        return (
+          <DecisionNode d={n.decision} onDone={onDone}>
+            {qs ? <><Tone tone="amber">{plural(qs, "planner question")} below still open</Tone>
+              <div className="fx-hint">Answer {qs === 1 ? "it" : "them"} first; approving takes ★ on any left open.</div></> : null}
+          </DecisionNode>
+        );
+      }
       case "decision": return <DecisionNode d={n.decision} onDone={onDone} />;
       case "ticket": return (<>
         <div className="fx-row between"><span className="fx-row"><span className="fx-id">{n.node.id}</span>{n.card?.pr_url ? <Ext href={n.card.pr_url}>PR</Ext> : null}</span>
@@ -707,13 +716,18 @@ function FactoryPage() {
 
   if (!data) return <div className="fx">{error ? <div className="fx-err">{error}</div> : <div className="fx-hint">Loading…</div>}</div>;
 
-  // The deck holds what needs a person: pushed (work waits) and digest ones. The factory takes the auto ones itself;
-  // planner questions ride along with their review (★ on approval) and hang off their step in the flow.
+  // The deck holds what needs a person: pushed (work waits) and digest ones; the factory takes the auto ones itself.
+  // A planner question sorts with its dispatch's review, just ahead of it: answer the plan, then approve it.
   const open = data.status.decisions;
-  const decisions = open.filter((x) => x.tier !== "auto" && x.kind !== "plan").sort((a, b) =>
-    (b.tier === "now") - (a.tier === "now")
-    || (a.deadline ? Date.parse(a.deadline) : Infinity) - (b.deadline ? Date.parse(b.deadline) : Infinity)
-    || KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind) || a.id - b.id);
+  const reviewOf = Object.fromEntries(open.filter((x) => x.kind === "review").map((x) => [x.run_id, x]));
+  const lead = (x) => (x.kind === "plan" && reviewOf[x.run_id]) || x;
+  const decisions = open.filter((x) => x.tier !== "auto").sort((p, q) => {
+    const a = lead(p), b = lead(q);
+    return (b.tier === "now") - (a.tier === "now")
+      || (a.deadline ? Date.parse(a.deadline) : Infinity) - (b.deadline ? Date.parse(b.deadline) : Infinity)
+      || KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind) || a.id - b.id
+      || (p.kind === "review") - (q.kind === "review") || p.id - q.id;
+  });
   const byRun = Object.fromEntries(data.dispatches.map((d) => [d.run_id, d]));
   const skipped = Object.fromEntries((data.candidates?.skipped || []).map((x) => [x.identifier, x.reason]));
   const answers = data.tickets.filter((t) => ticketGroup(t, skipped).group === "answer").length;
@@ -721,8 +735,9 @@ function FactoryPage() {
   const current = byRun[sel] || data.dispatches.find((d) => decisions.some((x) => x.run_id === d.run_id)) || data.dispatches[0];
   const context = (x) => {
     const base = byRun[x.run_id] ? clip(dispatchTitle(byRun[x.run_id], titles), 60) : x.identifier ? `${x.identifier} ${clip(x.title, 50)}` : null;
+    if (x.kind === "plan") return `${base} · step ${x.node_id}`;
     const qs = x.kind === "review" ? open.filter((y) => y.kind === "plan" && y.run_id === x.run_id).length : 0;
-    return qs ? `${base} · ${plural(qs, "planner question")}, ★ on approval` : base;
+    return qs ? `${base} · ${plural(qs, "planner question")} still open, ★ on approval` : base;
   };
   const done4u = data.status.done_for_you || [];
   const done = (r, d, msg) => {

@@ -30,8 +30,10 @@ One-time, by hand:
   `factory.db` changes, over `/stream`; no polling). **Needs you** is a deck of
   decisions: the question, the options with what each leads to, the recommended one marked ★ and why. Tap an
   option (a second tap confirms ones that start or stop work or write Linear; some ask for a reason), swipe
-  right to take ★, left for later. A tap answers at once: the card flies off while the server confirms, and comes
-  back on top with the reason if it refuses. **Done for you** lists what the factory answered itself this week.
+  right to take ★, left for later. A draft's planner questions come just before its review, and the review node
+  in the flow says how many are still open, so you answer the plan before approving it (approval takes ★ on any
+  left). A tap answers at once: the card flies off while the server confirms, and comes back on top with the
+  reason if it refuses. **Done for you** lists what the factory answered itself this week.
   **Dispatches** are cards; open one to see it as a flow of cards down a rail:
   dispatch → review → tickets → steps (branching where the plan branches) → results (PR, Linear writes), with
   each decision hanging off the node it's about. Tap a card to light up what it leads to; `+ note` on a draft's
@@ -39,7 +41,8 @@ One-time, by hand:
   factory's recommended next group one tap away. UI source is React JSX in
   `hermes/plugins/factory/dashboard/src/index.jsx` (React and components come from the dashboard SDK);
   `./install.sh` bundles it with `bun build` into the gitignored `dist/` and copies the plugin.
-- Chat: `hermes -p factory`, also on the iPhone through Hermex (Bot Mode, factory profile). It shows drafts,
+- Chat: `hermes -p factory`, also on the iPhone through Hermex (Bot Mode, factory profile; the web dashboard has
+  no Bot Mode yet, so digests and pushes are read and answered there or in the Factory tab). It shows drafts,
   takes notes ("note FIN-3788/2: …") and answers decisions (weighty ones through the Hermes approval prompt);
   "ok" to a digest takes every ★ in it with one confirmation.
 - Decisions (`factory decide list|choose|ok|ask`): every choice the factory needs from you is a decision with 2+
