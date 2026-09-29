@@ -26,9 +26,11 @@ One-time, by hand:
 
 ## Use
 
-- Dashboard: Hermes dashboard, **Factory** tab: status per lifecycle stage, draft / review (plan tree, notes on
-  any node, approve / hold / reject) / resolve flags, and throughput (`factory metrics`). A click there is the
-  approval. UI source is React JSX in `hermes/plugins/factory/dashboard/src/index.jsx` (React comes from the
+- Dashboard: Hermes dashboard, **Factory** tab: one graph (Obsidian-style) of dispatches → tickets → plan steps,
+  arrows for "must happen first", held writes attached to what they hold, unrelated tickets as lone nodes. Select
+  a node for its lifecycle position, what each action leads to, and the actions (approve / hold / reject, notes on
+  any plan node, resolve flags); shift-click ready tickets to draft them as one dispatch. Throughput tab:
+  `factory metrics`. A click there is the approval. UI source is React JSX in `hermes/plugins/factory/dashboard/src/index.jsx` (React comes from the
   dashboard SDK); `./install.sh` bundles it with `bun build` into the gitignored `dist/` and copies the plugin.
 - Chat: `hermes -p factory`, also on the iPhone through Hermex (Bot Mode, factory profile). It shows drafts,
   takes notes ("note FIN-3788/2: …"), holds, rejects, and approves (Hermes approval prompt).
