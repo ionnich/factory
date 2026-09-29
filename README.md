@@ -38,12 +38,16 @@ One-time, by hand:
   right to take ★, left for later. A draft's planner questions come just before its review, and the review node
   in the flow says how many are still open, so you answer the plan before approving it (approval takes ★ on any
   left). A tap answers at once: the card flies off while the server confirms, and comes back on top with the
-  reason if it refuses. **Done for you** lists what the factory answered itself this week.
-  **Dispatches** are cards; open one to see it as a flow of cards down a rail:
-  dispatch → review → tickets → steps (branching where the plan branches) → results (PR, Linear writes), with
-  each decision hanging off the node it's about. Tap a card to light up what it leads to; `+ note` on a draft's
-  nodes. **Tickets** not in a dispatch are a list (ready / needs answer / checking / not for us), with the
-  factory's recommended next group one tap away. UI source is React JSX in
+  reason if it refuses.
+  Below the deck the factory is one tab per lifecycle stage: **Ingest** (tickets: ready / needs answer /
+  checking / not for us, with the factory's recommended next group one tap away), **Draft** (assemble and
+  revise/edit: rows are drafts, open one to see the plan's DAG — cards down a rail: dispatch → review → tickets →
+  steps (branching where the plan branches) → results (PR, Linear writes), each decision hanging off the node
+  it's about, every node folded until tapped — and `+ note` on draft nodes), **Run** (staged, executing, done),
+  and **Learn** (reconciled and the last archived ones, with write-backs in the result nodes; throughput and
+  **Done for you** — what the factory answered itself this week — live here too). Dispatches are rows in an
+  engineering table (stage, dispatch, tickets, progress, what waits on you, age; the columns fold on a phone).
+  A row belongs to one stage for its whole life there and only moves forward. UI source is React JSX in
   `hermes/plugins/factory/dashboard/src/index.jsx` (React and components come from the dashboard SDK);
   `./install.sh` bundles it with `bun build` into the gitignored `dist/` and copies the plugin.
 - Chat: `hermes -p factory`, also on the iPhone through Hermex (Bot Mode, factory profile; the web dashboard has

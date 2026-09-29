@@ -1,8 +1,10 @@
 // Factory tab, mobile first: a stack of cards.
 //   Needs you: a deck of decisions. Each is a question with options, what each leads to, and the factory's
 //     recommendation. Tap an option, or swipe right to take the recommendation, left for later.
-//   Dispatches: one card each; open one to see it as a flow of cards down a rail: dispatch → review → tickets →
-//     steps → results, with its decisions hanging off the node they're about. Tickets not in a dispatch are a list.
+//   Lifecycle: one tab per factory stage — Ingest (tickets), Draft (assemble + revise/edit), Run (staged, executing,
+//     done), Learn (reconciled, archived, throughput). Dispatches are rows in an engineering table; open one to see
+//     its DAG as folded cards down a rail (dispatch → review → tickets → steps → results), decisions hanging off
+//     the node they're about.
 // Every action goes through the plugin API to the factory CLI, which enforces the invariants.
 // Built by install.sh (`bun build`, classic JSX via tsconfig.json) to dist/index.js; React and the shadcn-style
 // components come from the dashboard SDK.
@@ -567,16 +569,41 @@ function Flow({ d, titles, onDone, focusNode }) {
   );
 }
 
-function DispatchChip({ d, title, selected, needs, onClick }) {
+// ---- lifecycle: dispatches as rows in an engineering table, one tab per stage ------------------------------
+const STAGES = [["ingest", "Ingest"], ["draft", "Draft"], ["run", "Run"], ["learn", "Learn"]];
+const stageOf = (d) => d.state === "draft" ? "draft" : ["staged", "executing", "done"].includes(d.state) ? "run" : "learn";
+
+function DispatchRow({ d, title, needs, selected, onClick }) {
   const s = dispatchStatus(d);
   const cards = d.tickets || [];
+  const repos = (() => { try { return JSON.parse(d.repos_json || "[]").map((r) => r.repo.split("/").pop()); } catch { return []; } })();
   return (
-    <button className={`fx-dcard${selected ? " sel" : ""}`} onClick={onClick}>
-      <div className="fx-row between"><Tone tone={s.tone}>{s.label}</Tone>{needs ? <span className="fx-needs">{needs}</span> : null}</div>
-      <div className="fx-dtitle">{title}</div>
-      <div className="fx-bar">{cards.map((c) => <i key={c.identifier} className={`t-${CARD_TONE[c.card_status]}`} />)}</div>
-      <div className="fx-hint">{plural(cards.length, "ticket")} · {ago(d.created_at)}</div>
-    </button>
+    <div className={`fx-tr${selected ? " sel" : ""}`} onClick={onClick} role="button" tabIndex={0}
+         onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { stop(e); onClick(); } }}>
+      <div className="fx-tc fx-tc-st"><Tone tone={s.tone}>{s.label}</Tone></div>
+      <div className="fx-tc fx-tc-ti">
+        <div className="fx-ttitle">{title}</div>
+        <div className="fx-hint">{d.run_id}{repos.length ? ` · ${repos.join(", ")}` : ""}</div>
+      </div>
+      <div className="fx-tc fx-tc-tk"><div className="fx-row">{cards.map((c) => <span key={c.identifier} className="fx-id">{c.identifier}</span>)}</div></div>
+      <div className="fx-tc fx-tc-pr"><div className="fx-bar">{cards.map((c) => <i key={c.identifier} className={`t-${CARD_TONE[c.card_status]}`} />)}</div></div>
+      <div className="fx-tc fx-tc-ne">{needs ? <span className="fx-needs">{needs}</span> : <span className="fx-hint">—</span>}</div>
+      <div className="fx-tc fx-tc-age"><span className="fx-hint">{ago(d.created_at)}</span></div>
+    </div>
+  );
+}
+
+// An engineering table of dispatches: stage, what it is, tickets, progress, what waits on you, age. On the phone
+// the columns fold into two lines; the header row disappears.
+function StageTable({ dispatches, titles, needsOf, selected, onSelect }) {
+  return (
+    <div className="fx-table">
+      <div className="fx-thead"><span>Stage</span><span>Dispatch</span><span>Tickets</span><span>Progress</span><span>Needs</span><span>Age</span></div>
+      {dispatches.map((d) => (
+        <DispatchRow key={d.run_id} d={d} title={dispatchTitle(d, titles)} needs={needsOf(d.run_id)}
+                     selected={selected?.run_id === d.run_id} onClick={() => onSelect(d.run_id)} />
+      ))}
+    </div>
   );
 }
 
@@ -683,6 +710,7 @@ function FactoryPage() {
   const [loadedAt, setLoadedAt] = useState(null);
   const [live, setLive] = useState(false);
   const [sel, setSel] = useState(null);
+  const [tab, setTab] = useState(null);  // lifecycle stage; null = pick from what's going on
   const [focus, setFocus] = useState(null);
   const [toast, setToast] = useState(null);
   const [showTp, setShowTp] = useState(false);
@@ -732,7 +760,18 @@ function FactoryPage() {
   const skipped = Object.fromEntries((data.candidates?.skipped || []).map((x) => [x.identifier, x.reason]));
   const answers = data.tickets.filter((t) => ticketGroup(t, skipped).group === "answer").length;
   const needs = decisions.length;
-  const current = byRun[sel] || data.dispatches.find((d) => decisions.some((x) => x.run_id === d.run_id)) || data.dispatches[0];
+  const needsOf = (runId) => open.filter((x) => x.run_id === runId && x.tier !== "auto").length;
+  const rows = { ingest: [], draft: [], run: [], learn: [] };
+  data.dispatches.forEach((d) => rows[stageOf(d)].push(d));
+  const inIngest = data.tickets.filter((t) => !t.dispatch).length;
+  const count = (stage) => stage === "ingest" ? inIngest : rows[stage].length;
+  // Default stage: what needs you, else where the dispatches are. A dispatch belongs to one stage for its whole
+  // life there, so a row only ever moves forward.
+  const active = tab && STAGES.some(([id]) => id === tab) ? tab
+    : (decisions[0] && byRun[decisions[0].run_id] ? stageOf(byRun[decisions[0].run_id]) : null)
+      || (rows.draft.length ? "draft" : rows.run.length ? "run" : "ingest");
+  const list = rows[active];
+  const current = (byRun[sel] && list.some((d) => d.run_id === sel) ? byRun[sel] : list[0]) || null;
   const context = (x) => {
     const base = byRun[x.run_id] ? clip(dispatchTitle(byRun[x.run_id], titles), 60) : x.identifier ? `${x.identifier} ${clip(x.title, 50)}` : null;
     if (x.kind === "plan") return `${base} · step ${x.node_id}`;
@@ -747,10 +786,19 @@ function FactoryPage() {
     load();
   };
   const openNode = (x) => {
-    if (!byRun[x.run_id]) return;
+    const run = byRun[x.run_id];
+    if (!run) return;
+    setTab(stageOf(run));
     setSel(x.run_id);
     setFocus(x.kind === "review" ? "gate" : `d:${x.id}`);
     setTimeout(() => flowRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+  };
+  const pick = (runId) => { setSel(runId); setFocus(null); };
+  const switchTab = (stage) => { setTab(stage); setSel(null); setFocus(null); };
+  const EMPTY = {
+    draft: "No draft right now. The factory proposes one when verified tickets accumulate, or draft your own in Ingest.",
+    run: "Nothing staged or executing right now.",
+    learn: "Nothing learned yet. Dispatches land here after they run and write back to Linear.",
   };
 
   return (
@@ -769,35 +817,41 @@ function FactoryPage() {
 
       <Deck decisions={decisions} context={context} onDone={(r, d) => done(r, d)} onOpen={openNode} />
 
-      <section className="fx-sec" ref={flowRef}>
-        <h2>Dispatches <span className="fx-count">{data.dispatches.length}</span></h2>
-        {data.dispatches.length ? (<>
-          <div className="fx-carousel">
-            {data.dispatches.map((d) => (
-              <DispatchChip key={d.run_id} d={d} title={dispatchTitle(d, titles)} selected={current?.run_id === d.run_id}
-                            needs={open.filter((x) => x.run_id === d.run_id && x.tier !== "auto").length} onClick={() => { setSel(d.run_id); setFocus(null); }} />
-            ))}
-          </div>
-          {current ? <Flow key={current.run_id} d={current} titles={titles} onDone={done} focusNode={focus} /> : null}
-        </>) : <div className="fx-empty">No dispatch right now. Draft one from the tickets below, or let the factory propose one.</div>}
-      </section>
+      <div className="fx-stage-tabs" role="tablist" aria-label="Factory lifecycle">
+        {STAGES.map(([id, label]) => (
+          <button key={id} role="tab" aria-selected={active === id} className={`fx-stage-tab${active === id ? " on" : ""}`}
+                  onClick={() => switchTab(id)}>
+            {label} <span className="fx-count">{count(id)}</span>
+          </button>
+        ))}
+      </div>
 
-      <section className="fx-sec">
-        <h2>Tickets <span className="fx-hint">not in a dispatch</span></h2>
-        <Tickets data={data} onDone={done} />
-      </section>
+      {active === "ingest" ? (
+        <section className="fx-sec">
+          <h2>Tickets <span className="fx-hint">verified, not in a dispatch</span></h2>
+          <Tickets data={data} onDone={done} />
+        </section>
+      ) : (
+        <section className="fx-sec" ref={flowRef}>
+          {list.length ? (<>
+            <StageTable dispatches={list} titles={titles} needsOf={needsOf} selected={current} onSelect={pick} />
+            {current ? <Flow key={current.run_id} d={current} titles={titles} onDone={done} focusNode={focus} /> : null}
+          </>) : <div className="fx-empty">{EMPTY[active]}</div>}
+        </section>
+      )}
 
-      {done4u.length ? (
-        <details className="fx-sec fx-fold">
-          <summary>Done for you <span className="fx-count">{done4u.length}</span> <span className="fx-hint">this week</span></summary>
-          <DoneForYou items={done4u} />
+      {active === "learn" ? (<>
+        {done4u.length ? (
+          <details className="fx-sec fx-fold">
+            <summary>Done for you <span className="fx-count">{done4u.length}</span> <span className="fx-hint">this week</span></summary>
+            <DoneForYou items={done4u} />
+          </details>
+        ) : null}
+        <details className="fx-sec fx-fold" onToggle={(e) => setShowTp(e.currentTarget.open)}>
+          <summary>Throughput</summary>
+          {showTp ? <Throughput /> : null}
         </details>
-      ) : null}
-
-      <details className="fx-sec fx-fold" onToggle={(e) => setShowTp(e.currentTarget.open)}>
-        <summary>Throughput</summary>
-        {showTp ? <Throughput /> : null}
-      </details>
+      </>) : null}
     </div>
   );
 }

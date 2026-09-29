@@ -212,7 +212,8 @@ def cmd_overview(cfg, conn, a):
     finished ones something still waits on the user for, e.g. a blocked ticket)."""
     st = status(cfg, conn)
     runs = dict.fromkeys([d["run_id"] for d in st["dispatches"]] +
-                         [x["run_id"] for x in st["decisions"] if x["run_id"] and x["kind"] == "blocked"])
+                         [x["run_id"] for x in st["decisions"] if x["run_id"] and x["kind"] == "blocked"] +
+                         [x["run_id"] for x in st["archived"]])  # last closed ones, for the Learn tab
     out({"status": st, "tickets": tickets(cfg, conn), "candidates": dispatch.candidates(cfg, conn),
          "dispatches": [dispatch_status(cfg, conn, r) for r in runs
                         if conn.execute("SELECT 1 FROM dispatch WHERE run_id=?", (r,)).fetchone()]})
