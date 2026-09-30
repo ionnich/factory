@@ -63,7 +63,8 @@ One-time, by hand:
   sits beside it (now → question → each option on its own track, one row apart → rejoin → … → result; ★ solid, picked path lit, the rest
   faded), one selection with the switches. Open decisions whose ★ starts, stops or writes nothing are the
   **Quick** lane under the deck: tap one to see its options, or "Take all ★" (`POST /decisions/ok`, the chat's "ok").
-  Lifecycle tabs sit below the health header, above the decision deck: **Tickets** (every ticket in scope or ever touched —
+  Lifecycle tabs sit below the health header, above the decision deck. Selecting a tab brings its content into view:
+  **Tickets** (every ticket in scope or ever touched —
   `factory tickets --all`, fetched only while the tab is open; the overview carries just the per-filter counts —
   newest activity first, filtered ready / needs answer / stale / in dispatch / done / not ours, plus a search; ready
   ones are ticked into a draft, with the factory's recommended next group one tap away; a row opens a sheet with the
