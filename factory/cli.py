@@ -9,7 +9,7 @@ import statistics
 import sys
 from datetime import UTC, datetime, timedelta
 
-from . import config, db, decide, dispatch, linear, prune, reconcile, repos, witness
+from . import config, costs, db, decide, dispatch, linear, prune, reconcile, repos, witness
 
 
 def out(obj) -> None:
@@ -67,6 +67,10 @@ def cmd_propose(cfg, conn, a):
     res = dispatch.propose(cfg, conn)
     res["swept"] = decide.sweep(cfg, conn)
     msgs = decide.notify(cfg, conn, res["swept"])
+    try:  # the cost ledger is derived data: a failed sync never costs the user a push or digest
+        costs.sync(conn, cfg.db.parent)
+    except Exception as e:
+        print(f"factory: cost sync: {type(e).__name__}: {e}", file=sys.stderr)
     if not a.announce:
         return out({**res, "messages": msgs})
     if msgs:  # cron stdout -> bot-chat:factory (Hermex); nothing to say = no message
@@ -166,7 +170,8 @@ def cmd_metrics(cfg, conn, a):
          "per_repo": [{"repo": r, "done": c["done"], "blocked": c["blocked"]} for r, c in sorted(repos_.items())],
          "writeback": {k: wb.get(k, 0) for k in ("confirmed", "failed", "flagged")},
          "verdicts": {r["kind"]: r["n"] for r in q("SELECT kind, count(*) n FROM verdict WHERE created_at >= ? "
-                                                   "GROUP BY kind", since)}})
+                                                   "GROUP BY kind", since)},
+         "cost": costs.summary(conn, a.days)})
 
 
 def cmd_reconcile(cfg, conn, a):

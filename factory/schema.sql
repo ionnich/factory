@@ -376,3 +376,15 @@ CREATE TABLE notice (
   body TEXT NOT NULL,
   at   TEXT NOT NULL
 );
+
+-- Cost ledger: each factory agent session (Hermes crons/chats, fleet captain/secondmates/crews) with its tokens
+-- and cost, synced from the agents' own records by `costs.sync`. Derived data: rewritable, never a source of truth.
+CREATE TABLE cost_session (
+  id         TEXT PRIMARY KEY,               -- hermes:<profile>:<session id> | omp:<session file>
+  stage      TEXT NOT NULL,                  -- prune | reconcile | plan | chat | captain | secondmate | crew
+  run_id     TEXT,                           -- the dispatch it worked on (execution stages)
+  started_at TEXT NOT NULL,
+  mtime      REAL NOT NULL,                  -- source change marker: omp logs are re-read only when it moves
+  input      INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL,
+  usd        REAL NOT NULL
+);

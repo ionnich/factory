@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -247,6 +247,11 @@ CREATE TRIGGER writeback_confirmed_final BEFORE UPDATE OF status ON writeback
 WHEN OLD.status = 'confirmed' AND NEW.status IS NOT OLD.status
   AND NOT (OLD.approved_by IS NULL AND NEW.approved_by IS NOT NULL)
 BEGIN SELECT RAISE(ABORT, 'a confirmed write-back is final unless a person applies it anyway'); END;""",
+    # v11: cost ledger, derived from the agents' own session records (factory costs.sync); rewritable.
+    11: """CREATE TABLE cost_session (
+  id TEXT PRIMARY KEY, stage TEXT NOT NULL, run_id TEXT, started_at TEXT NOT NULL, mtime REAL NOT NULL,
+  input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL, usd REAL NOT NULL
+);""",
 }
 
 

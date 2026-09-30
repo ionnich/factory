@@ -735,13 +735,23 @@ function Throughput() {
   const stats = [["done", m.tickets.done], ["blocked", m.tickets.blocked], ["block rate", pct(m.block_rate)],
                  ["approve → done", hours(m.hours.stage_to_done_p50)], ["slowest", hours(m.hours.stage_to_done_max)],
                  ["done → archived", hours(m.hours.done_to_archived_p50)]];
+  const c = m.cost;
+  const usd = (v) => (v == null ? "—" : `$${v.toFixed(2)}`);
+  const spend = Object.entries(c.by_stage).sort((a, b) => b[1] - a[1]);
   return (
     <div className="fx-stack-v">
       <div className="fx-stats">{stats.map(([k, v]) => <div key={k} className="fx-stat"><b>{v}</b><span>{k}</span></div>)}</div>
       <div className="fx-hint">{`Last 28 days · ${m.dispatches.staged} approved, ${m.dispatches.archived} archived · Linear writes: ${m.writeback.confirmed} sent, ${m.writeback.failed} failed, ${m.writeback.flagged} held`}</div>
+      <div className="fx-stats">{[["per dispatch", c.per_unit.dispatch], ["per plan", c.per_unit.plan], ["per verdict", c.per_unit.verdict]]
+        .map(([k, v]) => <div key={k} className="fx-stat"><b>{usd(v)}</b><span>{k}</span></div>)}</div>
+      <ul className="fx-cost">{spend.map(([s, v]) => (
+        <li key={s}><span>{STAGE_COST[s] || s}</span><i style={{ width: `${c.total ? (v / c.total) * 100 : 0}%` }} /><b>{usd(v)}</b></li>))}</ul>
+      <div className="fx-hint">{`Agent spend ${usd(c.total)} in 28 days, from the agents' own session records`}</div>
     </div>
   );
 }
+const STAGE_COST = { captain: "Fleet captain (routing)", secondmate: "Domain leads", crew: "Crews (code)", prune: "Verification",
+                     plan: "Planning", reconcile: "Write-back", chat: "Chat" };
 
 // ---- page ------------------------------------------------------------------------------------------------------
 function FactoryPage() {

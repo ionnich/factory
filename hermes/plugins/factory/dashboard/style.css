@@ -199,3 +199,8 @@
   .fx-q { font-size: 1.08rem; }
   .fx-carousel { margin: 0 -.6rem; padding-left: .6rem; padding-right: .6rem; }
 }
+.fx-cost { list-style: none; margin: 0; padding: 0; display: grid; gap: .35rem; font-size: .82rem; }
+.fx-cost li { display: grid; grid-template-columns: 10.5rem 1fr 3.8rem; align-items: center; gap: .5rem; }
+.fx-cost i { height: .5rem; border-radius: 999px; background: var(--a, var(--color-primary)); min-width: 2px; }
+.fx-cost b { text-align: right; font-variant-numeric: tabular-nums; }
+@media (max-width: 640px) { .fx-cost li { grid-template-columns: 8.5rem 1fr 3.4rem; } }
