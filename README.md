@@ -42,31 +42,39 @@ One-time, by hand:
   decisions: the question, the options with what each leads to, the recommended one marked ★ and why. Tap an
   option (a second tap confirms ones that start or stop work or write Linear; some ask for a reason), swipe
   right to take ★, left for later. A tap answers at once: the card flies off while the server confirms, and comes
-  back on top with the reason if it refuses. A draft's planner questions and its review are one card ("Review
-  FIN-4146 · 2 questions") that opens the **plan** (the configurator; also `/factory?view=review&run=<run_id>`, so a
+  back on top with the reason if it refuses. `why?` under any decision (and under each plan question) asks the
+  planner inline (see Why? below). A draft's planner questions and its review are one card ("Review FIN-4146 · 2
+  questions") that opens the **plan** full-page (the configurator; also `/factory?view=review&run=<run_id>`, so a
   push can link straight in). On a phone it is one column: a sticky **result** (the dispatch's predicted result
   plus one line per question from the picked option, tagged `#id`; the picked path as a breadcrumb — press and
   hold it to mark every difference from ★ — and "vs ★: +1 step · risk"), then the outline: ticket → its result →
-  numbered steps ("after 1" chips, files). Each question is a switch inside the step it is about (★ marked; each
-  option shows its change, cost, risk); a question that only matters under one answer appears once that answer is
-  picked. Flipping a switch sends nothing: the outline redraws under that option's plan changes (changed steps
-  get a yellow bar, added ones a `+`, dropped ones strike through and fold). **Lock in path** answers every open
-  question with what is picked, then the review (approve / hold / reject) takes its place. On a desktop a railway
-  map sits beside it (now → question → options side by side → rejoin → … → result; ★ solid, picked path lit, the
-  rest faded), one selection with the switches. Open decisions whose ★ starts, stops or writes nothing are the
+  numbered steps ("after 1" chips, files), with operator notes on each node and, while the dispatch is a draft,
+  `+ note` on the root, each ticket and each step (the executor reads notes word for word). Each question is a
+  switch inside the step it is about (★ marked; each option shows its change, cost, risk); a question that only
+  matters under one answer appears once that answer is picked. Flipping a switch sends nothing: the outline redraws
+  under that option's plan changes (changed steps get a yellow bar, added ones a `+`, dropped ones strike through
+  and fold). **Lock in path** answers every open question with what is picked, then the review (approve / hold /
+  reject) takes its place. The ticket button opens each ticket's verdict and evidence. On a desktop a railway map
+  sits beside it (now → question → options side by side → rejoin → … → result; ★ solid, picked path lit, the rest
+  faded), one selection with the switches. Open decisions whose ★ starts, stops or writes nothing are the
   **Quick** lane under the deck: tap one to see its options, or "Take all ★" (`POST /decisions/ok`, the chat's "ok").
-  Below the deck the factory is one tab per lifecycle stage: **Ingest** (tickets: ready / needs answer /
-  checking / not for us, with the factory's recommended next group one tap away), **Draft** (assemble and
-  revise/edit: rows are drafts; "Open the plan" plus the plan's DAG — cards down a rail: dispatch → review →
-  tickets → steps → results, each decision hanging off the node it's about, and `+ note` on draft nodes), **Run**
-  (staged, executing, done: the plan read-only on the chosen path, card status per ticket, a step ✓ once a card
-  comment says so, e.g. "FIN-1/2 done"), and **Learn** (reconciled and the last archived ones: the plan with
-  "predicted" next to "landed" — done summary, PR and write-backs per ticket — where untaken answers still flip as
-  ghosts; throughput and **Done for you** — what the factory answered itself this week — live here too).
-  Dispatches are rows in an engineering table (stage, dispatch, tickets, progress, what waits on you, age; the
-  columns fold on a phone). A row belongs to one stage for its whole life there and only moves forward. UI source
-  is React JSX in `hermes/plugins/factory/dashboard/src/` (`index.jsx` page and deck, `plan.jsx` the plan outline
-  and configurator, `railway.jsx` its desktop map; React and components come from the dashboard SDK);
+  Below the deck the factory is one tab per lifecycle stage: **Tickets** (every ticket in scope or ever touched —
+  `factory tickets --all`, fetched only while the tab is open; the overview carries just the per-filter counts —
+  newest activity first, filtered ready / needs answer / stale / in dispatch / done / not ours, plus a search; ready
+  ones are ticked into a draft, with the factory's recommended next group one tap away; a row opens a sheet with the
+  Linear header, the current verdict with its evidence, and the ticket's timeline: Linear updates, every verdict
+  (superseded ones too), dispatch transitions, notes, decisions asked and answered, card events, write-backs and our
+  own Linear writes, oldest first — `factory ticket-timeline <ID>`; `/factory?ticket=<ID>` opens that sheet),
+  **Draft** (rows are drafts; the selected one shows its plan, the configurator above), **Run** (staged, executing,
+  done: the plan read-only on the chosen path, card status per ticket, a step ✓ once a card comment says so, e.g.
+  "FIN-1/2 done"), and **Learn** (reconciled and the last archived ones: the plan with "predicted" next to "landed"
+  — done summary, PR and write-backs per ticket — where untaken answers still flip as ghosts; then **Learnings**,
+  **Throughput** with cost, and **Done for you** — what the factory answered itself this week). Dispatches are rows
+  in an engineering table (stage, dispatch, tickets, progress, what waits on you, age; the columns fold on a phone).
+  A row belongs to one stage for its whole life there and only moves forward. UI source is React JSX in
+  `hermes/plugins/factory/dashboard/src/` (`index.jsx` page and deck, `plan.jsx` the plan outline and configurator,
+  `railway.jsx` its desktop map, `tickets.jsx` the Tickets tab, `why.jsx` the why threads, `learn.jsx` the
+  learnings; React and components come from the dashboard SDK);
   `./install.sh` bundles it with `bun build` into the gitignored `dist/` and copies the plugin.
 - Chat: `hermes -p factory`, also on the iPhone through Hermex (Bot Mode, factory profile; the web dashboard has
   no Bot Mode yet, so digests and pushes are read and answered there or in the Factory tab). It shows drafts,
@@ -85,7 +93,8 @@ One-time, by hand:
   decision, plan tree, tickets with verdict and mirror path; explain only, ≤5 lines, cite file:line) and stores
   the answer, or `failed` with the error after 180s or a non-zero exit. Follow-ups resume the decision's last
   session so the planner keeps context. Toolsets: `file` only — Hermes has no read-only terminal toolset, and
-  `file` can still write (the prompt forbids it). On an open draft review, "replan with this" sends the draft back
+  `file` can still write (the prompt forbids it). While a planned draft is in review, "replan with this" under an
+  answer (in the plan or on its review) sends the draft back
   (`factory draft replan <run_id> --reason TEXT`, POST /drafts/{run_id}/replan): the reason becomes a binding
   `Replan:` root note, the plan steps are cleared, open review and plan decisions (and their pending asks) are
   withdrawn as `replanned`, and the plan gate picks it up again as unplanned. Notes and answered questions stay.
@@ -130,7 +139,7 @@ One-time, by hand:
   uses next to the cost per verdict and per plan.
 - Backups: `factory-backup` (03:00) writes `~/.hermes/factory/backups/factory-YYYY-MM-DD.db` (newest 14), and every
   schema migration first writes `factory-pre-vN.db`. Same disk: protects against bad writes, not disk loss.
-- CLI: `factory status|overview|tickets|candidates|stage|draft|decide|ask|handoff|propose|execute|card|reconcile|archive|metrics|backup`.
+- CLI: `factory status|overview|tickets|ticket-timeline|candidates|stage|draft|decide|ask|handoff|propose|execute|card|reconcile|archive|metrics|backup`.
   `stage` and approving refresh only the repos involved (parallel fetch); the cron keeps the rest fresh.
 
 ## Invariants (in code: `factory/schema.sql` triggers + CLI checks)

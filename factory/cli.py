@@ -251,8 +251,9 @@ def cmd_overview(cfg, conn, a):
     dispatches = [dispatch_status(cfg, conn, r) for r in runs
                   if conn.execute("SELECT 1 FROM dispatch WHERE run_id=?", (r,)).fetchone()]
     shown = [x["id"] for x in st["decisions"]] + [x["id"] for d in dispatches for x in d["decisions"]]
-    out({"status": st, "tickets": tickets(cfg, conn), "candidates": dispatch.candidates(cfg, conn),
-         "learnings": learn.rows(conn),
+    tk, cands = tickets(cfg, conn), dispatch.candidates(cfg, conn)
+    counts = collections.Counter(t["group"] for t in ledger(cfg, conn, tk, cands["skipped"]))  # list: `tickets --all`
+    out({"status": st, "tickets": tk, "ticket_counts": counts, "candidates": cands, "learnings": learn.rows(conn),
          "dispatches": dispatches, "asks": ask.rows(conn, set(shown))})  # "why?" threads by decision id
 
 
@@ -323,7 +324,8 @@ def dispatch_status(cfg, conn, run_id):
 
 
 def cmd_tickets(cfg, conn, a):
-    out(tickets(cfg, conn))
+    tk = tickets(cfg, conn)
+    out(ledger(cfg, conn, tk, dispatch.candidates(cfg, conn)["skipped"]) if a.all else tk)
 
 
 def tickets(cfg, conn) -> list:
@@ -351,6 +353,152 @@ def tickets(cfg, conn) -> list:
         if r["verdict"]:
             del r["verdict"]["evidence_json"]
     return rows
+
+
+DONE_TYPES = ("completed", "canceled", "duplicate")
+
+
+def group(t: dict, skipped) -> str:
+    """Which Tickets-tab filter a ledger row falls under (the tab says why): dispatch|not|done|stale|ready|answer."""
+    v, d = t.get("verdict"), t.get("dispatch")
+    if d and d["state"] != "archived":
+        return "dispatch"
+    if not t.get("owned"):
+        return "not"
+    if t["state_type"] in DONE_TYPES or t.get("in_review"):
+        return "done"
+    if not t.get("in_scope") or not t.get("context"):
+        return "not"
+    if not v or t.get("freshness") != "fresh":
+        return "stale"
+    if v["kind"] == "valid":
+        return "not" if t["identifier"] in skipped else "ready"
+    return "answer" if v["kind"] in ("needs-clarification", "invalid-references") else "not"
+
+
+def ledger(cfg, conn, owned_rows, skipped) -> list:
+    """Every ticket in scope or ever touched (verdict, dispatch): one small row each, for the Tickets tab. Owned
+    in-scope ones reuse `tickets()` (mapping, freshness); the rest are read straight off linear_latest. `skipped`:
+    candidates()' skipped list (a valid ticket someone else holds is not ready)."""
+    mine = {t["identifier"]: t for t in owned_rows}
+    skipped = {x["identifier"] for x in skipped}
+    review = {k: t.get("review_state") for k, t in cfg.linear.get("team", {}).items()}
+    verdicts = {r["issue_id"]: {"kind": r["kind"], "target": r["target"], "reason": r["reason"]} for r in conn.execute(
+        "SELECT issue_id, kind, target, reason FROM verdict WHERE superseded_at IS NULL")}
+    runs = {r["issue_id"]: dict(r) for r in conn.execute(  # latest membership wins (rows come oldest first)
+        "SELECT t.issue_id, t.run_id, d.state, t.card_status, t.pr_url FROM dispatch_ticket t JOIN dispatch d "
+        "USING (run_id) ORDER BY d.created_at")}
+    last = dict(conn.execute(
+        "SELECT issue_id, max(at) FROM (SELECT issue_id, updated_at at FROM linear_latest "
+        "UNION ALL SELECT issue_id, created_at FROM verdict UNION ALL SELECT issue_id, at FROM card_event "
+        "UNION ALL SELECT issue_id, coalesce(chosen_at, void_at, created_at) FROM decision WHERE issue_id IS NOT NULL "
+        "UNION ALL SELECT t.issue_id, l.at FROM dispatch_ticket t JOIN transition_log l USING (run_id)) GROUP BY issue_id"))
+    rows = []
+    for s in conn.execute("SELECT * FROM linear_latest WHERE in_scope=1 OR issue_id IN "
+                          "(SELECT issue_id FROM verdict UNION SELECT issue_id FROM dispatch_ticket)"):
+        raw = json.loads(s["raw_json"])
+        t = mine.get(s["identifier"])
+        run = runs.pop(s["issue_id"], None)
+        row = {
+            "identifier": s["identifier"], "title": raw["title"],
+            "url": raw["url"].rsplit("/", 1)[0],  # Linear redirects the slugless URL; half the bytes
+            "domain": prune.issue_fields(s)[0], "assignee": (raw["assignee"] or {}).get("email"),
+            "linear_state": raw["state"]["name"], "state_type": s["state_type"], "in_scope": bool(s["in_scope"]),
+            "in_review": raw["state"]["name"] == review.get(raw["team"]["key"]),
+            "owned": t is not None or prune.owned(cfg, conn, s),
+            "context": t and t["context"], "unmapped_reason": t and t["unmapped_reason"],
+            "freshness": t and t["freshness"], "verdict": verdicts.get(s["issue_id"]),
+            "dispatch": run and {k: v for k, v in run.items() if k != "issue_id" and v is not None},
+            "last_at": last.get(s["issue_id"]),
+        }
+        row = {k: v for k, v in row.items() if v}  # absent = null/false, keeps the list small
+        rows.append({**row, "group": group(row, skipped)})
+    return rows
+
+
+def cmd_ticket_timeline(cfg, conn, a):
+    out(ticket_timeline(conn, prune.latest(conn, a.identifier)["issue_id"]))
+
+
+def _run_at(conn, run_id: str) -> str | None:
+    """writeback rows carry no time: sweep-/followup- runs are named after it, a dispatch's writes land between done
+    and reconciled. ponytail: approximate to the run, add writeback.at if exact write times matter."""
+    m = re.fullmatch(r"(?:sweep|followup)-(\d{8}-\d{6})", run_id)
+    if m:
+        return datetime.strptime(m.group(1), "%Y%m%d-%H%M%S").strftime("%Y-%m-%dT%H:%M:%SZ")
+    d = conn.execute("SELECT coalesce(reconciled_at, done_at) FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+    return d[0] if d else None
+
+
+# Linear fields a snapshot-to-snapshot diff names in the timeline; the first three show old → new.
+_WATCH = {"state": lambda r: r["state"]["name"], "assignee": lambda r: (r["assignee"] or {}).get("email"),
+          "priority": lambda r: r["priority"], "title": lambda r: r["title"],
+          "description": lambda r: r.get("description"), "labels": lambda r: [x["name"] for x in r["labels"]["nodes"]]}
+
+
+def ticket_timeline(conn, issue_id: str) -> list[dict]:
+    """Everything the factory saw and did with one ticket, oldest first: [{at, kind, actor, summary, detail?}]."""
+    ev = []
+    add = lambda at, kind, actor, summary, detail=None: ev.append(
+        {"at": at, "kind": kind, "actor": actor, "summary": summary, **({"detail": detail} if detail else {})})
+    own = {r[0] for r in conn.execute("SELECT updated_at FROM linear_own_write WHERE issue_id=?", (issue_id,))}
+    prev = None
+    for s in conn.execute("SELECT updated_at, raw_json FROM linear_snapshot WHERE issue_id=? ORDER BY updated_at",
+                          (issue_id,)):
+        raw = json.loads(s["raw_json"])
+        if prev is None:
+            changes = [f"ingested in {raw['state']['name']}"]
+        else:
+            changes = [f"{k}: {f(prev)} → {f(raw)}" if k in ("state", "assignee", "priority") else f"{k} edited"
+                       for k, f in _WATCH.items() if f(prev) != f(raw)] or ["updated"]
+        mine = s["updated_at"] in own
+        add(s["updated_at"], "own-write" if mine else "linear", "factory:reconcile" if mine else "linear",
+            "; ".join(changes))
+        prev = raw
+    for v in conn.execute("SELECT * FROM verdict WHERE issue_id=? ORDER BY id", (issue_id,)):
+        add(v["created_at"], "verdict", v["created_by"],
+            f"{v['kind']}{' ' + v['target'] if v['target'] else ''}{' (superseded)' if v['superseded_at'] else ''}",
+            {"id": v["id"], "kind": v["kind"], "target": v["target"], "reason": v["reason"],
+             "evidence": json.loads(v["evidence_json"]), "context": v["context"], "repo": v["repo"],
+             "trunk_sha": v["trunk_sha"], "superseded_at": v["superseded_at"], "written_back_run": v["written_back_run"]})
+    # Before the dispatch's transitions: a card's done and the dispatch's done it triggers share a millisecond.
+    for c in conn.execute("SELECT * FROM card_event WHERE issue_id=? ORDER BY id", (issue_id,)):
+        add(c["at"], "card", c["actor"], c["kind"] + (f": {c['body']}" if c["body"] else ""),
+            {"run_id": c["run_id"], **json.loads(c["metadata_json"] or "{}")})
+    run_ids = [r[0] for r in conn.execute("SELECT run_id FROM dispatch_ticket WHERE issue_id=?", (issue_id,))]
+    for run in run_ids:
+        for t in conn.execute("SELECT from_state, to_state, actor, at FROM transition_log WHERE run_id=? ORDER BY id",
+                              (run,)):
+            add(t["at"], "dispatch", t["actor"], f"{run}: {t['from_state'] or 'new'} → {t['to_state']}", {"run_id": run})
+        planned = conn.execute("SELECT planned_at FROM dispatch WHERE run_id=?", (run,)).fetchone()[0]
+        if planned:
+            add(planned, "dispatch", "planner", f"{run}: plan written", {"run_id": run})
+    ident = conn.execute("SELECT identifier FROM linear_latest WHERE issue_id=?", (issue_id,)).fetchone()[0]
+    q = ",".join("?" * len(run_ids))
+    for n in conn.execute(f"SELECT * FROM dispatch_note WHERE run_id IN ({q}) AND (node_id=? OR node_id LIKE ?)",
+                          (*run_ids, ident, ident + "/%")):
+        add(n["at"], "note", n["author"], n["body"], {"run_id": n["run_id"], "node": n["node_id"]})
+    for x in conn.execute(f"SELECT * FROM decision WHERE issue_id=? OR (run_id IN ({q}) AND (node_id=? OR node_id LIKE ?)) "
+                          "ORDER BY id", (issue_id, *run_ids, ident, ident + "/%")):
+        base = {"id": x["id"], "decision": x["kind"], "run_id": x["run_id"], "node": x["node_id"]}
+        add(x["created_at"], "decision", x["created_by"], f"asked: {x['question']}", base)
+        if x["chosen"]:
+            label = next((o["label"] for o in json.loads(x["options_json"]) if o["id"] == x["chosen"]), x["chosen"])
+            add(x["chosen_at"], "decision", x["chosen_by"], f"answered: {label}" + (f" ({x['chosen_note']})" if x["chosen_note"] else ""),
+                {**base, "chosen": x["chosen"], "recommended": x["recommended"]})
+        elif x["void_reason"]:
+            add(x["void_at"], "decision", "factory", f"withdrawn: {x['void_reason']}", base)
+    for w in conn.execute("SELECT * FROM writeback WHERE issue_id=?", (issue_id,)):
+        held = w["decision"] == "flag" and w["approved_by"] is None
+        status = ("skipped" if w["decision"] == "skip" else "held" if held else
+                  {"confirmed": "applied", "sent": "sending"}.get(w["status"], w["status"]))
+        add(_run_at(conn, w["run_id"]), "writeback", w["approved_by"] or "factory:reconcile",
+            f"{w['op']} {status} ({w['rule']})",
+            {"run_id": w["run_id"], "op": w["op"], "status": status, "reason": w["reason"],
+             "linear_ref": w["linear_ref"], "payload": json.loads(w["payload_json"])})
+    # Mixed precisions (Linear and sqlite ms, db.now µs): compare as datetimes at ms, so ties keep the order above.
+    ms = lambda at: (t := datetime.fromisoformat(at)).replace(microsecond=t.microsecond // 1000 * 1000)
+    return sorted(ev, key=lambda e: ms(e["at"]) if e["at"] else datetime.max.replace(tzinfo=UTC))
 
 
 def cmd_ticket(cfg, conn, a):
@@ -414,7 +562,13 @@ def main(argv=None):
     s = sub.add_parser("ticket", help="latest snapshot + mapping + current verdict")
     s.add_argument("identifier")
     s.set_defaults(fn=cmd_ticket)
-    sub.add_parser("tickets", help="owned tickets with verdict + freshness (JSON)").set_defaults(fn=cmd_tickets)
+    s = sub.add_parser("tickets", help="owned tickets with verdict + freshness (JSON)")
+    s.add_argument("--all", action="store_true", help="every ticket in scope or touched, one small row each, "
+                   "with its Tickets-tab group")
+    s.set_defaults(fn=cmd_tickets)
+    s = sub.add_parser("ticket-timeline", help="everything the factory did with one ticket, oldest first (JSON)")
+    s.add_argument("identifier")
+    s.set_defaults(fn=cmd_ticket_timeline)
     sub.add_parser("overview", help="everything the Factory tab shows, in one call (JSON)").set_defaults(fn=cmd_overview)
     sub.add_parser("prune-gate", help="Hermes pre-check for the prune job").set_defaults(fn=cmd_prune_gate)
     sub.add_parser("candidates", help="stageable tickets (JSON), and why the rest are not").set_defaults(

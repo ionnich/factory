@@ -115,7 +115,7 @@ class Decisions(unittest.TestCase):
         with self.assertRaises(dispatch.StageError):  # needs a reason
             dispatch.replan(self.c, "d1", " ", "user")
         res = dispatch.replan(self.c, "d1", "split FIN-1 into two PRs", "user")
-        self.assertEqual((res["steps_cleared"], res["decisions_voided"]), (3, 2))
+        self.assertEqual((res["steps_cleared"], res["decisions_voided"]), (4, 2))  # root, FIN-1 (its result), 2 steps
         self.assertEqual(self.c.execute("SELECT count(*) FROM dispatch_step WHERE run_id='d1'").fetchone()[0], 0)
         self.assertEqual({d["void_reason"] for d in decide.rows(self.c, "d1", open_only=False)}, {"replanned"})
         self.assertEqual(self.c.execute("SELECT status, error FROM ask").fetchone()[:], ("failed", "replanned"))

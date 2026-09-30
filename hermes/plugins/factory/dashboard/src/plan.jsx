@@ -1,14 +1,16 @@
-// The plan as one outline, phone first (the "configurator"): a sticky result header, then ticket → result → numbered
-// steps, each plan question a switch inside the step it is about. Flipping a switch changes nothing on the server:
-// the picked option's `changes` are applied to the outline and its `result` rewrites the header. "Lock in path"
-// answers the open questions (POST /decisions/{id}, one by one), then the review decision shows. Read-only in Run
+// The plan as one outline, phone first (the "configurator"; the Draft tab's view of a draft): a sticky result header,
+// then ticket → result → numbered steps, each plan question a switch inside the step it is about, with its "why?"
+// thread (why.jsx). Flipping a switch changes nothing on the server: the picked option's `changes` are applied to the
+// outline and its `result` rewrites the header. "Lock in path" answers the open questions (POST /decisions/{id}, one by
+// one), then the review decision shows. While draft, `+ note` on the root, each ticket and each step. Read-only in Run
 // (the chosen path, steps ✓ from card comments) and Learn (predicted next to landed; untaken paths flip as ghosts).
-import { ActErr, CARD, CARD_TONE, DecisionBody, Ext, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose } from "./index.jsx";
+import { API, ActErr, CARD, CARD_TONE, DecisionBody, Ext, NoteBox, Notes, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose } from "./index.jsx";
 import { Railway } from "./railway.jsx";
+import { Why } from "./why.jsx";
 
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
-const { useState, useMemo, useRef } = SDK.hooks;
+const { useState, useEffect, useMemo, useRef } = SDK.hooks;
 const { Button } = SDK.components;
 const h = React.createElement;
 const Fragment = React.Fragment;
@@ -89,7 +91,7 @@ export function doneSteps(events) {
 const stageMode = (d) => d.state === "draft" ? "draft" : ["staged", "executing", "done"].includes(d.state) ? "run" : "learn";
 
 // ---- one question: a switch ------------------------------------------------------------------------------------
-function Switch({ q, pick, onPick, locked, renderWhy, diff }) {
+function Switch({ q, pick, onPick, locked, diff }) {
   const opts = sortOptions(q), cur = pick[q.id];
   const seg = opts.length === 2 && opts.every((o) => o.label.length <= 18);
   const star = (o) => (o.id === q.recommended ? <span className="star">★</span> : null);
@@ -124,13 +126,13 @@ function Switch({ q, pick, onPick, locked, renderWhy, diff }) {
         </div>
       )}
       {q.why ? <div className="fx-hint"><span className="star">★</span>{q.why}</div> : null}
-      {renderWhy ? renderWhy(q) : null}
+      <Why d={q} />
     </div>
   );
 }
 
 // ---- the outline: ticket → result → numbered steps, switches inside ----------------------------------------------
-function Outline({ d, qs, pick, free, onPick, cmp, renderWhy, tickets }) {
+function Outline({ d, qs, pick, free, onPick, cmp, tickets, onDone }) {
   const nodes = applyPlan(d.tree || [], qs, pick);
   const act = activeQs(qs, pick);
   const cards = Object.fromEntries((d.tickets || []).map((c) => [c.identifier, c]));
@@ -139,9 +141,13 @@ function Outline({ d, qs, pick, free, onPick, cmp, renderWhy, tickets }) {
   if (!tks.length) tks = (d.tickets || []).map((c) => ({ id: c.identifier, title: tickets[c.identifier]?.title }));
   const shown = new Set(nodes.filter((n) => !n.gone).map((n) => n.id).concat(tks.map((t) => t.id)));
   const on = (id) => act.filter((q) => q.node_id === id || (id === "root" && !shown.has(q.node_id)));
-  const sw = (q) => <Switch key={q.id} q={q} pick={pick} onPick={onPick} locked={!free(q)} renderWhy={renderWhy} diff={cmp?.qs.has(q.id)} />;
+  const sw = (q) => <Switch key={q.id} q={q} pick={pick} onPick={onPick} locked={!free(q)} diff={cmp?.qs.has(q.id)} />;
+  // notes bind the executor (dispatch.md); new ones only while draft, on nodes the plan has (not an unsent flip's)
+  const notes = (n) => (<><Notes notes={n?.notes} />
+    {d.state === "draft" && n && !n.added && !n.gone ? <NoteBox run={d.run_id} nodeId={n.id} onDone={onDone} /> : null}</>);
   return (
     <div className="fx-ol">
+      {notes(nodes.find((n) => n.id === "root") || { id: "root" })}
       {on("root").map(sw)}
       {tks.map((t) => {
         const c = cards[t.id];
@@ -156,6 +162,7 @@ function Outline({ d, qs, pick, free, onPick, cmp, renderWhy, tickets }) {
             </div>
             <div className="fx-title small">{t.title || tickets[t.id]?.title}</div>
             {t.result ? <div className="fx-ol-res">→ {t.result}</div> : null}
+            {notes(nodes.find((n) => n.id === t.id) || { id: t.id })}
             {on(t.id).map(sw)}
             {steps.length ? <ol className="fx-ol-steps">{steps.map((s) => {
               const n = s.id.split("/")[1], ok = c?.card_status === "done" || done.has(s.id);
@@ -172,6 +179,7 @@ function Outline({ d, qs, pick, free, onPick, cmp, renderWhy, tickets }) {
                       {(s.files || []).map((f) => <span key={f.path} className="fx-file">{f.path}{f.new ? " (new)" : ""}</span>)}
                     </div>) : null}
                   {s.detail ? <div className="fx-hint clamp">{s.detail}</div> : null}
+                  {notes(s)}
                   {s.gone ? null : on(s.id).map(sw)}
                 </li>);
             })}</ol> : null}
@@ -204,12 +212,19 @@ const evidence = (e) => e.type === "file" ? `${e.path}${e.line ? `:${e.line}` : 
   : e.type === "linear" ? e.ref : e.witness ? `${e.witness}: ${clip(e.query, 80)}` : e.type;
 
 function TicketSheet({ d, tickets, onClose }) {
-  const title = (id) => tickets[id]?.title || (d.tree || []).find((n) => n.id === id)?.title;
+  // tickets in a draft can be missing from overview.tickets (owned, in scope only): the ledger has them
+  const missing = (d.tickets || []).some((c) => !tickets[c.identifier]);
+  const [more, setMore] = useState({});
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    if (missing) SDK.fetchJSON(`${API}/tickets`).then((xs) => setMore(Object.fromEntries(xs.map((t) => [t.identifier, t]))), (e) => setErr(errText(e)));
+  }, [missing]);
+  const title = (id) => (tickets[id] || more[id])?.title || (d.tree || []).find((n) => n.id === id)?.title;
   return (
     <div className="fx-bsheet-bg" onClick={onClose}>
       <div className="fx-bsheet" onClick={stop} role="dialog" aria-label="Tickets">
         {(d.tickets || []).map((c) => {
-          const t = tickets[c.identifier], v = t?.verdict;
+          const t = tickets[c.identifier] || more[c.identifier], v = t?.verdict;
           return (
             <div key={c.identifier} className="fx-stack-v fx-bsheet-t">
               <div className="fx-row">{t?.url ? <Ext href={t.url}>{c.identifier}</Ext> : <span className="fx-id">{c.identifier}</span>}
@@ -220,6 +235,7 @@ function TicketSheet({ d, tickets, onClose }) {
             </div>
           );
         })}
+        <ActErr err={err} />
         <Button size="sm" onClick={onClose}>Close</Button>
       </div>
     </div>
@@ -235,7 +251,7 @@ function Review({ d, onDone }) {
 }
 
 // ---- the whole thing: result header + outline (+ railway on desktop) + bottom bar in review ---------------------
-export function Plan({ d, tickets = {}, onDone, onClose, renderWhy }) {
+export function Plan({ d, tickets = {}, onDone, onClose }) {
   const mode = stageMode(d);
   const qs = useMemo(() => planQs(d), [d]);
   const [flips, setFlips] = useState({});
@@ -285,7 +301,7 @@ export function Plan({ d, tickets = {}, onDone, onClose, renderWhy }) {
                                onContextMenu={(e) => e.preventDefault()}>{breadcrumb(qs, pick)}</button> : null}
           {qs.length && mode !== "run" ? <div className="fx-hint">{cmp.same ? "★ path" : `vs ★: ${vs}`}</div> : null}
         </header>
-        <Outline d={d} qs={qs} pick={pick} free={free} onPick={onPick} cmp={hold ? cmp : null} renderWhy={renderWhy} tickets={tickets} />
+        <Outline d={d} qs={qs} pick={pick} free={free} onPick={onPick} cmp={hold ? cmp : null} tickets={tickets} onDone={onDone} />
         {mode === "draft" ? (
           <div className="fx-cfg-bar">
             {open.length ? (

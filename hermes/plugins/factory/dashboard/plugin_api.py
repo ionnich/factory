@@ -67,6 +67,18 @@ async def overview():
     return {**await factory("overview"), "jobs": jobs()}
 
 
+@router.get("/tickets")
+async def all_tickets():  # the Tickets tab's list; kept off /overview, which refreshes on every change
+    return await factory("tickets", "--all")
+
+
+@router.get("/tickets/{ident}/timeline")
+async def ticket_timeline(ident: str):
+    if not IDENT.match(ident):
+        raise HTTPException(422, "bad ticket id")
+    return await factory("ticket-timeline", ident)
+
+
 def _stamp(conn: sqlite3.Connection) -> tuple:
     """Moves when another connection commits to factory.db (PRAGMA data_version on this connection; reads don't
     move it) or a cron job record changes."""

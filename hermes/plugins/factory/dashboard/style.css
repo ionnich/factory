@@ -132,7 +132,7 @@
 .fx-bar i { flex: 1; height: 5px; border-radius: 3px; background: var(--color-border); }
 .fx-bar i.t-green { background: var(--g); } .fx-bar i.t-blue { background: var(--b); } .fx-bar i.t-amber { background: var(--a); }
 
-/* dispatch flow: cards down a rail */
+/* the rail (railway.jsx map): dots and wires beside rows */
 .fx-flow { position: relative; margin-top: .4rem; }
 .fx-rail { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
 .fx-wire { fill: none; stroke: var(--e); stroke-width: 2; stroke-linecap: round; transition: stroke .2s, opacity .2s; }
@@ -144,31 +144,23 @@
 .fx-dot.t-gray { fill: var(--n); } .fx-dot.t-red { fill: var(--r); } .fx-dot.t-done { fill: var(--n); opacity: .7; }
 .fx-dot.t-ghost { fill: var(--bg); stroke: var(--n); stroke-width: 1.5; stroke-dasharray: 2 2; }
 .fx-dot.lit { stroke: var(--b); }
-.fx-flow-row { transition: opacity .2s; }
-.fx-flow-row.dim { opacity: .45; }
-.fx-node { margin: 0 0 .45rem; padding: .6rem .8rem; border-radius: 14px; border: 1px solid var(--color-border);
-           background: var(--color-card); cursor: pointer; display: grid; gap: .3rem;
-           animation: fx-pop .45s var(--spring) both; transition: border-color .2s, transform .2s var(--spring); }
-@keyframes fx-pop { from { opacity: 0; transform: translateY(8px) scale(.97); } }
-.fx-node:hover { transform: translateX(2px); }
-.fx-node.open { border-color: var(--b); }
-.fx-node.k-root { border-width: 2px; }
-.fx-node.k-step { padding: .45rem .7rem; border-radius: 11px; background: color-mix(in srgb, var(--color-card) 60%, transparent); }
-.fx-node.k-step .fx-step { font-size: .88rem; font-weight: 550; flex: 1; min-width: 0; }
-.fx-node.live { border: 2px solid var(--a); box-shadow: 0 0 0 4px color-mix(in srgb, var(--a) 12%, transparent); cursor: auto; }
-.fx-node.settled { opacity: .85; }
-.fx-node.k-outcome { border-style: dashed; }
 .fx-pre { white-space: pre-wrap; font-size: .82rem; color: var(--color-muted-foreground); overflow-wrap: anywhere; }
 .fx-note { font-size: .84rem; padding: .35rem .55rem; border-left: 3px solid var(--a); border-radius: 6px;
            background: color-mix(in srgb, var(--a) 9%, transparent); white-space: pre-wrap; overflow-wrap: anywhere; }
-.fx-history { margin: .2rem 0 0 1rem; list-style: disc; font-size: .78rem; color: var(--color-muted-foreground); }
 .fx-writes { list-style: none; margin: .1rem 0 0; padding: 0; display: grid; gap: .15rem; font-size: .82rem; }
 .fx-writes .mark { display: inline-block; width: 1.1rem; font-weight: 800; }
 .fx-writes .w-confirmed .mark { color: var(--g); } .fx-writes .w-failed .mark { color: var(--r); }
 .fx-writes .w-held .mark { color: var(--a); } .fx-writes .w-planned .mark { color: var(--b); }
 
 /* tickets */
-.fx-tabs { overflow-x: auto; max-width: 100%; margin-bottom: .6rem; }
+.fx-search { width: 100%; margin-bottom: .5rem; }
+.fx-chips { display: flex; flex-wrap: wrap; gap: .35rem; margin-bottom: .7rem; }
+.fx-chip { display: inline-flex; gap: .3rem; align-items: center; padding: .3rem .7rem; border-radius: 999px; cursor: pointer;
+           border: 1px solid var(--color-border); background: var(--color-card); color: var(--color-muted-foreground);
+           font: inherit; font-size: .8rem; font-weight: 600; }
+.fx-chip.on { border-color: var(--b); color: var(--b); }
+.fx-tmeta { gap: .35rem; margin: .15rem 0; }
+.fx-trow .fx-ttitle, .fx-trow .fx-hint { overflow-wrap: anywhere; }
 .fx-suggest { margin-bottom: .7rem; border: 2px solid var(--a) !important; }
 .fx-list { display: grid; gap: .4rem; }
 .fx-trow { display: flex; gap: .6rem; align-items: flex-start; padding: .6rem .75rem; border-radius: 12px; cursor: pointer;
@@ -180,6 +172,20 @@
 .fx-draftbar { position: sticky; bottom: .8rem; z-index: 5; display: flex; gap: .5rem; align-items: center; margin-top: .6rem;
                padding: .55rem .75rem; border-radius: 14px; background: var(--color-card); border: 2px solid var(--b);
                box-shadow: 0 8px 26px rgb(0 0 0 / .3); animation: fx-rise .35s var(--spring) both; }
+/* ticket sheet: slides up over the page, the timeline scrolls inside it */
+.fx-sheet-bg { position: fixed; inset: 0; z-index: 50; background: rgb(0 0 0 / .45); display: flex; align-items: flex-end;
+               justify-content: center; }
+.fx-sheet { width: min(760px, 100%); max-height: 88vh; overflow-y: auto; overscroll-behavior: contain; display: grid; gap: .6rem;
+            align-content: start; padding: 1rem .9rem 2rem; border-radius: 18px 18px 0 0; background: var(--color-card, var(--bg));
+            border: 1px solid var(--color-border); box-shadow: 0 -10px 40px rgb(0 0 0 / .35); animation: fx-rise .35s var(--spring) both; }
+.fx-verdict { padding: .6rem .7rem; border-radius: 12px; border: 1px solid var(--color-border); }
+.fx-evidence { list-style: none; margin: 0; padding: 0; display: grid; gap: .4rem; font-size: .82rem; }
+.fx-evidence code, .fx-ev-body { overflow-wrap: anywhere; }
+.fx-evidence code { font-size: .78rem; }
+.fx-timeline { list-style: none; margin: 0; padding: 0 0 0 .8rem; border-left: 2px solid var(--e); display: grid; gap: .55rem; }
+.fx-ev { position: relative; display: grid; gap: .2rem; cursor: pointer; font-size: .85rem; }
+.fx-ev::before { content: ""; position: absolute; left: calc(-.8rem - 5px); top: .45rem; width: 8px; height: 8px;
+                 border-radius: 999px; background: var(--n); }
 
 /* throughput */
 .fx-fold > summary { cursor: pointer; font-weight: 700; margin-bottom: .6rem; }

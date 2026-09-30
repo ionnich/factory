@@ -1,19 +1,20 @@
 // Factory tab, mobile first: a stack of cards.
 //   Needs you: a deck of decisions. Each is a question with options, what each leads to, and the factory's
 //     recommendation. Tap an option, or swipe right to take the recommendation, left for later.
-//   Lifecycle: one tab per factory stage — Ingest (tickets), Draft (assemble + revise/edit), Run (staged, executing,
-//     done), Learn (reconciled, archived, learnings, throughput). Dispatches are rows in an engineering table; a draft opens its
-//     DAG as folded cards down a rail (dispatch → review → tickets → steps → results) and its plan (plan.jsx, the
-//     configurator); Run and Learn show the plan read-only. Quick lane: light decisions, ★ on all in one tap.
+//   Lifecycle: one tab per factory stage — Tickets (every ticket and its audit trail; pick drafts), Draft (the plan:
+//     plan.jsx, the configurator, with notes while draft), Run (staged, executing, done; the plan read-only), Learn
+//     (reconciled, archived: predicted vs landed, learnings, throughput). Dispatches are rows in an engineering table.
+//     Quick lane: light decisions, ★ on all in one tap.
 // Every action goes through the plugin API to the factory CLI, which enforces the invariants.
 // Built by install.sh (`bun build`, classic JSX via tsconfig.json) to dist/index.js; React and the shadcn-style
-// components come from the dashboard SDK.
+// components come from the dashboard SDK. The Tickets tab lives in tickets.jsx.
 import { Learnings } from "./learn.jsx";
 import { Plan, Quick } from "./plan.jsx";
+import { TicketsTab } from "./tickets.jsx";
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect, useCallback, useRef, useMemo } = SDK.hooks;
-const { Button, Badge, Card, CardContent, Input, Tabs, TabsList, TabsTrigger, Toast } = SDK.components;
+const { Button, Badge, Card, CardContent, Input, Toast } = SDK.components;
 const h = React.createElement;
 const Fragment = React.Fragment;  // for <>…</>
 const API = "/api/plugins/factory";
@@ -55,8 +56,6 @@ const KIND = { review: "Review", plan: "Planner asks", ask: "Executor asks", blo
 const KIND_ORDER = ["review", "ask", "executor-gone", "dispatch-stuck", "blocked", "writeback", "plan", "learning"];
 const CARD = { ready: "not started", running: "in progress", done: "done", blocked: "blocked" };
 const CARD_TONE = { ready: "gray", running: "blue", done: "green", blocked: "amber" };
-const RECHECK = { new: "Not verified yet", "ticket-changed": "Changed in Linear since it was verified",
-                  "evidence-changed": "The code it was verified against changed", "context-changed": "Repo mapping changed" };
 
 function dispatchStatus(d) {
   const cards = d.tickets || [];
@@ -81,17 +80,6 @@ function dispatchTitle(d, titles) {
   const ids = (d.tickets || []).map((c) => c.identifier);
   if (ids.length === 1) return titles[ids[0]] || ids[0];
   return ids.length ? `${ids.length} tickets: ${ids.join(", ")}` : d.run_id;
-}
-
-function ticketGroup(t, skipped) {
-  const v = t.verdict;
-  if (t.dispatch) return { group: "dispatch" };
-  if (!t.context) return { group: "not", why: "No repo is mapped for this domain" };
-  if (!v || t.freshness !== "fresh") return { group: "checking", why: RECHECK[t.freshness] || "Queued for verification" };
-  if (v.kind === "valid") return skipped[t.identifier] ? { group: "not", why: skipped[t.identifier] } : { group: "ready", why: v.reason };
-  if (v.kind === "needs-clarification") return { group: "answer", why: v.reason };
-  if (v.kind === "invalid-references") return { group: "answer", why: `${v.target}: ${v.reason}` };
-  return { group: "not", why: `${v.kind === "duplicate-of" ? `Duplicate of ${v.target}` : v.kind.replace("-", " ")}: ${v.reason}` };
 }
 
 // ---- decisions -------------------------------------------------------------------------------------------------
@@ -286,143 +274,8 @@ function DoneForYou({ items }) {
   );
 }
 
-// ---- dispatch flow: cards down a rail ------------------------------------------------------------------------
-// Nodes in flow order; edges own (parent → child), after (prerequisite → dependent), attach (node → its decision).
-function buildFlow(d, titles) {
-  const nodes = [], edges = [], idx = {};
-  const add = (n) => { if (idx[n.id] == null) { idx[n.id] = nodes.length; nodes.push(n); } return n; };
-  const link = (s, t, kind) => { if (idx[s] != null && idx[t] != null && s !== t) edges.push({ s, t, kind, attach: kind === "attach" }); };
-  const tree = d.tree || [];
-  const decisions = (d.decisions || []).filter((x) => !x.void_reason || x.kind === "review");
-  const reviews = decisions.filter((x) => x.kind === "review");
-  const gate = reviews.find((x) => x.open) || reviews[reviews.length - 1];
-  const cards = Object.fromEntries((d.tickets || []).map((c) => [c.identifier, c]));
-  const writes = d.writes || [];
-  const kindOf = Object.fromEntries(tree.map((n) => [n.id, n.kind]));
-  const nid = (id) => (id == null || id === "root" ? "root" : kindOf[id] === "ticket" ? `t:${id}` : `s:${id}`);
-  const attachAll = (nodeId, key) => decisions.filter((x) => x.kind !== "review" && (x.node_id === key)).forEach((x) => {
-    add({ id: `d:${x.id}`, kind: "decision", decision: x, attach: true });
-    link(nodeId, `d:${x.id}`, "attach");
-  });
-  add({ id: "root", kind: "root", d, title: dispatchTitle(d, titles) });
-  attachAll("root", "root");
-  if (gate) { add({ id: "gate", kind: "gate", decision: gate }); link("root", "gate", "own"); }
-  const head = gate ? "gate" : "root";
-  const byTicket = {};
-  tree.forEach((n) => { if (n.kind === "step") (byTicket[n.id.split("/")[0]] ||= []).push(n); });
-  const outcome = (ident) => {
-    const steps = byTicket[ident] || [];
-    const oid = `o:${ident}`;
-    add({ id: oid, kind: "outcome", ident, card: cards[ident], writes: writes.filter((w) => w.identifier === ident) });
-    const dependedOn = new Set(steps.flatMap((s) => s.depends_on || []).concat(steps.map((s) => s.id.includes(".") ? s.id.slice(0, s.id.lastIndexOf(".")) : null)));
-    const ends = steps.filter((s) => !dependedOn.has(s.id));
-    (ends.length ? ends.map((s) => `s:${s.id}`) : [`t:${ident}`]).forEach((s) => link(s, oid, "own"));
-    decisions.filter((x) => x.kind === "writeback" && x.node_id === ident).forEach((x) => {
-      add({ id: `d:${x.id}`, kind: "decision", decision: x, attach: true });
-      link(oid, `d:${x.id}`, "attach");
-    });
-  };
-  const idents = tree.filter((n) => n.kind === "ticket").map((n) => n.id);
-  const lastStep = {};
-  tree.forEach((n) => { if (n.kind === "step") lastStep[n.id.split("/")[0]] = n.id; });
-  tree.forEach((n) => {
-    if (n.kind === "dispatch") return;
-    if (n.kind === "ticket") add({ id: `t:${n.id}`, kind: "ticket", node: n, card: cards[n.id], title: n.title || titles[n.id] });
-    else add({ id: `s:${n.id}`, kind: "step", node: n, card: cards[n.id.split("/")[0]] });
-    decisions.filter((x) => x.kind !== "writeback" && x.kind !== "review" && x.node_id === n.id).forEach((x) => {
-      add({ id: `d:${x.id}`, kind: "decision", decision: x, attach: true });
-    });
-    const tk = n.kind === "ticket" ? n.id : n.id.split("/")[0];
-    if ((n.kind === "ticket" && !byTicket[n.id]) || (n.kind === "step" && lastStep[tk] === n.id)) outcome(tk);
-  });
-  if (!idents.length) (d.tickets || []).forEach((c) => {  // no plan yet: tickets straight off the dispatch
-    add({ id: `t:${c.identifier}`, kind: "ticket", node: { id: c.identifier, notes: [], depends_on: [] }, card: c, title: titles[c.identifier] });
-    link(head, `t:${c.identifier}`, "own");
-    outcome(c.identifier);
-  });
-  tree.forEach((n) => {
-    if (n.kind === "dispatch") return;
-    const me = nid(n.id);
-    if (!(n.kind === "step" && n.depends_on?.length)) link(n.parent === "root" || n.parent == null ? head : nid(n.parent), me, "own");
-    (n.depends_on || []).forEach((dep) => link(nid(dep), me, "after"));
-    decisions.filter((x) => x.kind !== "writeback" && x.kind !== "review" && x.node_id === n.id).forEach((x) => link(me, `d:${x.id}`, "attach"));
-  });
-  return { nodes: topo(nodes, edges), edges };
-}
-
-// A step (or a question on one) belongs to its ticket.
-const ownerOf = (n) => n.kind === "step" ? n.node.id.split("/")[0]
-  : n.kind === "decision" && n.decision.kind !== "writeback" && n.decision.node_id?.includes("/") ? n.decision.node_id.split("/")[0] : null;
-
-// Folded tickets hide their steps and the questions on them; edges through hidden steps reroute to the ticket.
-function fold(flow, shown) {
-  const steps = {}, asks = {};
-  flow.nodes.forEach((n) => {
-    const t = ownerOf(n);
-    if (n.kind === "step") steps[t] = (steps[t] || 0) + 1;
-    if (t && n.kind === "decision" && n.decision.open) asks[t] = (asks[t] || 0) + 1;
-  });
-  const hide = (n) => { const t = ownerOf(n); return t && !shown.has(t); };
-  const byId = Object.fromEntries(flow.nodes.map((n) => [n.id, n]));
-  const to = (id) => { const n = byId[id]; if (!hide(n)) return id; return n.kind === "step" ? `t:${ownerOf(n)}` : null; };
-  const seen = new Set(), edges = [];
-  flow.edges.forEach((e) => {
-    const s = to(e.s), t = to(e.t), k = `${s}>${t}`;
-    if (s && t && s !== t && !seen.has(k)) { seen.add(k); edges.push({ ...e, s, t }); }
-  });
-  const nodes = flow.nodes.filter((n) => !hide(n)).map((n) => n.kind === "ticket" && steps[n.node.id]
-    ? { ...n, steps: steps[n.node.id], asks: asks[n.node.id] || 0, folded: !shown.has(n.node.id) } : n);
-  return { nodes: topo(nodes, edges), edges };
-}
-
-// Kahn's algorithm, ties broken by build order, so every edge points down the page.
-function topo(nodes, edges) {
-  const pos = Object.fromEntries(nodes.map((n, i) => [n.id, i]));
-  const indeg = Object.fromEntries(nodes.map((n) => [n.id, 0]));
-  edges.forEach((e) => { indeg[e.t]++; });
-  const ready = nodes.filter((n) => !indeg[n.id]).map((n) => n.id);
-  const out = [];
-  while (ready.length) {
-    ready.sort((a, b) => pos[a] - pos[b]);
-    const id = ready.shift();
-    out.push(nodes[pos[id]]);
-    edges.forEach((e) => { if (e.s === id && --indeg[e.t] === 0) ready.push(e.t); });
-  }
-  return out.length === nodes.length ? out : nodes;  // a cycle can't happen (the plan is a DAG); keep build order if it did
-}
-
-// Git-graph style lanes: a node takes its parent's lane when free; an edge that skips rows reserves a lane for
-// the rows it passes; decisions branch one lane to the right of what they hang off.
-function lanes(nodes, edges) {
-  const row = Object.fromEntries(nodes.map((n, i) => [n.id, i]));
-  const occ = [];
-  const free = (l, a, b) => { for (let r = a; r <= b; r++) if (occ[l]?.has(r)) return false; return true; };
-  const take = (l, a, b) => { occ[l] ||= new Set(); for (let r = a; r <= b; r++) occ[l].add(r); };
-  const lowest = (a, b) => { let l = 0; while (!free(l, a, b)) l++; return l; };
-  const lane = {}, track = new Map(), arrive = {};
-  const ins = {}, outs = {};
-  edges.forEach((e) => { (ins[e.t] ||= []).push(e); (outs[e.s] ||= []).push(e); });
-  nodes.forEach((n, r) => {
-    const parents = (ins[n.id] || []).map((e) => lane[e.s]).filter((l) => l != null);
-    const prefs = n.attach ? [(parents[0] ?? 0) + 1] : [...parents, ...(arrive[n.id] || [])];
-    const L = prefs.find((l) => free(l, r, r)) ?? lowest(r, r);
-    take(L, r, r);
-    lane[n.id] = L;
-    let main = false;
-    (outs[n.id] || []).slice().sort((a, b) => row[a.t] - row[b.t]).forEach((e) => {
-      const rc = row[e.t];
-      if (rc <= r + 1) return;
-      const T = (!e.attach && !main && free(L, r + 1, rc - 1)) ? L : lowest(r + 1, rc - 1);
-      take(T, r + 1, rc - 1);
-      track.set(e, T);
-      (arrive[e.t] ||= []).push(T);
-      if (!e.attach) main = true;
-    });
-  });
-  return { lane, track, count: Math.max(0, ...Object.values(lane), ...track.values()) + 1 };
-}
-
-const LANE_W = 16, RAIL_X0 = 10, DOT_Y = 22;
+// ---- the rail: dots and wires beside rows (railway.jsx lays out the plan's map on it) --------------------------
+const LANE_W = 16, RAIL_X0 = 10;
 const DOT_TONE = (n) => {
   if (n.kind === "root") return dispatchStatus(n.d).tone;
   if (n.kind === "gate" || n.kind === "decision") return n.decision.open ? "amber" : n.decision.void_reason ? "gray" : "done";
@@ -476,84 +329,6 @@ function NoteBox({ run, nodeId, onDone }) {
 
 const Notes = ({ notes }) => (notes || []).map((n) => <div key={n.id} className="fx-note">{n.body}<div className="fx-hint">{n.author} · {ago(n.at)}</div></div>);
 
-function DecisionNode({ d, onDone, children }) {
-  const c = useChoose(d, (r, x) => onDone(r, x));
-  return (
-    <>
-      <div className="fx-row between"><Tone tone={d.open ? "amber" : "gray"}>{KIND[d.kind]}</Tone>{d.deadline && d.open ? <span className="fx-clock">⏱ {until(d.deadline)}</span> : null}</div>
-      <div className="fx-q small">{d.question}</div>
-      {children}
-      <DecisionBody d={d} busy={c.busy} err={c.err} compact onChoose={(o, n) => c.choose(o, n).catch(() => {})} />
-    </>
-  );
-}
-
-function FlowCard({ n, d, open, onToggle, onDone, draft, cardRef, i }) {
-  const body = () => {
-    switch (n.kind) {
-      case "root": {
-        const s = dispatchStatus(d);
-        const repos = (() => { try { return JSON.parse(d.repos_json || "[]").map((r) => r.repo.split("/").pop()); } catch { return []; } })();
-        const root = (d.tree || []).find((x) => x.id === "root");
-        return (<>
-          <div className="fx-row between"><span className="fx-k">Dispatch</span><Tone tone={s.tone}>{s.label}</Tone></div>
-          <div className="fx-title">{n.title}</div>
-          <div className="fx-hint">{[d.run_id, ...repos, d.auto ? "drafted by the factory" : d.drafted_by].filter(Boolean).join(" · ")}</div>
-          {d.emergency ? <Tone tone="amber">Emergency: no review window</Tone> : null}
-          {d.hash_ok === false ? <div className="fx-err">The dispatch file changed after approval.</div> : null}
-          {open && root?.detail ? <div className="fx-pre">{root.detail}</div> : null}
-          <Notes notes={root?.notes} />
-          {draft ? <NoteBox run={d.run_id} nodeId="root" onDone={onDone} /> : null}
-          {open ? <ul className="fx-history">{(d.transitions || []).map((x, k) => <li key={k}>{x.to_state} · {x.actor} · {ago(x.at)}</li>)}</ul> : null}
-        </>);
-      }
-      case "gate": {
-        const qs = n.decision.open ? (d.decisions || []).filter((x) => x.kind === "plan" && x.open).length : 0;
-        return (
-          <DecisionNode d={n.decision} onDone={onDone}>
-            {qs ? <><Tone tone="amber">{plural(qs, "planner question")} below still open</Tone>
-              <div className="fx-hint">Answer {qs === 1 ? "it" : "them"} first; approving takes ★ on any left open.</div></> : null}
-          </DecisionNode>
-        );
-      }
-      case "decision": return <DecisionNode d={n.decision} onDone={onDone} />;
-      case "ticket": return (<>
-        <div className="fx-row between"><span className="fx-row"><span className="fx-id">{n.node.id}</span>{n.card?.pr_url ? <Ext href={n.card.pr_url}>PR</Ext> : null}</span>
-          {n.card ? <Tone tone={CARD_TONE[n.card.card_status]}>{CARD[n.card.card_status]}</Tone> : null}</div>
-        <div className="fx-title small">{n.title}</div>
-        {open && n.node.detail ? <div className="fx-pre">{n.node.detail}</div> : null}
-        {n.steps ? <div className="fx-hint fx-fold-hint">{n.folded ? "▸" : "▾"} {plural(n.steps, "step")}{n.asks ? ` · ${plural(n.asks, "open question")}` : ""}</div> : null}
-        <Notes notes={n.node.notes} />
-        {draft ? <NoteBox run={d.run_id} nodeId={n.node.id} onDone={onDone} /> : null}
-      </>);
-      case "step": return (<>
-        <div className="fx-row"><span className="fx-id">{n.node.id.split("/")[1]}</span><span className="fx-step">{n.node.title}</span></div>
-        {n.node.depends_on?.length ? <div className="fx-hint">after {n.node.depends_on.join(", ")}</div> : null}
-        {n.node.detail ? <div className={`fx-pre${open ? "" : " clamp"}`}>{n.node.detail}</div> : null}
-        <Notes notes={n.node.notes} />
-        {draft && open ? <NoteBox run={d.run_id} nodeId={n.node.id} onDone={onDone} /> : null}
-      </>);
-      case "outcome": {
-        const st = n.card?.card_status;
-        return (<>
-          <div className="fx-row between"><span className="fx-k">Result · {n.ident}</span>
-            {st === "done" ? <Tone tone="green">landed</Tone> : st === "blocked" ? <Tone tone="amber">blocked</Tone> : <span className="fx-hint">not yet</span>}</div>
-          {n.card?.pr_url ? <Ext href={n.card.pr_url}>{n.card.pr_url.replace("https://github.com/", "")}</Ext>
-            : <div className="fx-hint">{st === "blocked" ? "Stopped before a PR." : "A merged PR with green checks, then write-back to Linear."}</div>}
-          <Writes writes={n.writes} />
-        </>);
-      }
-      default: return null;
-    }
-  };
-  return (
-    <div ref={cardRef} className={`fx-node k-${n.kind}${open ? " open" : ""}${n.kind === "decision" || n.kind === "gate" ? (n.decision.open ? " live" : " settled") : ""}`}
-         style={{ animationDelay: `${Math.min(i, 12) * 35}ms` }} onClick={onToggle}>
-      {body()}
-    </div>
-  );
-}
-
 const Writes = ({ writes }) => (writes.length ? <ul className="fx-writes">{writes.map((w, k) => (
   <li key={k} className={`w-${w.decision === "flag" ? "held" : w.status}`}>
     <span className="mark">{w.decision === "flag" ? "⏸" : w.status === "confirmed" ? "✓" : w.status === "failed" ? "✕" : "…"}</span>
@@ -561,66 +336,8 @@ const Writes = ({ writes }) => (writes.length ? <ul className="fx-writes">{write
     {w.decision === "flag" ? " · held" : w.approved_by ? ` · applied by ${w.approved_by}` : ""}
   </li>))}</ul> : null);
 
-function Flow({ d, titles, onDone, focusNode }) {
-  const full = useMemo(() => buildFlow(d, titles), [d, titles]);
-  const focusOwner = (id) => { const n = full.nodes.find((x) => x.id === id); return n && ownerOf(n); };
-  // Folded by default; tickets with open step questions (and the focused node's ticket) start unfolded.
-  const [shown, setShown] = useState(() => new Set(full.nodes.map((n) => n.kind === "decision" && n.decision.open ? ownerOf(n) : null)
-    .concat(focusOwner(focusNode)).filter(Boolean)));
-  const flow = useMemo(() => fold(full, shown), [full, shown]);
-  const layout = useMemo(() => lanes(flow.nodes, flow.edges), [flow]);
-  const [open, setOpen] = useState(focusNode || null);
-  const pending = useRef(focusNode || null);
-  const refs = useRef([]);
-  const box = useRef(null);
-  const [ys, setYs] = useState([]);
-  const measure = useCallback(() => {
-    setYs(refs.current.slice(0, flow.nodes.length).map((el) => (el ? el.offsetTop + DOT_Y : null)));
-  }, [flow]);
-  React.useLayoutEffect(measure, [measure, open]);
-  useEffect(() => {
-    const ro = new ResizeObserver(measure);
-    if (box.current) ro.observe(box.current);
-    return () => ro.disconnect();
-  }, [measure]);
-  useEffect(() => {
-    if (!focusNode) return;
-    const t = focusOwner(focusNode);
-    if (t) setShown((s) => (s.has(t) ? s : new Set(s).add(t)));
-    setOpen(focusNode);
-    pending.current = focusNode;
-  }, [focusNode]);
-  useEffect(() => {  // scroll once the focused node is visible, not on every refresh
-    const i = flow.nodes.findIndex((n) => n.id === pending.current);
-    if (i < 0) return;
-    pending.current = null;
-    refs.current[i]?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [flow]);
-  const toggleFold = (t) => setShown((s) => { const x = new Set(s); x.has(t) ? x.delete(t) : x.add(t); return x; });
-  const lit = useMemo(() => {  // the open card and everything downstream of it: what it leads to
-    if (!open) return null;
-    const s = new Set([open]), stack = [open];
-    while (stack.length) { const id = stack.pop(); flow.edges.forEach((e) => { if (e.s === id && !s.has(e.t)) { s.add(e.t); stack.push(e.t); } }); }
-    return s;
-  }, [open, flow]);
-  const width = RAIL_X0 * 2 + (layout.count - 1) * LANE_W + 4;
-  const draft = d.state === "draft";
-  return (
-    <div className="fx-flow" ref={box} style={{ "--rail": `${width}px` }}>
-      <Rail flow={flow} layout={layout} ys={ys} lit={lit} width={width} />
-      {flow.nodes.map((n, i) => (
-        <div key={n.id} className={`fx-flow-row${lit && !lit.has(n.id) ? " dim" : ""}`}
-             style={{ paddingLeft: `${width + (layout.lane[n.id] > 0 && n.attach ? 0 : 0)}px` }}>
-          <FlowCard n={n} d={d} i={i} draft={draft} open={open === n.id} cardRef={(el) => { refs.current[i] = el; }}
-                    onToggle={() => { if (n.steps) toggleFold(n.node.id); setOpen(open === n.id ? null : n.id); }} onDone={onDone} />
-        </div>
-      ))}
-    </div>
-  );
-}
-
 // ---- lifecycle: dispatches as rows in an engineering table, one tab per stage ------------------------------
-const STAGES = [["ingest", "Ingest"], ["draft", "Draft"], ["run", "Run"], ["learn", "Learn"]];
+const STAGES = [["tickets", "Tickets"], ["draft", "Draft"], ["run", "Run"], ["learn", "Learn"]];
 const stageOf = (d) => d.state === "draft" ? "draft" : ["staged", "executing", "done"].includes(d.state) ? "run" : "learn";
 
 function DispatchRow({ d, title, needs, selected, onClick }) {
@@ -654,71 +371,6 @@ function StageTable({ dispatches, titles, needsOf, selected, onSelect }) {
                      selected={selected?.run_id === d.run_id} onClick={() => onSelect(d.run_id)} />
       ))}
     </div>
-  );
-}
-
-// ---- tickets (not in a dispatch): a list -----------------------------------------------------------------------
-function TicketRow({ t, why, pick }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className={`fx-trow${pick?.checked ? " picked" : ""}`} onClick={() => setOpen(!open)}>
-      {pick ? <input type="checkbox" className="fx-pick" checked={pick.checked} disabled={pick.disabled} onClick={stop}
-                     onChange={pick.toggle} aria-label={`Select ${t.identifier}`} /> : null}
-      <div className="fx-grow">
-        <div className="fx-row"><Ext href={t.url}>{t.identifier}</Ext><span className="fx-hint">{t.domain}</span></div>
-        <div className="fx-ttitle">{t.title}</div>
-        {why ? <div className={`fx-hint${open ? "" : " clamp"}`}>{why}</div> : null}
-      </div>
-    </div>
-  );
-}
-
-function Tickets({ data, onDone }) {
-  const [picked, setPicked] = useState([]);
-  const max = data.candidates?.max_tickets || 0;
-  const stageable = (data.candidates?.candidates || []).map((c) => c.identifier);
-  const suggested = (data.candidates?.suggested || []).filter((i) => stageable.includes(i));
-  const sel = picked.filter((i) => stageable.includes(i));
-  const skipped = Object.fromEntries((data.candidates?.skipped || []).map((x) => [x.identifier, x.reason]));
-  const groups = { ready: [], answer: [], checking: [], not: [] };
-  data.tickets.forEach((t) => { const g = ticketGroup(t, skipped); if (groups[g.group]) groups[g.group].push({ t, why: g.why }); });
-  const a = useAction(() => { setPicked([]); onDone({}, null, "Drafted; a planner is writing the plan"); });
-  const draft = (ids) => a.run("/stage", { identifiers: ids });
-  const titles = Object.fromEntries(data.tickets.map((t) => [t.identifier, t.title]));
-  const TABS = [["ready", "Ready"], ["answer", "Needs answer"], ["checking", "Checking"], ["not", "Not for us"]];
-  return (
-    <Tabs defaultValue={groups.answer.length && !groups.ready.length ? "answer" : "ready"}>
-      {(tab, setTab) => (<>
-        <TabsList className="fx-tabs">
-          {TABS.map(([k, label]) => <TabsTrigger key={k} active={tab === k} value={k} onClick={() => setTab(k)}>{label} {groups[k].length}</TabsTrigger>)}
-        </TabsList>
-        {tab === "ready" && suggested.length ? (
-          <Card className="fx-card fx-suggest"><CardContent className="fx-stack-v">
-            <div className="fx-row between"><span className="fx-k">Next dispatch</span><span className="fx-hint">★ recommended</span></div>
-            <div>{suggested.map((i) => <div key={i} className="fx-ttitle"><span className="fx-id">{i}</span> {clip(titles[i], 70)}</div>)}</div>
-            <div className="fx-hint">The factory would group these next: same Domain, then same repo. A planner shapes them into one plan; you review it before anything runs.</div>
-            <div className="fx-row"><Button size="sm" disabled={a.busy} onClick={() => draft(suggested)}>{a.busy ? "Drafting…" : `★ Draft these ${suggested.length}`}</Button>
-              <span className="fx-hint">or tick your own below</span></div>
-            <ActErr err={a.err} />
-          </CardContent></Card>
-        ) : null}
-        <div className="fx-list">
-          {groups[tab].length ? groups[tab].map(({ t, why }) => (
-            <TicketRow key={t.identifier} t={t} why={why} pick={tab === "ready" && stageable.includes(t.identifier) ? {
-              checked: sel.includes(t.identifier), disabled: !sel.includes(t.identifier) && sel.length >= max,
-              toggle: () => setPicked(sel.includes(t.identifier) ? sel.filter((i) => i !== t.identifier) : [...sel, t.identifier]),
-            } : null} />
-          )) : <div className="fx-empty">{{ ready: "Nothing verified and free right now.", answer: "No questions from verification.", checking: "Nothing being verified.", not: "Nothing set aside." }[tab]}</div>}
-        </div>
-        {sel.length ? (
-          <div className="fx-draftbar">
-            <span><b>{sel.length}</b> picked</span><span className="fx-grow" />
-            <Button size="sm" ghost onClick={() => setPicked([])}>Clear</Button>
-            <Button size="sm" disabled={a.busy} onClick={() => draft(sel)}>{a.busy ? "Drafting…" : "Draft dispatch"}</Button>
-          </div>
-        ) : null}
-      </>)}
-    </Tabs>
   );
 }
 
@@ -770,8 +422,8 @@ function FactoryPage() {
   const [loadedAt, setLoadedAt] = useState(null);
   const [live, setLive] = useState(false);
   const [sel, setSel] = useState(null);
-  const [tab, setTab] = useState(null);  // lifecycle stage; null = pick from what's going on
-  const [focus, setFocus] = useState(null);
+  // ?ticket=<IDENT> opens the Tickets tab with that ticket's sheet (tickets.jsx reads the id)
+  const [tab, setTab] = useState(() => new URLSearchParams(location.search).get("ticket") ? "tickets" : null);  // null = pick from what's going on
   const [toast, setToast] = useState(null);
   const [showTp, setShowTp] = useState(false);
   // ?view=review&run=<run_id> opens that dispatch's plan (the configurator) in place of the page, e.g. from a Hermex push
@@ -820,8 +472,7 @@ function FactoryPage() {
       || (p.kind === "review") - (q.kind === "review") || p.id - q.id;
   });
   const byRun = Object.fromEntries(data.dispatches.map((d) => [d.run_id, d]));
-  const skipped = Object.fromEntries((data.candidates?.skipped || []).map((x) => [x.identifier, x.reason]));
-  const answers = data.tickets.filter((t) => ticketGroup(t, skipped).group === "answer").length;
+  const answers = data.ticket_counts?.answer || 0;
   const needs = decisions.length;
   const needsOf = (runId) => open.filter((x) => x.run_id === runId && x.tier !== "auto").length;
   // A draft's plan questions and review are one deck card that opens the configurator; light ones (★ starts or
@@ -838,15 +489,15 @@ function FactoryPage() {
               question: `Review ${(d.tickets || []).map((c) => c.identifier).join(", ")}${n ? ` · ${plural(n, "question")}` : ""}` }];
   });
   const tix = Object.fromEntries(data.tickets.map((t) => [t.identifier, t]));
-  const rows = { ingest: [], draft: [], run: [], learn: [] };
+  const rows = { tickets: [], draft: [], run: [], learn: [] };
   data.dispatches.forEach((d) => rows[stageOf(d)].push(d));
-  const inIngest = data.tickets.filter((t) => !t.dispatch).length;
-  const count = (stage) => stage === "ingest" ? inIngest : rows[stage].length;
+  const ready = data.ticket_counts?.ready || 0;
+  const count = (stage) => stage === "tickets" ? ready : rows[stage].length;
   // Default stage: what needs you, else where the dispatches are. A dispatch belongs to one stage for its whole
   // life there, so a row only ever moves forward.
   const active = tab && STAGES.some(([id]) => id === tab) ? tab
     : (decisions[0] && byRun[decisions[0].run_id] ? stageOf(byRun[decisions[0].run_id]) : null)
-      || (rows.draft.length ? "draft" : rows.run.length ? "run" : "ingest");
+      || (rows.draft.length ? "draft" : rows.run.length ? "run" : "tickets");
   const list = rows[active];
   const current = (byRun[sel] && list.some((d) => d.run_id === sel) ? byRun[sel] : list[0]) || null;
   const context = (x) => {
@@ -874,28 +525,29 @@ function FactoryPage() {
     if (!run) return;
     setTab(stageOf(run));
     setSel(x.run_id);
-    setFocus(x.kind === "review" ? "gate" : `d:${x.id}`);
   };
-  const pick = (runId) => { setSel(runId); setFocus(null); };
-  const switchTab = (stage) => { setTab(stage); setSel(null); setFocus(null); };
+  const switchTab = (stage) => { setTab(stage); setSel(null); };
   const EMPTY = {
-    draft: "No draft right now. The factory proposes one when verified tickets accumulate, or draft your own in Ingest.",
+    draft: "No draft right now. The factory proposes one when verified tickets accumulate, or draft your own in Tickets.",
     run: "Nothing staged or executing right now.",
     learn: "Nothing learned yet. Dispatches land here after they run and write back to Linear.",
   };
 
+  const why = { asks: data.asks || {}, reviews: reviewOf };  // why.jsx threads, in the plan and on every decision
   if (review) {
     return (
+      <WhyContext.Provider value={why}>
       <div className="fx" ref={top}>
         <Toast toast={toast} />
         {byRun[review] ? <Plan key={review} d={byRun[review]} tickets={tix} onDone={done} onClose={() => openReview(null)} /> : (
           <div className="fx-row between"><span className="fx-empty">Dispatch {review} is not live any more.</span>
             <button className="fx-x" onClick={() => openReview(null)} aria-label="Close">✕</button></div>)}
       </div>
+      </WhyContext.Provider>
     );
   }
   return (
-    <WhyContext.Provider value={{ asks: data.asks || {}, reviews: reviewOf }}>
+    <WhyContext.Provider value={why}>
     <div className="fx" ref={top}>
       <Toast toast={toast} />
       <header className="fx-head">
@@ -921,30 +573,20 @@ function FactoryPage() {
         ))}
       </div>
 
-      {active === "ingest" ? (
+      {active === "tickets" ? (
         <section className="fx-sec">
-          <h2>Tickets <span className="fx-hint">verified, not in a dispatch</span></h2>
-          <Tickets data={data} onDone={done} />
+          <TicketsTab data={data} onDone={done} />
         </section>
       ) : (
         <section className="fx-sec">
           {list.length ? (<>
-            <StageTable dispatches={list} titles={titles} needsOf={needsOf} selected={current} onSelect={pick} />
-            {!current ? null : active === "draft" ? (<>
-              <Button onClick={() => openReview(current.run_id)}>Open the plan ›</Button>
-              <Flow key={current.run_id} d={current} titles={titles} onDone={done} focusNode={focus} />
-            </>) : <Plan key={current.run_id} d={current} tickets={tix} onDone={done} />}
+            <StageTable dispatches={list} titles={titles} needsOf={needsOf} selected={current} onSelect={setSel} />
+            {current ? <Plan key={current.run_id} d={current} tickets={tix} onDone={done} /> : null}
           </>) : <div className="fx-empty">{EMPTY[active]}</div>}
         </section>
       )}
 
       {active === "learn" ? (<>
-        {done4u.length ? (
-          <details className="fx-sec fx-fold">
-            <summary>Done for you <span className="fx-count">{done4u.length}</span> <span className="fx-hint">this week</span></summary>
-            <DoneForYou items={done4u} />
-          </details>
-        ) : null}
         <details className="fx-sec fx-fold" open>
           <summary>Learnings <span className="fx-count">{(data.learnings || []).length}</span></summary>
           <Learnings items={data.learnings || []} />
@@ -953,6 +595,12 @@ function FactoryPage() {
           <summary>Throughput</summary>
           {showTp ? <Throughput /> : null}
         </details>
+        {done4u.length ? (
+          <details className="fx-sec fx-fold">
+            <summary>Done for you <span className="fx-count">{done4u.length}</span> <span className="fx-hint">this week</span></summary>
+            <DoneForYou items={done4u} />
+          </details>
+        ) : null}
       </>) : null}
     </div>
     </WhyContext.Provider>
@@ -962,4 +610,4 @@ function FactoryPage() {
 window.__HERMES_PLUGINS__.register("factory", FactoryPage);
 
 // For plan.jsx / railway.jsx (bundled together; used at render time only, so the import cycle is harmless).
-export { ActErr, CARD, CARD_TONE, DecisionBody, Ext, LANE_W, RAIL_X0, Rail, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose };
+export { API, ActErr, CARD, CARD_TONE, DecisionBody, Ext, LANE_W, NoteBox, Notes, RAIL_X0, Rail, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose };
