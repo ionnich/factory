@@ -178,6 +178,27 @@ class ExecutorDelivery(unittest.TestCase):
         self.assertEqual((withdrawn["open"], withdrawn["chosen"]), (False, None))
         self.assertTrue(decide.one(self.c, asked)["open"])
 
+    def test_a_due_quiet_alert_is_withdrawn_not_answered_while_a_question_waits(self):
+        with mock.patch.object(decide, "_tier", return_value="auto"):  # its ★ is due, before watch() withdraws it
+            quiet = decide.executor(self.c, "run", "dispatch-stuck", "no card activity for 6.1h (limit 6h)", 6)
+        asked = self.question()
+        [swept] = decide.sweep(self.cfg, self.c)
+        withdrawn = decide.one(self.c, quiet)
+        self.assertEqual((swept["id"], withdrawn["open"], withdrawn["chosen"]), (quiet, False, None))
+        self.assertIn(f"decision #{asked}", withdrawn["void_reason"])
+        self.assertTrue(decide.one(self.c, asked)["open"])
+
+    def test_no_answer_acts_on_a_quiet_alert_while_an_answer_is_undelivered_a_crash_alert_still_answers(self):
+        quiet = decide.executor(self.c, "run", "dispatch-stuck", "no card activity for 6.1h (limit 6h)", 6)
+        gone = decide.executor(self.c, "run", "executor-gone", "pane gone", 6)
+        did = self.question()
+        with mock.patch.object(dispatch, "_send", side_effect=dispatch.StageError("pane busy")):
+            decide.choose(self.cfg, self.c, did, "wait", "user")
+        with self.assertRaisesRegex(dispatch.StageError, f"decision #{did}"):
+            decide.choose(self.cfg, self.c, quiet, "wait", "user:dashboard")
+        self.assertTrue(decide.one(self.c, quiet)["open"])
+        self.assertEqual(decide.choose(self.cfg, self.c, gone, "wait", "user:dashboard")["chosen"], "wait")
+
     def test_quiet_clock_resumes_at_delivery_not_at_the_choice_or_a_failed_send(self):
         self.c.execute("UPDATE dispatch SET executing_at=?", (ago(9),))
         did = self.question()

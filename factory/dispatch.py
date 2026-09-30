@@ -1037,14 +1037,15 @@ def _last_activity(conn, run_id: str) -> tuple[str | None, str | None]:
         "ORDER BY at DESC LIMIT 1", {"r": run_id}).fetchone() or (None, None))
 
 
-def _waiting_on(conn, run_id: str) -> tuple[int, dict | None] | None:
-    """The decision an executing dispatch's work waits on a person for, with its undelivered answer if any: an answer
-    that has not reached the executor (only an explicit resend sends it) before the oldest open executor question."""
-    if undelivered := decide.executor_deliveries(conn, run_id):
-        return undelivered[0]["decision_id"], undelivered[0]
-    ask = conn.execute(f"SELECT min(id) FROM decision WHERE run_id=? AND kind='ask' AND {decide.OPEN}",
-                       (run_id,)).fetchone()[0]
-    return (ask, None) if ask else None
+def _waiting_on(conn, run_id: str) -> tuple[int, str | None] | None:
+    """(decision, delivery state) an executing dispatch's work waits on a person for: the oldest answer that has not
+    reached the executor (only an explicit resend sends it), else the oldest open executor question (state None).
+    A plain read: no sender recovery and no transaction, so `decide.choose` can ask it mid-answer."""
+    row = conn.execute(
+        "SELECT q.id, x.state FROM decision q LEFT JOIN executor_delivery x ON x.decision_id=q.id WHERE q.run_id=? "
+        f"AND (x.state <> 'sent' OR (q.kind='ask' AND {decide.OPEN})) ORDER BY x.state IS NULL, q.id LIMIT 1",
+        (run_id,)).fetchone()
+    return tuple(row) if row else None
 
 
 def watch(cfg: Config, conn) -> list:
@@ -1099,7 +1100,7 @@ def runtime(conn, d) -> dict:
     if gone := alert.get("executor-gone"):
         did, blocker, step = gone["id"], gone["reason"], f"answer decision #{gone['id']}"
     elif waiting and waiting[1]:
-        did, state = waiting[0], waiting[1]["state"]
+        did, state = waiting
         blocker = f"your answer to #{did} has not reached the executor ({state})"
         step = "wait for the send in progress" if state == "sending" else f"check the executor, then resend #{did}"
     elif waiting:
