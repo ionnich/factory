@@ -430,6 +430,14 @@ function FactoryPage() {
   const [review, setReview] = useState(() => { const p = new URLSearchParams(location.search); return p.get("view") === "review" ? p.get("run") : null; });
   const top = useRef(null);
   useEffect(() => { top.current?.scrollIntoView(); }, [review]);
+  const strip = useRef(null);
+  useEffect(() => {  // the active stage tab fully in view (nearest edge), scrolling the strip only, never the page
+    const s = strip.current, t = s?.querySelector(".on");
+    if (!t) return;
+    const a = s.getBoundingClientRect(), b = t.getBoundingClientRect();
+    if (b.left < a.left) s.scrollLeft -= a.left - b.left + 4;
+    else if (b.right > a.right) s.scrollLeft += b.right - a.right + 4;
+  }, [tab, review, !data]);
   const [, tick] = useState(0);
   const inflight = useRef(false);
   const again = useRef(false);
@@ -491,8 +499,7 @@ function FactoryPage() {
   const tix = Object.fromEntries(data.tickets.map((t) => [t.identifier, t]));
   const rows = { tickets: [], draft: [], run: [], learn: [] };
   data.dispatches.forEach((d) => rows[stageOf(d)].push(d));
-  const ready = data.ticket_counts?.ready || 0;
-  const count = (stage) => stage === "tickets" ? ready : rows[stage].length;
+  const count = (stage) => stage === "tickets" ? (data.ticket_counts?.ready || 0) + answers : rows[stage].length;
   // Default stage: what needs you, else where the dispatches are. A dispatch belongs to one stage for its whole
   // life there, so a row only ever moves forward.
   const active = tab && STAGES.some(([id]) => id === tab) ? tab
@@ -564,7 +571,7 @@ function FactoryPage() {
       <Deck decisions={deck} context={context} onDone={(r, d) => done(r, d)} onOpen={openNode} />
       <Quick items={decisions.filter(light)} context={context} onDone={done} />
 
-      <div className="fx-stage-tabs" role="tablist" aria-label="Factory lifecycle">
+      <div className="fx-stage-tabs" role="tablist" aria-label="Factory lifecycle" ref={strip}>
         {STAGES.map(([id, label]) => (
           <button key={id} role="tab" aria-selected={active === id} className={`fx-stage-tab${active === id ? " on" : ""}`}
                   onClick={() => switchTab(id)}>

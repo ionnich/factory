@@ -1,7 +1,7 @@
-// Desktop map of a plan's choices, railway style: NOW → question → its options side by side → rejoin → next question
+// Desktop map of a plan's choices, railway style: NOW → question → its options on parallel tracks → rejoin → next question
 // … → RESULT; a question that only matters under one answer hangs under that branch. The ★ path is solid, the picked
 // path glows, the rest fade. One selection with the outline: click a branch = flip that switch. Drawn by the Rail
-// (index.jsx), one node per row; lanes are assigned here (branches side by side).
+// (index.jsx), one node per row; lanes are assigned here (each branch its own track).
 import { LANE_W, RAIL_X0, Rail, clip, sortOptions } from "./index.jsx";
 import { activeQs, starPick } from "./plan.jsx";
 

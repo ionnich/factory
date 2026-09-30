@@ -55,7 +55,7 @@ One-time, by hand:
   under that option's plan changes (changed steps get a yellow bar, added ones a `+`, dropped ones strike through
   and fold). **Lock in path** answers every open question with what is picked, then the review (approve / hold /
   reject) takes its place. The ticket button opens each ticket's verdict and evidence. On a desktop a railway map
-  sits beside it (now → question → options side by side → rejoin → … → result; ★ solid, picked path lit, the rest
+  sits beside it (now → question → each option on its own track, one row apart → rejoin → … → result; ★ solid, picked path lit, the rest
   faded), one selection with the switches. Open decisions whose ★ starts, stops or writes nothing are the
   **Quick** lane under the deck: tap one to see its options, or "Take all ★" (`POST /decisions/ok`, the chat's "ok").
   Below the deck the factory is one tab per lifecycle stage: **Tickets** (every ticket in scope or ever touched —
