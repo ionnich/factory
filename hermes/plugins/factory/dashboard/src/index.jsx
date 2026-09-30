@@ -10,6 +10,7 @@
 // components come from the dashboard SDK. The Tickets tab lives in tickets.jsx.
 import { Learnings } from "./learn.jsx";
 import { Plan, Quick } from "./plan.jsx";
+import { Jev } from "./jev.jsx";
 import { TicketsTab } from "./tickets.jsx";
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
@@ -91,6 +92,7 @@ function Option({ d, o, onChoose, busy }) {
   const [text, setText] = useState("");
   useEffect(() => { if (!armed) return; const t = setTimeout(() => setArmed(false), 4000); return () => clearTimeout(t); }, [armed]);
   const rec = o.id === d.recommended;
+  const focus = d.jev && d.jev.status === "ok" ? d.jev.focus : null;
   const go = () => {
     if (busy) return;
     if (o.note && !noting) return setNoting(true);
@@ -102,7 +104,7 @@ function Option({ d, o, onChoose, busy }) {
     <div className={`fx-opt${rec ? " rec" : ""}${armed ? " armed" : ""}`} onClick={stop}>
       <button className="fx-opt-btn" disabled={busy} onClick={go} aria-label={`${o.label}${rec ? " (recommended)" : ""}`}>
         <span className="fx-opt-label">{rec ? <span className="star">★</span> : null}{armed ? `Tap again: ${o.label}` : o.label}</span>
-        <span className="fx-opt-leads">→ {o.leads_to}</span>
+        <span className={`fx-opt-leads${focus === "result" ? " jev-focus" : ""}`}>→ {o.leads_to}</span>
       </button>
       {noting ? (
         <div className="fx-row fx-note-in">
@@ -141,6 +143,7 @@ function DecisionBody({ d, onChoose, busy, err, compact, hideHold }) {
   if (!d.open) return <><Answered d={d} /><Why d={d} /></>;
   return (
     <>
+      <Jev d={d} />
       <div className="fx-why"><span className="star">★</span> {d.options.find((o) => o.id === d.recommended)?.label}: {d.why}</div>
       <div className="fx-opts">{sortOptions(d).filter((o) => !hideHold || o.id !== "hold").map((o) => <Option key={o.id} d={d} o={o} busy={busy} onChoose={onChoose} />)}</div>
       <ActErr err={err} />

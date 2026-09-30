@@ -2,6 +2,8 @@
 // with how often agents cited each (`L<id>`), next to what a verdict and a plan cost (metrics.cost.per_unit), so
 // the two can be weighed. No savings figure: the factory can't observe tokens not spent. Proposed ones are
 // answered in the deck (decision kind 'learning'); here they are only listed.
+import { REL } from "./jev.jsx";
+
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect } = SDK.hooks;
@@ -11,12 +13,20 @@ const KINDS = [["house_rule", "House rules"], ["pitfall", "Pitfalls"], ["codemap
 const usd = (v) => (v == null ? "—" : `$${v.toFixed(2)}`);
 const times = (n) => (n === 1 ? "used once" : `used ${n}×`);
 
-const Line = ({ l }) => (
-  <div className="fx-note">
-    <span className="fx-id">L{l.id}</span> {l.body}
-    <div className="fx-hint">{l.scope.split("/").pop()} · {l.status === "proposed" ? "awaiting you" : times(l.uses)} · from {l.source}</div>
-  </div>
-);
+const Line = ({ l }) => {
+  const j = l.jev;
+  const rel = j?.relation;
+  return (
+    <div className="fx-note">
+      <span className="fx-id">L{l.id}</span> {l.body}
+      <div className="fx-hint">{l.scope.split("/").pop()} · {l.status === "proposed" ? "awaiting you · proposed" : `${times(l.uses)} · observed`} from {l.source}</div>
+      {rel && rel.learning_id != null ? (
+        <div className={`fx-hint${rel.kind === "conflicts" ? " fx-err" : ""}`}>{REL[rel.kind] || "related to"} <span className="fx-id">L{rel.learning_id}</span>{rel.body ? ` · ${rel.body}` : ""}</div>
+      ) : null}
+      {j && j.status === "unavailable" ? <div className="fx-hint">Jev unavailable: {j.error || "no comparison run"}</div> : null}
+    </div>
+  );
+};
 
 // items: [{id, kind: codemap|pitfall|house_rule, scope, body, anchors: [path], source, status: active|proposed,
 //          created_at, uses}]

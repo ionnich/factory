@@ -5,6 +5,7 @@
 // one), then the review decision shows. While draft, `+ note` on the root, each ticket and each step. Read-only in Run
 // (the chosen path, steps ✓ from card comments) and Learn (predicted next to landed; untaken paths flip as ghosts).
 import { API, ActErr, CARD, CARD_TONE, DecisionBody, Ext, NoteBox, Notes, Option, Silence, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose } from "./index.jsx";
+import { Jev, REL, jevFocus } from "./jev.jsx";
 import { Railway } from "./railway.jsx";
 import { Why } from "./why.jsx";
 
@@ -95,13 +96,23 @@ function Switch({ q, pick, onPick, locked, diff }) {
   const opts = sortOptions(q), cur = pick[q.id];
   const seg = opts.length === 2 && opts.every((o) => o.label.length <= 18);
   const star = (o) => (o.id === q.recommended ? <span className="star">★</span> : null);
+  const focus = jevFocus(q);
   const detail = (o) => {
     if (!o) return null;
     const what = o.changes?.length
       ? o.changes.map((c) => (c.add ? `+ ${c.add.title}` : c.becomes ? `${c.step} → ${c.becomes}` : `drops ${c.step}`)).join(" · ")
       : o.leads_to;
-    const meta = [o.cost, o.risk].filter(Boolean).join(" · ");
-    return (<><span className="fx-opt-leads">{what}</span>{meta ? <span className="fx-sw-meta">{meta}</span> : null}</>);
+    const lit = (focus === "changes" && o.changes?.length) || (focus === "result" && !o.changes?.length);
+    return (<>
+      <span className={`fx-opt-leads${lit ? " jev-focus" : ""}`}>{what}</span>
+      {o.cost || o.risk ? (
+        <span className="fx-sw-meta">
+          {o.cost ? <span className={focus === "cost" ? "jev-focus" : undefined}>{o.cost}</span> : null}
+          {o.cost && o.risk ? " · " : null}
+          {o.risk ? <span className={focus === "risk" ? "jev-focus" : undefined}>{o.risk}</span> : null}
+        </span>
+      ) : null}
+    </>);
   };
   return (
     <div className={`fx-sw${diff ? " diff" : ""}${locked ? " locked" : ""}`} onClick={stop}>
@@ -110,6 +121,7 @@ function Switch({ q, pick, onPick, locked, diff }) {
       {q.now ? <div className="fx-hint">Today: {q.now}</div> : null}
       {q.evidence?.length ? <div className="fx-row">{q.evidence.map((e, i) => (
         <span key={i} className="fx-file" title={e.note || ""}>{e.path}{e.line ? `:${e.line}` : ""}</span>))}</div> : null}
+      <Jev d={q} />
       {seg ? (<>
         <div className="fx-seg" role="radiogroup" aria-label={q.question}>
           {opts.map((o) => <button key={o.id} role="radio" aria-checked={o.id === cur} className={o.id === cur ? "on" : ""}
@@ -269,6 +281,7 @@ export function Plan({ d: current, tickets = {}, onDone, onClose }) {
   };
   const cmp = vsStar(d.tree || [], qs, pick);
   const res = results(d, qs, pick);
+  const focusQs = Object.fromEntries(qs.map((q) => [q.id, jevFocus(q)]));
   const open = qs.filter((q) => q.open);
   const review = (d.decisions || []).find((x) => x.kind === "review" && x.open);
   const holdChoice = useChoose(review, onDone);
@@ -303,7 +316,7 @@ export function Plan({ d: current, tickets = {}, onDone, onClose }) {
           </div>
           <div className={mode === "learn" ? "fx-res-cols" : undefined}>
             {res.length ? <ul className="fx-res-lines">{res.map((r, i) => (
-              <li key={i} className={hold && r.q && cmp.qs.has(r.q) ? "diff" : undefined}>{r.text}{r.q ? <span className="fx-id">#{r.q}</span> : null}</li>))}</ul>
+              <li key={i} className={[hold && r.q && cmp.qs.has(r.q) && "diff", r.q && focusQs[r.q] === "result" && "jev-focus"].filter(Boolean).join(" ") || undefined}>{r.text}{r.q ? <span className="fx-id">#{r.q}</span> : null}</li>))}</ul>
               : <div className="fx-hint">{d.review === "planning" ? "The planner is writing the plan." : "No predicted result in this plan."}</div>}
             {mode === "learn" ? <Landed d={d} /> : null}
           </div>
@@ -339,10 +352,14 @@ function QuickRow({ d, ctx, onDone }) {
   const [open, setOpen] = useState(false);
   const c = useChoose(d, onDone);
   const rec = d.options.find((o) => o.id === d.recommended);
+  const rel = d.kind === "learning" ? d.jev?.relation : null;
   return (
     <li className="fx-quick-row" onClick={() => setOpen(!open)}>
       <div><span className="star">★</span><b>{rec?.label}</b> · {d.question}</div>
       {ctx ? <div className="fx-hint">{ctx}</div> : null}
+      {rel && rel.learning_id != null ? (
+        <div className={`fx-hint${rel.kind === "conflicts" ? " fx-err" : ""}`}>{REL[rel.kind] || "related to"} <span className="fx-id">L{rel.learning_id}</span>{rel.body ? ` · ${rel.body}` : ""}</div>
+      ) : null}
       {open ? <DecisionBody d={d} busy={c.busy} err={c.err} compact onChoose={(o, n) => c.choose(o, n).catch(() => {})} /> : null}
     </li>
   );
@@ -352,6 +369,19 @@ export function Quick({ items, context, onDone }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   if (!items.length) return null;
+  const groupOf = (d) => (d.kind === "learning" && d.jev?.group ? d.jev.group : null);
+  const sets = [];  // [group, [decisions…]]; related learnings share jev.group, each still answers on its own
+  const seen = new Map();
+  items.forEach((d) => {
+    const g = groupOf(d);
+    if (!g) return;
+    if (seen.has(g)) sets[seen.get(g)][1].push(d);
+    else { seen.set(g, sets.length); sets.push([g, [d]]); }
+  });
+  const grouped = sets.filter(([, ds]) => ds.length > 1);
+  const inSet = new Set(grouped.flatMap(([, ds]) => ds.map((d) => d.id)));
+  const row = (d) => <QuickRow key={d.id} d={d} ctx={context(d)} onDone={onDone} />;
+  const conflicts = (ds) => ds.map((d) => d.jev?.relation).filter((r) => r?.kind === "conflicts" && r.learning_id != null);
   const all = () => {
     setBusy(true); setErr(null);
     post("/decisions/ok", { ids: items.map((x) => x.id) }).then((r) => {
@@ -365,7 +395,19 @@ export function Quick({ items, context, onDone }) {
     <section className="fx-quick">
       <div className="fx-row between"><span className="fx-k">Quick · {items.length}</span>
         <Button size="sm" disabled={busy} onClick={all}>{busy ? "Taking ★…" : "Take all ★"}</Button></div>
-      <ul>{items.map((d) => <QuickRow key={d.id} d={d} ctx={context(d)} onDone={onDone} />)}</ul>
+      <ul>{items.filter((d) => !inSet.has(d.id)).map(row)}</ul>
+      {grouped.map(([g, ds]) => {
+        const cs = conflicts(ds);
+        return (
+          <details key={g} className="fx-fold fx-rel" open>
+            <summary>
+              Related learnings <span className="fx-count">{ds.length}</span>
+              {cs.length ? <span className="fx-rel-conflict">{cs.map((r) => `conflicts with L${r.learning_id}`).join(" · ")}</span> : null}
+            </summary>
+            <ul>{ds.map(row)}</ul>
+          </details>
+        );
+      })}
       <ActErr err={err} />
     </section>
   );

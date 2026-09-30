@@ -289,3 +289,24 @@
 .fx-rw-o { font: inherit; background: none; border: 1px solid var(--color-border); border-radius: 999px; padding: .1rem .6rem; color: inherit; cursor: pointer; }
 .fx-rw-o[aria-pressed="true"] { border-color: var(--b); color: var(--b); font-weight: 650; }
 .fx-rw-o:disabled { cursor: default; }
+
+/* Jev guidance (jev.jsx): compact, advisory; focus highlights consequence text, never a preselection */
+.fx-jev { display: grid; gap: .15rem; margin: 0 0 .45rem; padding: .45rem .6rem; border-radius: 10px;
+          border: 1px solid var(--color-border); background: color-mix(in srgb, var(--b) 6%, transparent); }
+.fx-jev-badge { justify-self: start; font-size: .68rem; font-weight: 750; text-transform: uppercase;
+                letter-spacing: .06em; padding: .05rem .5rem; border-radius: 999px; border: 1px solid; }
+.fx-jev-badge.t-amber { color: var(--a); border-color: var(--a); }
+.fx-jev-badge.t-blue { color: var(--b); border-color: var(--b); }
+.fx-jev-badge.t-gray { color: var(--n); border-color: var(--n); }
+.fx-jev-line { font-size: .82rem; overflow-wrap: anywhere; }
+.fx-jev-line b { font-weight: 650; }
+.fx-jev-off { background: none; border-style: dashed; }
+.fx-jev-det { font-size: .8rem; }
+.fx-jev-det > summary { cursor: pointer; color: var(--color-muted-foreground); font-size: .75rem; }
+.fx-jev-meta { display: grid; gap: .1rem; margin-top: .25rem; }
+.jev-focus { background: color-mix(in srgb, var(--a) 24%, transparent); border-radius: 4px; padding: 0 .2rem; }
+
+/* related learnings in the Quick lane: one native collapsible section per jev.group, each answer still its own */
+.fx-rel { margin: .6rem 0 0; padding: .45rem .6rem; border: 1px solid var(--color-border); border-radius: 12px; }
+.fx-rel > summary { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-bottom: .3rem; }
+.fx-rel-conflict { color: var(--r); font-size: .78rem; font-weight: 650; }
