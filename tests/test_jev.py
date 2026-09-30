@@ -457,6 +457,36 @@ class Guidance(unittest.TestCase):
         self.assertNotIn("relation", shown)
         self.assertNotIn("group", shown)
 
+    def test_a_stale_group_root_drops_the_group_but_keeps_a_current_relation(self):
+        lids = []
+        for body in ("root fact", "target fact", "proposed fact"):
+            self.c.execute("INSERT INTO learning(kind,scope,body,anchors_json,source,status,created_at) "
+                           "VALUES ('pitfall','r',?,'[]',?,'proposed',?)", (body, f"decision:{body}", SNAP))
+            lids.append(self.c.execute("SELECT max(id) FROM learning").fetchone()[0])
+        root, target, proposal = lids
+        ld = decide.open_(self.c, "learning", "keep it?", [decide.option("keep", "Keep", "x"),
+                                                           decide.option("reject", "Drop", "y")],
+                          "keep", "why", "factory:learn", ref=str(proposal))
+        relation = {"kind": "supports", "learning_id": target, "body": "target fact"}
+        self.assertTrue(jev.store(self.c, ld, {"status": "ok", "relation": relation, "group": f"learning:{root}"}))
+        decide.choose(self.cfg, self.c, ld, "keep", "user")  # answered: this advice is never refreshed again
+        self.assertEqual(decide.one(self.c, ld)["jev"]["group"], f"learning:{root}")
+        for change in ("status='rejected'", "status='expired'", "scope='other'"):
+            with self.subTest(change=change):
+                self.c.execute("UPDATE learning SET status='proposed', scope='r' WHERE id=?", (root,))
+                self.c.execute(f"UPDATE learning SET {change} WHERE id=?", (root,))
+                shown = decide.one(self.c, ld)["jev"]
+                self.assertNotIn("group", shown)  # no group under a root since rejected, expired or relocated
+                self.assertEqual(shown["relation"], relation)  # while the direct relation still stands
+        self.assertEqual(jev.stored(self.c, ld)["group"], f"learning:{root}")  # filtered for display, still stored
+        self.c.execute("UPDATE learning SET status='proposed', scope='r' WHERE id=?", (root,))
+        # not learn's learning:<id> form (a leading zero, a suffix, an int), or an id past SQLite's: never a crash
+        for group in (f"learning:0{root}", f"learning:{root}x", root, "learning:" + "9" * 25):
+            with self.subTest(group=group):
+                shown = jev.served({"status": "ok", "relation": relation, "group": group}, self.c, [], {"r"})
+                self.assertNotIn("group", shown)
+                self.assertEqual(shown["relation"], relation)
+
     def test_the_newest_kept_rules_are_offered_when_there_are_more_than_fit(self):
         lids = [self.seed_rule(f"Rule number {i}") for i in range(jev.MAX_RULES + 1)]
         seen = {}

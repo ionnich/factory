@@ -24,12 +24,14 @@ the questions asked + the model) and reused across ticks while unchanged.
 Reads (decide rows, status, overview) never call the network; scoped to the
 decision's repos (a learning decision's: its learning's repo), they remove a
 stale approved-rule claim (with its policy category) once the rule expires,
-is rejected or leaves the scope, and a relation together with its group once
-its learning is gone, rewritten or relocated."""
+is rejected or leaves the scope, a relation together with its group once its
+learning is gone, rewritten or relocated, and just the group once its
+learning:<root> is no longer an active or proposed learning in the scope."""
 import hashlib
 import http.client
 import json
 import math
+import re
 import time
 import urllib.error
 import urllib.request
@@ -449,12 +451,25 @@ def _relation_current(conn, rel, repos) -> bool:
     return repos is None or r["scope"] in repos
 
 
+def _group_current(conn, group, repos) -> bool:
+    """The group root, in learn's own learning:<id> form, is still active/proposed and (scope known) lives in the
+    decision's repo scope. Cast in SQL: an overlong id finds no root instead of overflowing the binding."""
+    m = re.fullmatch(r"learning:([1-9][0-9]*)", group) if isinstance(group, str) else None
+    if m is None:
+        return False
+    r = conn.execute("SELECT scope FROM learning WHERE id = CAST(? AS INTEGER) AND status IN ('active', 'proposed')",
+                     (m[1],)).fetchone()
+    return r is not None and (repos is None or r["scope"] in repos)
+
+
 def served(payload, conn, options, repos=None) -> dict | None:
     """The top-level jev a read may show: absent when there is none, and with every stale claim removed (the key
     is gone, never nulled): a rule that expired, was rejected or left the scope, with the policy category it
     carried; a relation whose learning is gone, rewritten or relocated, together with its group — a group only
-    exists through its current relation. `repos` is the decision's scope (repos_for); None skips the scope checks,
-    so only a scoped call catches a relocated rule or relation target."""
+    exists through its current relation; and, that relation still current, a group whose root is malformed (not
+    learning:<id>), gone or relocated — answered learning advice never refreshes, so only the read drops it.
+    `repos` is the decision's scope (repos_for); None skips the scope checks, so only a scoped call catches a
+    relocated rule, relation target or group root."""
     if not isinstance(payload, dict) or payload.get("status") not in ("ok", "unavailable", "disabled"):
         return None
     j = dict(payload)
@@ -467,6 +482,8 @@ def served(payload, conn, options, repos=None) -> dict | None:
     if not _relation_current(conn, j.get("relation"), repos):
         j.pop("relation", None)
         j.pop("group", None)
+    elif "group" in j and not _group_current(conn, j["group"], repos):
+        del j["group"]  # the root went stale on its own: the still-current direct relation stays
     return j
 
 

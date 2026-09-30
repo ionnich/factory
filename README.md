@@ -163,8 +163,9 @@ One-time, by hand:
   rules a person kept (each with its scope), all quoted as data to judge, never instructions. Judgments are
   fingerprinted over the actual input plus the current eligible rules: an unchanged success is reused across
   propose ticks, changed inputs re-judge, failed calls retry later. Reads remove a rule claim whose rule expired,
-  was rejected or left the repo (with its policy category), and a relation together with its group once its
-  learning is gone, rewritten or relocated (a learning decision's scope is its learning's repo). The propose tick
+  was rejected or left the repo (with its policy category), a relation together with its group once its
+  learning is gone, rewritten or relocated, and only the group once its `learning:<root>` is no longer an active or
+  proposed learning of the repo (a learning decision's scope is its learning's repo). The propose tick
   refreshes before notify within 15 s: each call gets at most the time left, and the least recently attempted
   decisions go first, so repeated failures never starve the rest. `factory jev sync` refreshes the whole queue
   and the proposed learnings' relations on demand, nothing else. Reads (status/overview/`decide list`) never
