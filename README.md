@@ -151,25 +151,26 @@ One-time, by hand:
   / `unclear` with a confidence), matches an active house rule a person kept (rule id, body and the matching
   option label — never a preselection), and picks a focus (`result`/`changes`/`cost`/`risk`/`none`) from the
   existing consequence text. Each kept rule is its own question in the same call (which option it names, or none;
-  the question quotes the rule, since the model never sees a question id), so equivalent rules never split one
+  the question quotes the complete approved rule, including trailing exceptions), so equivalent rules never split one
   confidence: a rule is cited only when the provider's confidence in its own answer is >= 0.85 and it is still
   eligible after the call; sure rules naming different options cite none, agreeing ones cite the most confident
   (ties: the oldest). Guidance only: Jev never answers, voids or changes a decision; the UI never changes
-  the selected option from it, and a disabled or failed call leaves the decision as it was, with a visible
+  the selected option from it. Disabled guidance leaves normal review unchanged; a failed call shows an
   unavailable state and a sanitized error (no provider body). A plan question Jev is sure (>= 0.85) asks for pure
   missing investigation is refused at plan time with a StageError telling the planner to check the code and
-  decide it in the plan, before anything is written; authority/consent questions are never treated as mere
-  investigation. The state is the decision with its repos, options and evidence notes plus the 8 newest same-repo
+  decide it in the plan, before anything is written. `investigate` means facts the code or data settle, not
+  authority or consent; uncertain judgments preserve human review. The state contains the decision's repos,
+  options and evidence notes plus the 8 newest same-repo
   rules a person kept (each with its scope), all quoted as data to judge, never instructions. Judgments are
   fingerprinted over the actual input plus the current eligible rules: an unchanged success is reused across
   propose ticks, changed inputs re-judge, failed calls retry later. Reads remove a rule claim whose rule expired,
   was rejected or left the repo (with its policy category), a relation together with its group once its
   learning is gone, rewritten or relocated, and only the group once its `learning:<root>` is no longer an active or
   proposed learning of the repo (a learning decision's scope is its learning's repo). The propose tick
-  refreshes before notify within 15 s: each call gets at most the time left, and the least recently attempted
-  decisions go first, so repeated failures never starve the rest. `factory jev sync` refreshes the whole queue
-  and the proposed learnings' relations on demand, nothing else. Reads (status/overview/`decide list`) never
-  call the network. Endpoint
+  refreshes before notify with a 15 s soft budget (socket timeouts, not a hard wall-clock deadline). Calls use the
+  remaining budget, least recently attempted first, so repeated failures never starve the rest.
+  `factory jev sync` refreshes the whole queue and proposed learnings' relations on demand, nothing else.
+  Reads (status/overview/`decide list`) never call the network. Endpoint
   `https://api.typesafe.ai/v1/systemone`, model `jev-1.13.0` (pinned), key `TYPESAFE_API_KEY` in
   `~/.config/secrets/factory-jev.env` (listed in `secrets.env_files`; `[jev]` in factory.toml). Learnings never
   become rules by earned automation: `learning` decisions are excluded from the earned-auto tier and from sweep,
@@ -181,20 +182,24 @@ One-time, by hand:
   card's reason) and **house rules** (a plan option label you chose twice, or a non-★ answer with a note) are
   proposed as decisions and reach agents only once you keep them. An active learning expires when trunk changes or
   deletes an anchor. After harvesting commits, Jev compares each open proposal with at most 40 learnings of its
-  repo (same kind first, then newest; a proposed one only if older), quoted as data to judge: `duplicate` and
-  `supports` share a `learning:<root>` group, folded together as Related learnings in the Quick lane; `conflicts`
-  is never grouped and stays a visible warning. Grouping never merges answers: each proposal is still kept or
-  dropped as its own decision, and Jev never changes a learning's status. A tick gives this 15 s, least recently
-  attempted first, each call capped to the time left (`factory jev sync` runs it unbounded); a failure stays
-  visible and retries later; an unchanged success is reused until the input, a candidate's status, source or
-  scope, the question, the model or the 0.85 bar changes. The prune and planner gates hand agents `learnings`
+  repo (same kind first, then newest; a proposed one only if older). Each candidate gets its own four-way Choice
+  in one batched call, with its text treated as quoted data. Confidence belongs to that comparison, so several
+  agreeing candidates cannot dilute a clear conflict merely because its citation is ambiguous. Only comparisons
+  with confidence >= 0.85 count; conflicts take priority and never enter a related group. Otherwise the strongest
+  `duplicate` or `supports` comparison forms a `learning:<root>` group, folded as Related learnings in the Quick
+  lane. Each proposal still requires its own keep/drop choice; Jev never changes a learning's status.
+  Learning refresh has a separate 15 s soft budget, least recently attempted first; explicit `factory jev sync`
+  has no pass budget but keeps per-call timeouts. Failed calls remain visible and retry later. Unchanged successes
+  reuse their judgments until input, candidate metadata, questions, model or confidence threshold changes;
+  cached groups update from current target advice without another model call.
+  The prune and planner gates hand agents `learnings`
   (house rules and pitfalls for the repo, code map lines for the ticket's cited paths or named files; at most 12),
   dispatch.md gets **Known pitfalls**, and agents cite `L<id>` in verdict reasons, plans and card comments, which
   counts a use. The Learn tab lists them with their provenance (observed evidence, kept by you, or proposed and
   awaiting you, each with its source), relations and uses, next to the cost per verdict and per plan.
 - Backups: `factory-backup` (03:00) writes `~/.hermes/factory/backups/factory-YYYY-MM-DD.db` (newest 14), and every
   schema migration first writes `factory-pre-vN.db`. Same disk: protects against bad writes, not disk loss.
-- CLI: `factory status|overview|tickets|ticket-timeline|candidates|stage|draft|decide|ask|handoff|propose|execute|card|reconcile|archive|metrics|backup`.
+- CLI: `factory status|overview|tickets|ticket-timeline|candidates|stage|draft|decide|ask|handoff|propose|execute|card|reconcile|archive|metrics|backup|jev`.
   `stage` and approving refresh only the repos involved (parallel fetch); the cron keeps the rest fresh.
 
 ## Invariants (in code: `factory/schema.sql` triggers + CLI checks)
