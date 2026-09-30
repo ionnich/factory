@@ -4,7 +4,7 @@
 // outline and its `result` rewrites the header. "Lock in path" answers the open questions (POST /decisions/{id}, one by
 // one), then the review decision shows. While draft, `+ note` on the root, each ticket and each step. Read-only in Run
 // (the chosen path, steps ✓ from card comments) and Learn (predicted next to landed; untaken paths flip as ghosts).
-import { API, ActErr, CARD, CARD_TONE, DecisionBody, Ext, NoteBox, Notes, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose } from "./index.jsx";
+import { API, ActErr, CARD, CARD_TONE, DecisionBody, Ext, NoteBox, Notes, Option, Silence, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose } from "./index.jsx";
 import { Railway } from "./railway.jsx";
 import { Why } from "./why.jsx";
 
@@ -242,48 +242,65 @@ function TicketSheet({ d, tickets, onClose }) {
   );
 }
 
-function Review({ d, onDone }) {
-  const c = useChoose(d, onDone);
+function Review({ d, c }) {
   return (<>
     <div className="fx-q small">{d.question}</div>
-    <DecisionBody d={d} busy={c.busy} err={c.err} compact onChoose={(o, n) => c.choose(o, n).catch(() => {})} />
+    <DecisionBody d={d} busy={c.busy} err={c.err} compact hideHold onChoose={(o, n) => c.choose(o, n).catch(() => {})} />
   </>);
 }
 
 // ---- the whole thing: result header + outline (+ railway on desktop) + bottom bar in review ---------------------
-export function Plan({ d, tickets = {}, onDone, onClose }) {
+export function Plan({ d: current, tickets = {}, onDone, onClose }) {
+  const [snapshot, setSnapshot] = useState(null);
+  const d = snapshot || current;
   const mode = stageMode(d);
   const qs = useMemo(() => planQs(d), [d]);
-  const [flips, setFlips] = useState({});
+  const storageKey = `factory:plan:${d.run_id}`;
+  const [flips, setFlips] = useState(() => {
+    try { return JSON.parse(sessionStorage.getItem(storageKey) || "{}"); } catch { return {}; }
+  });
+  useEffect(() => {
+    try { sessionStorage.setItem(storageKey, JSON.stringify(flips)); } catch { /* Preview still works without browser storage. */ }
+  }, [storageKey, flips]);
   const [hold, setHold] = useState(false);
   const [sheet, setSheet] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const timer = useRef(null);
   const free = (q) => mode === "learn" || (mode === "draft" && q.open);  // Learn: ghost flips, nothing is sent
-  const pick = Object.fromEntries(qs.map((q) => [q.id, (free(q) && flips[q.id]) || q.chosen || q.recommended]));
+  const pick = Object.fromEntries(qs.map((q) => [q.id, (free(q) && q.options.some((o) => o.id === flips?.[q.id]) && flips[q.id]) || q.chosen || q.recommended]));
   const ghost = mode === "learn" && qs.some((q) => pick[q.id] !== (q.chosen || q.recommended));
-  const onPick = (qid, oid) => setFlips(flip(qs, flips, qid, oid));
+  const onPick = (qid, oid) => {
+    if (!busy && !holdChoice.busy) setFlips(flip(qs, flips, qid, oid));
+  };
   const cmp = vsStar(d.tree || [], qs, pick);
   const res = results(d, qs, pick);
   const open = qs.filter((q) => q.open);
   const review = (d.decisions || []).find((x) => x.kind === "review" && x.open);
+  const holdChoice = useChoose(review, onDone);
+  const editable = (q) => free(q) && !busy && !holdChoice.busy;
+  const holdOption = d.review !== "held" && review?.options.find((o) => o.id === "hold");
   const ids = (d.tickets || []).map((c) => c.identifier);
   const holdOn = () => { timer.current = setTimeout(() => setHold(true), 300); };
   const holdOff = () => { clearTimeout(timer.current); setHold(false); };
   const lockIn = async () => {
-    setBusy(true); setErr(null);
+    if (busy || holdChoice.busy) return;
+    setSnapshot(d); setBusy(true); setErr(null);
     try {
       for (const q of open) await post(`/decisions/${q.id}`, { option: pick[q.id] });
       onDone({}, null, "Path locked in");
-    } catch (e) { setErr(errText(e)); }  // the ones before it stand; the stream refreshes the outline
-    setBusy(false);
+    } catch (e) {
+      const message = `${errText(e)}. Previously saved answers remain; refresh to see what is still open.`;
+      setErr(message);
+      onDone({ after_error: message });
+    }
+    setSnapshot(null); setBusy(false);
   };
   const vs = [cmp.steps ? `${cmp.steps > 0 ? "+" : "−"}${plural(Math.abs(cmp.steps), "step")}` : "same steps", ...cmp.risks].join(" · ");
   const ticketBtn = <Button size="sm" ghost onClick={() => setSheet(true)}>{ids.length === 1 ? ids[0] : plural(ids.length, "ticket")}</Button>;
   return (
     <div className={`fx-cfg${qs.length ? " map" : ""}`}>
-      {qs.length ? <aside className="fx-cfg-map"><Railway d={d} qs={qs} pick={pick} onPick={onPick} free={free} /></aside> : null}
+      {qs.length ? <aside className="fx-cfg-map"><Railway d={d} qs={qs} pick={pick} onPick={onPick} free={editable} /></aside> : null}
       <div className="fx-cfg-main">
         <header className={`fx-res${mode === "draft" ? " sticky" : ""}`}>
           <div className="fx-row between">
@@ -300,14 +317,20 @@ export function Plan({ d, tickets = {}, onDone, onClose }) {
                                onPointerDown={holdOn} onPointerUp={holdOff} onPointerLeave={holdOff} onPointerCancel={holdOff}
                                onContextMenu={(e) => e.preventDefault()}>{breadcrumb(qs, pick)}</button> : null}
           {qs.length && mode !== "run" ? <div className="fx-hint">{cmp.same ? "★ path" : `vs ★: ${vs}`}</div> : null}
+          {mode === "draft" ? <div className="fx-stack-v">
+            {d.review === "held" ? <div className="fx-hint">Held: no automatic start. Your plan choices are not submitted by Hold.</div> : review ? <Silence d={review} /> : null}
+            {holdOption ? <Option key={review.id} d={review} o={holdOption} busy={busy || holdChoice.busy}
+                                  onChoose={(o, n) => holdChoice.choose(o, n).catch(() => {})} /> : null}
+            <ActErr err={holdChoice.err} />
+          </div> : null}
         </header>
-        <Outline d={d} qs={qs} pick={pick} free={free} onPick={onPick} cmp={hold ? cmp : null} tickets={tickets} onDone={onDone} />
+        <Outline d={d} qs={qs} pick={pick} free={editable} onPick={onPick} cmp={hold ? cmp : null} tickets={tickets} onDone={onDone} />
         {mode === "draft" ? (
           <div className="fx-cfg-bar">
             {open.length ? (
               <div className="fx-row">{ticketBtn}<span className="fx-grow" />
-                <Button size="sm" disabled={busy} onClick={lockIn}>{busy ? "Locking in…" : `Lock in path → (${open.length})`}</Button></div>
-            ) : review ? <Review d={review} onDone={onDone} /> : <div className="fx-row">{ticketBtn}<span className="fx-hint">Nothing left to decide.</span></div>}
+                <Button size="sm" disabled={busy || holdChoice.busy} onClick={lockIn}>{busy ? "Locking in…" : `Lock in path → (${open.length})`}</Button></div>
+            ) : review ? <Review d={review} c={holdChoice} /> : <div className="fx-row">{ticketBtn}<span className="fx-hint">Nothing left to decide.</span></div>}
             <ActErr err={err} />
           </div>
         ) : null}
