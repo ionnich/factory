@@ -155,10 +155,16 @@ One-time, by hand:
   unavailable state and a sanitized error (no provider body). A plan question Jev is sure (>= 0.85) asks for pure
   missing investigation is refused at plan time with a StageError telling the planner to check the code and
   decide it in the plan, before anything is written; authority/consent questions are never treated as mere
-  investigation. Judgments are fingerprinted over the actual input plus the current eligible rules: an unchanged
-  success is reused across propose ticks, changed inputs re-judge, failed calls retry on the next tick, and a
-  rule claim whose rule expired or was rejected (or a relation to a learning that is gone) is dropped on read. `factory jev sync` refreshes on demand; the
-  propose tick refreshes before notify. Reads (status/overview/`decide list`) never call the network. Endpoint
+  investigation. The state is the decision with its repos, options and evidence notes plus the 8 newest same-repo
+  rules a person kept (each with its scope), all quoted as data to judge, never instructions. Judgments are
+  fingerprinted over the actual input plus the current eligible rules: an unchanged success is reused across
+  propose ticks, changed inputs re-judge, failed calls retry later. Reads remove a rule claim whose rule expired,
+  was rejected or left the repo (with its policy category), and a relation together with its group once its
+  learning is gone, rewritten or relocated (a learning decision's scope is its learning's repo). The propose tick
+  refreshes before notify within 15 s: each call gets at most the time left, and the least recently attempted
+  decisions go first, so repeated failures never starve the rest. `factory jev sync` refreshes the whole queue
+  and the proposed learnings' relations on demand, nothing else. Reads (status/overview/`decide list`) never
+  call the network. Endpoint
   `https://api.typesafe.ai/v1/systemone`, model `jev-1.13.0` (pinned), key `TYPESAFE_API_KEY` in
   `~/.config/secrets/factory-jev.env` (listed in `secrets.env_files`; `[jev]` in factory.toml). Learnings never
   become rules by earned automation: `learning` decisions are excluded from the earned-auto tier and from sweep,
