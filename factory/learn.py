@@ -282,7 +282,9 @@ def _jev_refresh(cfg, conn) -> None:
 
 def rows(conn) -> list[dict]:
     """The Learn tab: active and proposed learnings, each with the guidance (`jev`) its decision carries via
-    core's jev.stored."""
+    core's jev.stored, filtered through jev.served so a relation to a rejected/expired learning never shows as a
+    relationship or group. The raw stored payload stays the fingerprint cache for _jev_refresh; only served
+    output is displayed."""
     out = []
     for r in conn.execute(
             "SELECT l.id, l.kind, l.scope, l.body, l.anchors_json anchors, l.source, l.status, l.created_at, l.uses, "
@@ -295,6 +297,8 @@ def rows(conn) -> list[dict]:
         if did is not None:
             advice = jev.stored(conn, did)
             if advice:
-                d["jev"] = advice
+                shown = jev.served(advice, conn, [])
+                if shown:
+                    d["jev"] = shown
         out.append(d)
     return out
