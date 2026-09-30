@@ -37,16 +37,18 @@ One-time, by hand:
 
 ## Use
 
-- Dashboard: Hermes dashboard, **Factory** tab, phone first, a stack of cards, live (the tab refreshes the moment
-  `factory.db` changes, over `/stream`; no polling). **Needs you** is a deck of
-  decisions: the question, the options with what each leads to, the recommended one marked ★ and why. Tap an
-  option (a second tap confirms executor answers and ones that start or stop work or write Linear; some ask for a
-  reason), swipe right to take a lightweight ★, left for later. Canceled gestures do nothing. Once confirmed,
-  the card flies off while the server responds, and comes back with the reason if refused. Long explanations and
-  completed why threads start folded; questions, options, deadlines, pending work and errors stay visible.
-  `why?` under any decision asks the planner inline (see Why? below). A draft's planner questions and its review are one card ("Review FIN-4146 · 2
-  questions") that opens the **plan** full-page (the configurator; also `/factory?view=review&run=<run_id>`, so a
-  push can link straight in). On a phone it is one column: a sticky **result** (the dispatch's predicted result
+- Dashboard: Hermes dashboard, **Factory** tab, phone first, eight lifecycle workspaces. Only the selected
+  workspace is mounted; its decisions, plans and actions stay inside it. The shared header has health,
+  refresh and a compact **Needs you** menu. Each menu item opens its owning stage and focuses the actual
+  decision or plan question; an executor question belongs in Run, never Tickets or Review.
+  `factory.db` changes refresh data over `/stream` without polling, changing tabs or opening panels.
+  Stage-local decision cards show options, consequences and ★. Executor answers and options that start or stop
+  work or write Linear require a second tap; some require a reason. Lightweight ★ accepts a right swipe;
+  left postpones. Canceled gestures do nothing. Refused choices return with their error.
+  Long explanations and completed why threads start folded; questions, deadlines, pending work and errors stay visible.
+  `why?` asks the planner inline. **Review** contains the plan configurator (`/factory?stage=review&run=<run_id>`;
+  legacy `?view=review&run=<run_id>` still works). On a phone it is one column: a sticky **result**
+  (the dispatch's predicted result
   plus one line per question from the picked option, tagged `#id`; the picked path as a breadcrumb — press and
   hold it to mark every difference from ★ — and "vs ★: +1 step · risk"), then the outline: ticket → its result →
   numbered steps ("after 1" chips, files), with operator notes on each node and, while the dispatch is a draft,
@@ -59,30 +61,38 @@ One-time, by hand:
   with the selected snapshot; switches, railway choices and Hold are disabled during submission. If a later
   answer fails, earlier saved answers remain and the page refreshes with an explicit partial-completion warning.
   Approval/rejection then appears below; Hold remains in the header. Connection failures and Refresh stay visible
-  inside the configurator. The ticket button opens each ticket's verdict and evidence. On a desktop a railway map
+  in the shared header. The ticket button opens each ticket's verdict and evidence. On a desktop a railway map
   sits beside it (now → question → each option on its own track, one row apart → rejoin → … → result; ★ solid, picked path lit, the rest
   faded), one selection with the switches. Open decisions whose ★ starts, stops or writes nothing are the
-  **Quick** lane under the deck: tap one to see its options, or "Take all ★" (`POST /decisions/ok`, the chat's "ok").
-  Lifecycle tabs sit below the health header, above the decision deck. Selecting a tab brings its content into view:
-  **Tickets** (every ticket in scope or ever touched —
-  `factory tickets --all`, fetched only while the tab is open; the overview carries just the per-filter counts —
-  newest activity first, filtered ready / needs answer / stale / in dispatch / done / not ours, plus a search; ready
-  ones are ticked into a draft, with the factory's recommended next group one tap away; a row opens a sheet with the
-  Linear header, the current verdict with its evidence, and the ticket's timeline: Linear updates, every verdict
-  (superseded ones too), dispatch transitions, notes, decisions asked and answered, card events, write-backs and our
-  own Linear writes, oldest first — `factory ticket-timeline <ID>`; `/factory?ticket=<ID>` opens that sheet),
-  **Draft** (rows are drafts; the selected one shows its plan, the configurator above), **Run** (staged, executing,
-  done: recorded last activity, blocker and next step for staged/executing dispatches, then the plan read-only on
-  the chosen path, card status per ticket, a step ✓ once a card comment says so, e.g. "FIN-1/2 done"),
-  and **Learn** (reconciled and the last archived ones: the plan with "predicted" next to "landed"
-  — done summary, PR and write-backs per ticket — where untaken answers still flip as ghosts; then **Learnings**,
-  **Throughput** with cost, and **Done for you** — what the factory answered itself this week). Dispatches are rows
-  in an engineering table (stage, dispatch, tickets, progress, what waits on you, age; the columns fold on a phone).
-  A row belongs to one stage for its whole life there and only moves forward. UI source is React JSX in
-  `hermes/plugins/factory/dashboard/src/` (`index.jsx` page and deck, `plan.jsx` the plan outline and configurator,
-  `railway.jsx` its desktop map, `tickets.jsx` the Tickets tab, `why.jsx` the why threads, `learn.jsx` the
-  learnings; React and components come from the dashboard SDK);
-  `./install.sh` bundles it with `bun build` into the gitignored `dist/` and copies the plugin.
+  stage-local **Quick** lane: tap one to see its options, or "Take all ★" (`POST /decisions/ok`, the chat's "ok").
+  Lifecycle tabs have stable `?stage=<stage>` URLs; `run`, `decision` and `ticket` target a specific item.
+  Browser Back/Forward restores location; each workspace retains its ticket filters, selection and scroll.
+  A selected dispatch that moves stage on refresh is replaced by a link to its new stage, not another dispatch.
+  Arrow keys move tab focus; Enter/Space selects. Learn and Costs sit apart from the eight lifecycle stages:
+  - **Tickets:** complete ticket ledger (`factory tickets --all`), ownership, scope and ingest status; no draft builder.
+    Search/filter and a row's sheet expose verdict evidence and the full audit timeline (`factory ticket-timeline <ID>`).
+    Legacy `/factory?ticket=<ID>` still opens the sheet. Ledger rows can link to their current lifecycle stage.
+  - **Verify:** only tickets whose backend phase is Verify, with verification-job status and Linear-answer filter.
+  - **Draft:** verified eligible tickets, recommended cohort/checkbox builder, unoffered drafts and blocked-ticket retry decisions.
+    A pending or failed draft submission survives leaving the workspace; a late success never steals navigation.
+  - **Plan:** drafts actually offered to the planner, replans and refused plan publications. `planning_requested_at`
+    records an offer, not proof an agent is running; `planning_error` records publication refusal, even without an offer.
+    Old unplanned drafts remain Draft until an actual offer. Planner-job health is labeled separately.
+  - **Review:** published draft plans, questions, configurator and approval/Hold/rejection. Held plans remain here;
+    replan returns to Plan, retaining notes and answered questions.
+  - **Run:** staged/executing dispatches, executor questions and undelivered answers, last activity/blocker/next step,
+    and the read-only execution plan.
+  - **Reconcile:** done/reconciled dispatches and unresolved pending/sent/failed/held Linear writes, including
+    sweep/followup writes without a dispatch. Viewing writes never applies them.
+  - **Archive:** all archived dispatches, including rejected drafts, with audit history and predicted versus landed results.
+    Lazy `GET /archive` uses `factory status --archived`, not the overview's last-five history.
+  - **Learn:** proposed learning approvals, learned evidence and Done for you. **Costs:** throughput and cost ledger.
+  Counts name their units: Tickets and Verify count tickets; Draft through Archive count dispatches.
+  Draft separately labels ready tickets. Backend records determine phases, not whether a UI panel or plan is open.
+  Dispatch rows fold into cards on a phone. UI source is React JSX in `hermes/plugins/factory/dashboard/src/`:
+  `index.jsx` owns workspaces, `plan.jsx` the configurator, `railway.jsx` its desktop map, `tickets.jsx` ticket views,
+  `why.jsx` explanation threads and `learn.jsx` learnings. React/components come from the dashboard SDK;
+  `./install.sh` bundles with `bun build` into gitignored `dist/` and copies the plugin.
 - Chat: `hermes -p factory`, also on the iPhone through Hermex (Bot Mode, factory profile; the web dashboard has
   no Bot Mode yet, so digests and pushes are read and answered there or in the Factory tab). It shows drafts,
   takes notes ("note FIN-3788/2: …") and answers decisions (weighty ones through the Hermes approval prompt);
@@ -95,7 +105,7 @@ One-time, by hand:
   pane), a blocked ticket (write back / retry with guidance), a missing or quiet executor (restart / wait / stop),
   a held Linear write (apply anyway / skip / do it yourself), a proposed learning (keep / drop).
   Executor answers and their exact outbound messages commit together. A failed or interrupted send stays visible
-  under Needs you after refresh, with **Resend recorded answer** (`factory decide resend <id>`, dashboard
+  in Run after refresh, linked from Needs you, with **Resend recorded answer** (`factory decide resend <id>`, dashboard
   `POST /decisions/{id}/resend`, or chat action `resend` with `decision_id`). Resending cannot change the answer;
   it targets the run's current executor pane. Sent answers, terminal runs and concurrent sends are refused.
   Interrupted sends are never replayed automatically: once their sender exits, the UI warns that delivery is
