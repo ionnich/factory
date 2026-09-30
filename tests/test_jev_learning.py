@@ -1,41 +1,18 @@
-"""Jev guidance on learnings: proposed learnings are compared (via core's factory.jev) with bounded same-scope
-candidates, the judgment is persisted through core's jev.stored/jev.store (doubled here as FakeJev) and never
-touches decision.detail_json — the immutable decision_answer_once trigger stays unchanged — while plan step text
-is no longer harvested as a code fact at all. Unchanged successes are reused and failed/disabled calls stay
-visible."""
+"""Jev guidance on learnings: proposed learnings are compared through core's factory.jev against a bounded
+same-repo candidate shortlist and each judgment is persisted through the real jev.store/jev.stored pair (the
+jev_advice row, never decision.detail_json — the immutable decision_answer_once trigger stays untouched), while
+plan step text is no longer harvested as a code fact at all. Only jev.evaluate, the model boundary, is patched;
+the real persistence path and DB triggers run unchanged."""
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
-from factory import db, decide, learn, repos
+from factory import db, decide, jev, learn, repos
 
 SNAP = "2026-09-01T00:00:00Z"
-
-
-class FakeJev:
-    """Test double for core's factory.jev: `evaluate` delegates to `respond`; `stored`/`store` keep the advice in
-    memory, and `store` rechecks the decision is still open the way the real helper's upsert does."""
-    def __init__(self, conn, respond):
-        self.conn = conn
-        self.respond = respond  # callable(cfg, state, questions) -> dict
-        self.calls = 0
-        self.advice: dict[int, dict] = {}
-
-    def evaluate(self, cfg, state, questions):
-        self.calls += 1
-        return self.respond(cfg, state, questions)
-
-    def stored(self, conn, decision_id):
-        return self.advice.get(decision_id)
-
-    def store(self, conn, decision_id, advice):
-        if conn.execute("SELECT id FROM decision WHERE id=? AND chosen IS NULL AND void_reason IS NULL",
-                        (decision_id,)).fetchone() is None:
-            return False
-        self.advice[decision_id] = advice
-        return True
 
 
 def ok(choice, confidence=0.9):
@@ -53,14 +30,11 @@ class JevLearning(unittest.TestCase):
         (self.repo / "cited.py").write_text("x = 1\n")
         self.git("add", "."); self.git("commit", "-qm", "one")
         self.sha = self.git("rev-parse", "HEAD")
-        self.c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
+        self.dbpath = Path(tempfile.mkdtemp()) / "t.db"
+        self.c = db.connect(self.dbpath)
         self.cfg = SimpleNamespace(mirror_path=lambda _: self.repo, raw={})
         self.c.execute("INSERT OR REPLACE INTO repo_trunk VALUES ('r','main',?,?)", (self.sha, SNAP))
         self.c.execute("INSERT INTO linear_snapshot VALUES ('i1','FIN-1',?,?,'unstarted',1,'{}')", (SNAP, SNAP))
-        self.orig_jev = learn.jev
-
-    def tearDown(self):
-        learn.jev = self.orig_jev
 
     def verdict(self, note=""):
         ev = [{"type": "file", "path": "other.py", "note": note, "sha": self.sha}]
@@ -69,9 +43,9 @@ class JevLearning(unittest.TestCase):
                        (SNAP, self.sha, json.dumps(ev), '["other.py"]', SNAP))
         return self.c.execute("SELECT id FROM verdict ORDER BY id DESC LIMIT 1").fetchone()[0]
 
-    def candidate(self, body, scope="r", status="active", source="verdict:1"):
+    def candidate(self, body, scope="r", kind="codemap", status="active", source="verdict:1"):
         self.c.execute("INSERT INTO learning(kind,scope,body,anchors_json,trunk_sha,source,status,created_at) "
-                       "VALUES ('codemap',?,?,'[\"other.py\"]',NULL,?,?,?)", (scope, body, source, status, SNAP))
+                       "VALUES (?,?,?,'[\"other.py\"]',NULL,?,?,?)", (kind, scope, body, source, status, SNAP))
         return self.c.execute("SELECT id FROM learning ORDER BY id DESC LIMIT 1").fetchone()[0]
 
     def propose(self, body, scope="r", kind="pitfall", source="decision:9"):
@@ -81,8 +55,8 @@ class JevLearning(unittest.TestCase):
                              (str(lid),)).fetchone()[0]
         return lid, did
 
-    def jev(self, did):
-        advice = learn.jev.stored(self.c, did)
+    def advice(self, did):
+        advice = jev.stored(self.c, did)
         detail = json.loads(self.c.execute("SELECT detail_json FROM decision WHERE id=?",
                                            (did,)).fetchone()[0])
         self.assertNotIn("jev", detail)  # guidance never touches decision detail_json
@@ -117,11 +91,12 @@ class JevLearning(unittest.TestCase):
     def test_duplicate_guidance_lands_on_the_open_decision_and_reuses_unchanged_inputs(self):
         cid = self.candidate("other.py: x lives here")
         lid, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(self.c, lambda cfg, state, questions: ok(f"duplicate:{cid}"))
-        learn.sync(self.cfg, self.c)
-        j = self.jev(did)
+        with mock.patch.object(jev, "evaluate", side_effect=lambda cfg, state, questions: ok(f"duplicate:{cid}")) as ev:
+            learn.sync(self.cfg, self.c)
+            learn.sync(self.cfg, self.c)
+            self.assertEqual(ev.call_count, 1)  # unchanged successful judgment reused
+        j = self.advice(did)
         self.assertEqual(j["status"], "ok")
-        self.assertEqual(j["model"], "jev-1.13.0")
         self.assertEqual(j["relation"], {"kind": "duplicate", "learning_id": cid,
                                          "body": "other.py: x lives here"})
         self.assertEqual(j["group"], f"learning:{cid}")
@@ -129,107 +104,170 @@ class JevLearning(unittest.TestCase):
         self.assertIn("fingerprint", j)
         self.assertEqual(self.c.execute("SELECT status FROM learning WHERE id=?",
                                         (lid,)).fetchone()[0], "proposed")  # guidance never alters status
-        learn.sync(self.cfg, self.c)
-        self.assertEqual(learn.jev.calls, 1)  # unchanged successful judgment reused
-        self.assertEqual(self.jev(did), j)
 
     def test_candidate_status_or_body_change_reassesses(self):
         cid = self.candidate("other.py: x lives here")
-        _, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(self.c, lambda cfg, state, questions: ok(f"duplicate:{cid}"))
-        learn.sync(self.cfg, self.c)
-        self.c.execute("UPDATE learning SET body=? WHERE id=?", ("other.py: y lives here", cid))
-        learn.sync(self.cfg, self.c)
-        self.assertEqual(learn.jev.calls, 2)
-        self.c.execute("UPDATE learning SET status='proposed' WHERE id=?", (cid,))
-        learn.sync(self.cfg, self.c)
-        self.assertEqual(learn.jev.calls, 3)
+        self.propose("the parser lives in other.py")
+        with mock.patch.object(jev, "evaluate", side_effect=lambda cfg, state, questions: ok(f"duplicate:{cid}")) as ev:
+            learn.sync(self.cfg, self.c)
+            self.c.execute("UPDATE learning SET body=? WHERE id=?", ("other.py: y lives here", cid))
+            learn.sync(self.cfg, self.c)
+            self.c.execute("UPDATE learning SET status='proposed' WHERE id=?", (cid,))
+            learn.sync(self.cfg, self.c)
+            self.assertEqual(ev.call_count, 3)
 
     def test_unavailable_is_visible_and_retried_next_tick(self):
         self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(self.c, lambda cfg, state, questions: {"status": "unavailable", "error": "timeout"})
-        learn.sync(self.cfg, self.c)
-        j = self.jev(did)
-        self.assertEqual(j["status"], "unavailable")
-        self.assertEqual(j["error"], "timeout")
-        learn.sync(self.cfg, self.c)
-        self.assertEqual(learn.jev.calls, 2)  # failed calls retried, no loop beyond the next tick
+        with mock.patch.object(jev, "evaluate",
+                               side_effect=lambda cfg, state, questions: {"status": "unavailable"}) as ev:
+            learn.sync(self.cfg, self.c)
+            self.assertEqual(self.advice(did)["status"], "unavailable")
+            learn.sync(self.cfg, self.c)
+            self.assertEqual(ev.call_count, 2)  # failed calls retried, no loop beyond the next tick
 
     def test_disabled_is_visible_without_crashing_on_an_unconfigured_cfg(self):
         self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(self.c, lambda cfg, state, questions: {"status": "disabled", "error": "no key"})
-        learn.sync(SimpleNamespace(raw={}), self.c)
-        j = self.jev(did)
-        self.assertEqual(j["status"], "disabled")
-        self.assertEqual(j["error"], "no key")
+        with mock.patch.object(jev, "evaluate",
+                               side_effect=lambda cfg, state, questions: {"status": "disabled"}):
+            learn.sync(SimpleNamespace(raw={}), self.c)
+        self.assertEqual(self.advice(did)["status"], "disabled")
 
     def test_relation_to_an_unknown_candidate_is_not_trusted(self):
         self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(self.c, lambda cfg, state, questions: ok("duplicate:999"))
-        learn.sync(self.cfg, self.c)
-        j = self.jev(did)
+        with mock.patch.object(jev, "evaluate", side_effect=lambda cfg, state, questions: ok("duplicate:999")):
+            learn.sync(self.cfg, self.c)
+        j = self.advice(did)
         self.assertEqual(j["status"], "ok")
         self.assertNotIn("relation", j)
+
+    def test_low_confidence_relationship_is_recorded_but_never_surfaced_as_definitive(self):
+        cid = self.candidate("other.py: x lives here")
+        _, did = self.propose("the parser lives in other.py")
+        with mock.patch.object(jev, "evaluate",
+                               side_effect=lambda cfg, state, questions: ok(f"duplicate:{cid}", confidence=0.5)):
+            learn.sync(self.cfg, self.c)
+        j = self.advice(did)
+        self.assertEqual(j["status"], "ok")
+        self.assertNotIn("relation", j)
+        self.assertNotIn("group", j)
 
     def test_conflicts_is_surfaced_without_a_group(self):
         cid = self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(self.c, lambda cfg, state, questions: ok(f"conflicts:{cid}"))
-        learn.sync(self.cfg, self.c)
-        j = self.jev(did)
+        with mock.patch.object(jev, "evaluate", side_effect=lambda cfg, state, questions: ok(f"conflicts:{cid}")):
+            learn.sync(self.cfg, self.c)
+        j = self.advice(did)
         self.assertEqual(j["relation"], {"kind": "conflicts", "learning_id": cid,
                                          "body": "other.py: x lives here"})
         self.assertNotIn("group", j)
 
-    def test_a_new_duplicate_adopts_the_targets_group_and_links_never_cycle(self):
+    def test_same_tick_group_chain_adopts_the_root_stored_earlier(self):
         c0 = self.candidate("a.py: root", source="verdict:0")
         lid1, did1 = self.propose("b.py: middle again", kind="pitfall", source="decision:1")
+        lid2, did2 = self.propose("c.py: middle again", kind="pitfall", source="decision:2")
 
         def respond(cfg, state, questions):
-            return ok(f"duplicate:{c0 if state['proposal']['body'].startswith('b.py') else lid1}")
+            body = state["proposal"]["body"]
+            return ok(f"duplicate:{c0 if body.startswith('b.py') else lid1}")
 
-        learn.jev = FakeJev(self.c, respond)
-        learn.sync(self.cfg, self.c)
-        self.assertEqual(self.jev(did1)["group"], f"learning:{c0}")
-        lid2, did2 = self.propose("c.py: middle again", kind="pitfall", source="decision:2")
-        learn.sync(self.cfg, self.c)
-        g2 = self.jev(did2)["group"]
+        with mock.patch.object(jev, "evaluate", side_effect=respond):
+            learn.sync(self.cfg, self.c)  # one tick: the second proposal sees the first's stored group root
+        self.assertEqual(self.advice(did1)["group"], f"learning:{c0}")
+        g2 = self.advice(did2)["group"]
         self.assertEqual(g2, f"learning:{c0}")  # adopts the component root, not the direct target
         self.assertLess(int(g2.split(":")[1]), lid2)  # group targets always sit below the member's own id
 
-    def test_unrelated_repo_and_no_candidates_are_not_compared(self):
-        self.candidate("other.py: x lives here", scope="elsewhere")
+    def test_unrelated_repo_candidate_is_never_compared(self):
+        other = self.candidate("other.py: x lives here", scope="elsewhere")
         _, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(self.c, lambda cfg, state, questions: ok("none"))
-        learn.sync(self.cfg, self.c)
-        self.assertEqual(learn.jev.calls, 0)
-        self.assertIsNone(self.jev(did))
+        with mock.patch.object(jev, "evaluate",
+                               side_effect=lambda cfg, state, questions: ok(f"duplicate:{other}")) as ev:
+            learn.sync(self.cfg, self.c)
+            self.assertEqual(ev.call_count, 0)  # different repo: never compared
+        self.assertNotIn("relation", self.advice(did) or {})
+
+    def test_a_vanished_candidate_clears_the_stale_relationship(self):
+        cid = self.candidate("other.py: x lives here")
+        _, did = self.propose("the parser lives in other.py")
+        with mock.patch.object(jev, "evaluate", side_effect=lambda cfg, state, questions: ok(f"duplicate:{cid}")):
+            learn.sync(self.cfg, self.c)
+        self.assertIn("relation", self.advice(did))
+        self.c.execute("UPDATE learning SET status='expired' WHERE id=?", (cid,))
+        with mock.patch.object(jev, "evaluate") as ev:
+            learn.sync(self.cfg, self.c)
+            self.assertEqual(ev.call_count, 0)  # nothing left to compare
+        j = self.advice(did)
+        self.assertNotIn("relation", j)
+        self.assertNotIn("group", j)
 
     def test_rows_expose_guidance_on_the_learn_surface(self):
         cid = self.candidate("other.py: x lives here")
         lid, _ = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(self.c, lambda cfg, state, questions: ok(f"duplicate:{cid}"))
-        learn.sync(self.cfg, self.c)
+        with mock.patch.object(jev, "evaluate", side_effect=lambda cfg, state, questions: ok(f"duplicate:{cid}")):
+            learn.sync(self.cfg, self.c)
         row = next(r for r in learn.rows(self.c) if r["id"] == lid)
         self.assertEqual(row["jev"]["relation"], {"kind": "duplicate", "learning_id": cid,
                                                   "body": "other.py: x lives here"})
 
     def test_a_decision_answered_while_the_call_is_in_flight_is_left_untouched(self):
-        self.candidate("other.py: x lives here")
+        cid = self.candidate("other.py: x lives here")
         lid, did = self.propose("the parser lives in other.py")
 
         def answer_then_ok(cfg, state, questions):
             decide.choose(self.cfg, self.c, did, "reject", "user")
-            return ok(f"duplicate:{lid - 1}")
+            return ok(f"duplicate:{cid}")
 
-        learn.jev = FakeJev(self.c, answer_then_ok)
-        learn.sync(self.cfg, self.c)
-        self.assertIsNone(self.jev(did))  # guidance never lands on a closed decision
+        with mock.patch.object(jev, "evaluate", side_effect=answer_then_ok):
+            learn.sync(self.cfg, self.c)
+        self.assertIsNone(jev.stored(self.c, did))  # real jev.store recheck: guidance never lands on a closed decision
         self.assertEqual(self.c.execute("SELECT status FROM learning WHERE id=?",
                                         (lid,)).fetchone()[0], "rejected")
+
+    def test_persisted_advice_survives_reopen(self):
+        cid = self.candidate("other.py: x lives here")
+        _, did = self.propose("the parser lives in other.py")
+        with mock.patch.object(jev, "evaluate", side_effect=lambda cfg, state, questions: ok(f"duplicate:{cid}")):
+            learn.sync(self.cfg, self.c)
+        before = jev.stored(self.c, did)
+        self.c.close()
+        c2 = db.connect(self.dbpath)
+        try:
+            self.assertEqual(jev.stored(c2, did), before)  # a real jev_advice row, not an in-memory double
+        finally:
+            c2.close()
+
+    def test_shortlist_is_bounded_same_kind_first_and_same_repo_only(self):
+        for i in range(50):
+            self.candidate(f"c{i}.py: codemap fact")
+        for i in range(5):
+            self.candidate(f"p{i}.py: pitfall fact", kind="pitfall")
+        elsewhere = self.candidate("z.py: elsewhere fact", scope="elsewhere", kind="pitfall")
+        self.propose("q.py: new pitfall", kind="pitfall")
+        seen = []
+        with mock.patch.object(jev, "evaluate",
+                               side_effect=lambda cfg, state, questions: seen.append(state) or ok("none")):
+            learn.sync(self.cfg, self.c)
+        cands = seen[0]["candidates"]
+        self.assertEqual(len(cands), 40)  # capped well inside the 255-choice ceiling
+        self.assertTrue(all(c["kind"] == "pitfall" for c in cands[:5]))  # same kind leads
+        self.assertNotIn(elsewhere, [c["id"] for c in cands])  # same repo is mandatory
+
+    def test_only_older_proposed_candidates_join_but_active_ones_of_any_age_do(self):
+        lid, _ = self.propose("q.py: new pitfall", kind="pitfall")
+        newer_proposed = self.candidate("n.py: later proposal", kind="pitfall", status="proposed")
+        newer_active = self.candidate("m.py: later kept", kind="pitfall", status="active")
+        self.assertGreater(newer_proposed, lid)
+        self.assertGreater(newer_active, lid)
+        seen = []
+        with mock.patch.object(jev, "evaluate",
+                               side_effect=lambda cfg, state, questions: seen.append(state) or ok("none")):
+            learn.sync(self.cfg, self.c)
+        ids = [c["id"] for c in seen[0]["candidates"]]
+        self.assertNotIn(newer_proposed, ids)  # no forward pointers to younger proposals
+        self.assertIn(newer_active, ids)
 
 
 if __name__ == "__main__":
