@@ -297,6 +297,10 @@ def dispatch_status(cfg, conn, run_id):
             "SELECT from_state, to_state, actor, at FROM transition_log WHERE run_id=? ORDER BY id", (run_id,))],
         "decisions": decide.rows(conn, run_id, open_only=False),
         "writes": reconcile.show(conn, run_id)["writes"],  # what reconcile wrote (or holds) in Linear
+        # what the executor reported per card: step progress ("FIN-1/2 done") and the done summary, for the outline
+        "events": [dict(r) for r in conn.execute(
+            "SELECT t.identifier, e.kind, e.body, e.at FROM card_event e JOIN dispatch_ticket t USING (run_id, issue_id) "
+            "WHERE e.run_id=? AND e.kind IN ('comment', 'done', 'block') ORDER BY e.id", (run_id,))],
     }
 
 

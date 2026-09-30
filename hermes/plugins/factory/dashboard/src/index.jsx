@@ -2,12 +2,13 @@
 //   Needs you: a deck of decisions. Each is a question with options, what each leads to, and the factory's
 //     recommendation. Tap an option, or swipe right to take the recommendation, left for later.
 //   Lifecycle: one tab per factory stage — Ingest (tickets), Draft (assemble + revise/edit), Run (staged, executing,
-//     done), Learn (reconciled, archived, throughput). Dispatches are rows in an engineering table; open one to see
-//     its DAG as folded cards down a rail (dispatch → review → tickets → steps → results), decisions hanging off
-//     the node they're about.
+//     done), Learn (reconciled, archived, throughput). Dispatches are rows in an engineering table; a draft opens its
+//     DAG as folded cards down a rail (dispatch → review → tickets → steps → results) and its plan (plan.jsx, the
+//     configurator); Run and Learn show the plan read-only. Quick lane: light decisions, ★ on all in one tap.
 // Every action goes through the plugin API to the factory CLI, which enforces the invariants.
 // Built by install.sh (`bun build`, classic JSX via tsconfig.json) to dist/index.js; React and the shadcn-style
 // components come from the dashboard SDK.
+import { Plan, Quick } from "./plan.jsx";
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect, useCallback, useRef, useMemo } = SDK.hooks;
@@ -247,7 +248,7 @@ function TopCard({ d, ctx, err, onChoose, onLater, onOpen, pos, canLater }) {
     <Card className={`fx-card fx-top${leaving ? ` leave-${leaving}` : ""}`} style={style}
           onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}>
       <CardContent className="fx-stack-v">
-        {dx > 40 ? <div className="fx-swipe right">★ {rec?.label}</div> : dx < -40 && canLater ? <div className="fx-swipe left">Later</div> : null}
+        {dx > 40 && !d.group ? <div className="fx-swipe right">★ {rec?.label}</div> : dx < -40 && canLater ? <div className="fx-swipe left">Later</div> : null}
         <div className="fx-row between">
           <span className="fx-row"><Tone tone={d.tier === "now" || d.kind === "writeback" || d.kind === "blocked" ? "red" : "amber"}>{KIND[d.kind]}</Tone>
             {d.tier === "now" ? <span className="fx-urgent">work waits on you</span> : null}
@@ -257,8 +258,11 @@ function TopCard({ d, ctx, err, onChoose, onLater, onOpen, pos, canLater }) {
         {ctx ? <button className="fx-ctx" onClick={() => onOpen(d)}>{ctx} ›</button> : null}
         <div className="fx-q">{d.question}</div>
         {d.detail?.reason && d.kind !== "writeback" ? <div className="fx-hint">{d.detail.reason}</div> : null}
-        <DecisionBody d={d} err={err} onChoose={(o, n) => onChoose(d, o, n)} />
-        <div className="fx-hint fx-gesture">Swipe right for ★{canLater ? ", left for later" : ""}</div>
+        {d.group ? (<>  {/* a draft's plan questions + review: one card that opens the configurator */}
+          {d.result ? <div className="fx-hint">→ {d.result}</div> : null}
+          <Button onClick={() => onOpen(d)}>Open the plan ›</Button>
+        </>) : <DecisionBody d={d} err={err} onChoose={(o, n) => onChoose(d, o, n)} />}
+        <div className="fx-hint fx-gesture">{d.group ? (canLater ? "Swipe left for later" : "") : `Swipe right for ★${canLater ? ", left for later" : ""}`}</div>
       </CardContent>
     </Card>
   );
@@ -532,12 +536,7 @@ function FlowCard({ n, d, open, onToggle, onDone, draft, cardRef, i }) {
             {st === "done" ? <Tone tone="green">landed</Tone> : st === "blocked" ? <Tone tone="amber">blocked</Tone> : <span className="fx-hint">not yet</span>}</div>
           {n.card?.pr_url ? <Ext href={n.card.pr_url}>{n.card.pr_url.replace("https://github.com/", "")}</Ext>
             : <div className="fx-hint">{st === "blocked" ? "Stopped before a PR." : "A merged PR with green checks, then write-back to Linear."}</div>}
-          {n.writes.length ? <ul className="fx-writes">{n.writes.map((w, k) => (
-            <li key={k} className={`w-${w.decision === "flag" ? "held" : w.status}`}>
-              <span className="mark">{w.decision === "flag" ? "⏸" : w.status === "confirmed" ? "✓" : w.status === "failed" ? "✕" : "…"}</span>
-              Linear {w.op === "state" ? `→ ${w.payload?.state || "state"}` : w.op === "create" ? `follow-up “${clip(w.payload?.title, 40)}”${w.linear_ref ? ` (${w.linear_ref})` : ""}` : w.op}
-              {w.decision === "flag" ? " · held" : w.approved_by ? ` · applied by ${w.approved_by}` : ""}
-            </li>))}</ul> : null}
+          <Writes writes={n.writes} />
         </>);
       }
       default: return null;
@@ -550,6 +549,13 @@ function FlowCard({ n, d, open, onToggle, onDone, draft, cardRef, i }) {
     </div>
   );
 }
+
+const Writes = ({ writes }) => (writes.length ? <ul className="fx-writes">{writes.map((w, k) => (
+  <li key={k} className={`w-${w.decision === "flag" ? "held" : w.status}`}>
+    <span className="mark">{w.decision === "flag" ? "⏸" : w.status === "confirmed" ? "✓" : w.status === "failed" ? "✕" : "…"}</span>
+    Linear {w.op === "state" ? `→ ${w.payload?.state || "state"}` : w.op === "create" ? `follow-up “${clip(w.payload?.title, 40)}”${w.linear_ref ? ` (${w.linear_ref})` : ""}` : w.op}
+    {w.decision === "flag" ? " · held" : w.approved_by ? ` · applied by ${w.approved_by}` : ""}
+  </li>))}</ul> : null);
 
 function Flow({ d, titles, onDone, focusNode }) {
   const full = useMemo(() => buildFlow(d, titles), [d, titles]);
@@ -764,6 +770,10 @@ function FactoryPage() {
   const [focus, setFocus] = useState(null);
   const [toast, setToast] = useState(null);
   const [showTp, setShowTp] = useState(false);
+  // ?view=review&run=<run_id> opens that dispatch's plan (the configurator) in place of the page, e.g. from a Hermex push
+  const [review, setReview] = useState(() => { const p = new URLSearchParams(location.search); return p.get("view") === "review" ? p.get("run") : null; });
+  const top = useRef(null);
+  useEffect(() => { top.current?.scrollIntoView(); }, [review]);
   const [, tick] = useState(0);
   const inflight = useRef(false);
   const again = useRef(false);
@@ -810,6 +820,20 @@ function FactoryPage() {
   const answers = data.tickets.filter((t) => ticketGroup(t, skipped).group === "answer").length;
   const needs = decisions.length;
   const needsOf = (runId) => open.filter((x) => x.run_id === runId && x.tier !== "auto").length;
+  // A draft's plan questions and review are one deck card that opens the configurator; light ones (★ starts or
+  // stops nothing, writes nothing) go to the Quick lane, ★ on all in one tap.
+  const light = (x) => x.tier !== "now" && x.kind !== "plan" && x.kind !== "review" && !x.options.find((o) => o.id === x.recommended)?.weighty;
+  const grouped = new Set();
+  const deck = decisions.filter((x) => !light(x)).flatMap((x) => {
+    const d = byRun[x.run_id];
+    if (!((x.kind === "plan" || x.kind === "review") && d?.state === "draft")) return [x];
+    if (grouped.has(x.run_id)) return [];
+    grouped.add(x.run_id);
+    const n = open.filter((y) => y.kind === "plan" && y.run_id === x.run_id).length;
+    return [{ ...(reviewOf[x.run_id] || x), kind: "review", group: true, options: [], result: (d.tree || []).find((t) => t.id === "root")?.result,
+              question: `Review ${(d.tickets || []).map((c) => c.identifier).join(", ")}${n ? ` · ${plural(n, "question")}` : ""}` }];
+  });
+  const tix = Object.fromEntries(data.tickets.map((t) => [t.identifier, t]));
   const rows = { ingest: [], draft: [], run: [], learn: [] };
   data.dispatches.forEach((d) => rows[stageOf(d)].push(d));
   const inIngest = data.tickets.filter((t) => !t.dispatch).length;
@@ -823,7 +847,7 @@ function FactoryPage() {
   const current = (byRun[sel] && list.some((d) => d.run_id === sel) ? byRun[sel] : list[0]) || null;
   const context = (x) => {
     const base = byRun[x.run_id] ? clip(dispatchTitle(byRun[x.run_id], titles), 60) : x.identifier ? `${x.identifier} ${clip(x.title, 50)}` : null;
-    if (x.kind === "plan") return `${base} · step ${x.node_id}`;
+    if (x.kind === "plan" || x.group) return x.kind === "plan" ? `${base} · step ${x.node_id}` : base;
     const qs = x.kind === "review" ? open.filter((y) => y.kind === "plan" && y.run_id === x.run_id).length : 0;
     return qs ? `${base} · ${plural(qs, "planner question")} still open, ★ on approval` : base;
   };
@@ -834,8 +858,15 @@ function FactoryPage() {
                message: msg || (r?.after_error ? `Recorded, but: ${r.after_error}` : r?.handoff_error ? `Approved; starting is retried: ${r.handoff_error}` : `${o?.label || "Done"} ✓`) });
     load();
   };
+  const openReview = (run) => {  // the URL follows, so a reload or a shared link lands on the same plan
+    setReview(run);
+    const u = new URL(location.href);
+    if (run) { u.searchParams.set("view", "review"); u.searchParams.set("run", run); } else { u.searchParams.delete("view"); u.searchParams.delete("run"); }
+    history.replaceState(history.state, "", u);
+  };
   const openNode = (x) => {
     const run = byRun[x.run_id];
+    if (x.group) return openReview(x.run_id);
     if (!run) return;
     setTab(stageOf(run));
     setSel(x.run_id);
@@ -849,8 +880,18 @@ function FactoryPage() {
     learn: "Nothing learned yet. Dispatches land here after they run and write back to Linear.",
   };
 
+  if (review) {
+    return (
+      <div className="fx" ref={top}>
+        <Toast toast={toast} />
+        {byRun[review] ? <Plan key={review} d={byRun[review]} tickets={tix} onDone={done} onClose={() => openReview(null)} /> : (
+          <div className="fx-row between"><span className="fx-empty">Dispatch {review} is not live any more.</span>
+            <button className="fx-x" onClick={() => openReview(null)} aria-label="Close">✕</button></div>)}
+      </div>
+    );
+  }
   return (
-    <div className="fx">
+    <div className="fx" ref={top}>
       <Toast toast={toast} />
       <header className="fx-head">
         <div className={`fx-hello${needs ? " you" : ""}`}>{needs ? `${plural(needs, "thing")} need${needs === 1 ? "s" : ""} you` : "All clear"}</div>
@@ -863,7 +904,8 @@ function FactoryPage() {
         {error ? <div className="fx-err">Last refresh failed: {error}</div> : null}
       </header>
 
-      <Deck decisions={decisions} context={context} onDone={(r, d) => done(r, d)} onOpen={openNode} />
+      <Deck decisions={deck} context={context} onDone={(r, d) => done(r, d)} onOpen={openNode} />
+      <Quick items={decisions.filter(light)} context={context} onDone={done} />
 
       <div className="fx-stage-tabs" role="tablist" aria-label="Factory lifecycle">
         {STAGES.map(([id, label]) => (
@@ -883,7 +925,10 @@ function FactoryPage() {
         <section className="fx-sec">
           {list.length ? (<>
             <StageTable dispatches={list} titles={titles} needsOf={needsOf} selected={current} onSelect={pick} />
-            {current ? <Flow key={current.run_id} d={current} titles={titles} onDone={done} focusNode={focus} /> : null}
+            {!current ? null : active === "draft" ? (<>
+              <Button onClick={() => openReview(current.run_id)}>Open the plan ›</Button>
+              <Flow key={current.run_id} d={current} titles={titles} onDone={done} focusNode={focus} />
+            </>) : <Plan key={current.run_id} d={current} tickets={tix} onDone={done} />}
           </>) : <div className="fx-empty">{EMPTY[active]}</div>}
         </section>
       )}
@@ -905,3 +950,6 @@ function FactoryPage() {
 }
 
 window.__HERMES_PLUGINS__.register("factory", FactoryPage);
+
+// For plan.jsx / railway.jsx (bundled together; used at render time only, so the import cycle is harmless).
+export { ActErr, CARD, CARD_TONE, DecisionBody, Ext, LANE_W, RAIL_X0, Rail, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose };

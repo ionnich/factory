@@ -110,6 +110,10 @@ class Choice(BaseModel):
     note: str | None = Field(default=None, max_length=4000)
 
 
+class Ok(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=50)
+
+
 @router.post("/stage")
 async def stage(body: Stage):
     bad = [i for i in body.identifiers if not IDENT.match(i)]
@@ -137,6 +141,12 @@ async def draft_note(run_id: str, body: Note):
         raise HTTPException(422, "bad node id")
     return await factory("draft", "note", run_id_ok(run_id), "--node", body.node,
                          f"--body={text_ok(body.body, 'note')}", "--actor", "user:dashboard")
+
+
+@router.post("/decisions/ok")  # before /decisions/{id}: "ok" is not an id
+async def take_stars(body: Ok):
+    """The user's "ok": ★ on each (per-decision errors come back in the list, like `factory decide ok`)."""
+    return await factory("decide", "ok", *map(str, body.ids), "--actor", "user:dashboard", timeout=300)
 
 
 @router.post("/decisions/{decision_id}")
