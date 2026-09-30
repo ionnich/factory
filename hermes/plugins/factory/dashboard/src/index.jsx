@@ -1,16 +1,21 @@
-// Factory tab, mobile first: a stack of cards.
-//   Needs you: a deck of decisions. Each is a question with options, what each leads to, and the factory's
-//     recommendation; long explanations start folded. Tap an option, or swipe right to take the recommendation, left
-//     for later.
-//   Lifecycle: one tab per factory stage, the strip right under the header, the stage itself after the deck —
-//     Tickets (every ticket and its audit trail; pick drafts), Draft (the plan: plan.jsx, the configurator, with notes
-//     while draft), Run (staged, executing, done; the server's runtime read — last activity, blocker, next step —
-//     then the plan read-only), Learn (reconciled, archived: predicted vs landed, learnings, throughput). Dispatches
-//     are rows in an engineering table.
-//     Quick lane: light decisions, ★ on all in one tap.
+// Factory tab, mobile first. The header: Needs you (every decision or undelivered executor answer waiting on a person,
+// each line a link to its stage and the thing itself), job health, the live refresh. Under it one tab per lifecycle
+// stage and, apart, Learn and Costs; only the open one is on the page, with all of its own content:
+//   Tickets: the whole ticket ledger and each ticket's audit trail (tickets.jsx), when Linear was last ingested.
+//   Verify: tickets waiting on verification or an answer; the verification job's last run.
+//   Draft: ready tickets to draft, drafts not offered to a planner yet, blocked tickets' retry questions.
+//   Plan: drafts offered to the planner, or whose plan it refused, as recorded; the planner job's last run.
+//   Review: planned drafts, the plan as a configurator (plan.jsx): lock in a path, approve, hold.
+//   Run: executor questions, undelivered answers, the server's runtime read, the plan read-only.
+//   Reconcile: done dispatches, every unsettled Linear write, held writes' questions.
+//   Archive: every archived dispatch, rejected ones too (GET /archive), its transitions and plan.
+//   Learn: learnings, and proposed ones to keep or drop. Costs: throughput and agent spend.
+// The server's `phase` puts each dispatch, ticket and decision in its stage; nothing here guesses one. Where you are is
+// the URL (?stage=, run=, decision=, ticket=): each deliberate move is a history entry and Back returns to it; a stage
+// keeps its selection, ticket filters and scroll while you are elsewhere. A refresh never moves, reselects or unfolds.
 // Every action goes through the plugin API to the factory CLI, which enforces the invariants.
 // Built by install.sh (`bun build`, classic JSX via tsconfig.json) to dist/index.js; React and the shadcn-style
-// components come from the dashboard SDK. The Tickets tab lives in tickets.jsx.
+// components come from the dashboard SDK.
 import { Learnings } from "./learn.jsx";
 import { Plan, Quick } from "./plan.jsx";
 import { Jev } from "./jev.jsx";
@@ -28,7 +33,7 @@ import { Why, WhyContext } from "./why.jsx";
 const ago = (iso) => (iso ? SDK.utils.isoTimeAgo(iso) : "never");
 const epochAgo = (v) => (v == null ? "never" : typeof v === "number" ? SDK.utils.timeAgo(v) : ago(v));
 const errText = (e) => String(e && e.message ? e.message : e);
-const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const plural = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
 const clip = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + "…" : s || "");
 const post = (path, body) => SDK.fetchJSON(API + path,
   { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -61,19 +66,20 @@ const KIND_ORDER = ["review", "ask", "executor-gone", "dispatch-stuck", "blocked
 const CARD = { ready: "not started", running: "in progress", done: "done", blocked: "blocked" };
 const CARD_TONE = { ready: "gray", running: "blue", done: "green", blocked: "amber" };
 
+// A dispatch's status inside its stage (the server's phase). Planning only as recorded: an offer, never a planner at work.
 function dispatchStatus(d) {
   const cards = d.tickets || [];
   const n = (s) => cards.filter((c) => c.card_status === s).length;
-  switch (d.state) {
-    case "draft": return d.review === "planning" ? { tone: "gray", label: "Planning…" }
-      : d.review === "held" ? { tone: "amber", label: "Held" }
+  switch (d.phase) {
+    case "draft": return { tone: "gray", label: "Not offered" };
+    case "plan": return d.planning_error ? { tone: "red", label: "Plan refused" }
+      : { tone: "gray", label: `Requested ${ago(d.planning_requested_at)}` };
+    case "review": return d.review === "held" ? { tone: "amber", label: "Held" }
       : d.review === "in-review" ? { tone: "amber", label: `Auto in ${until(d.review_until)}` }
       : { tone: "amber", label: "In review" };
-    case "staged": return { tone: "blue", label: "Starting" };
-    case "executing": return { tone: "blue", label: `${n("done")}/${cards.length} done` };
-    case "done": return { tone: "blue", label: "Writing back" };
-    case "reconciled": return { tone: "green", label: "Written back" };
-    case "archived": return { tone: "green", label: "Archived" };
+    case "run": return d.state === "staged" ? { tone: "blue", label: "Starting" } : { tone: "blue", label: `${n("done")}/${cards.length} done` };
+    case "reconcile": return d.state === "done" ? { tone: "blue", label: "To write back" } : { tone: "green", label: "Written back" };
+    case "archive": return d.rejected_reason ? { tone: "gray", label: "Rejected" } : { tone: "green", label: "Archived" };
     default: return { tone: "gray", label: d.state };
   }
 }
@@ -182,12 +188,18 @@ function useChoose(d, onDone) {
 }
 
 // The deck: the top card is live; two more peek out behind it. A tap answers at once: the card flies off and the
-// next one is live while the server confirms; if it refuses, the card comes back on top with the reason.
-function Deck({ decisions, context, onDone, onOpen }) {
+// next one is live while the server confirms; if it refuses, the card comes back on top with the reason. `front`
+// ({id, nav}): the card a Needs you line, a link or Back points at comes to the top, once per navigation.
+function Deck({ decisions, context, onDone, onOpen, front }) {
   const [order, setOrder] = useState([]);
   const [gone, setGone] = useState({});
   const [flying, setFlying] = useState([]);
   const [errs, setErrs] = useState({});
+  const [led, setLed] = useState(null);
+  if (front && front.nav !== led) {  // set while rendering (React's derived state), so it is on top in this very render
+    setLed(front.nav);
+    setOrder((o) => [front.id, ...o.filter((id) => id !== front.id)]);
+  }
   const ids = decisions.map((d) => d.id).filter((id) => !gone[id]);
   const seq = [...order.filter((id) => ids.includes(id)), ...ids.filter((id) => !order.includes(id))];
   const byId = Object.fromEntries(decisions.map((d) => [d.id, d]));
@@ -214,8 +226,8 @@ function Deck({ decisions, context, onDone, onOpen }) {
       <div className="fx-deck">
         <div className="fx-stack">
           <Card className="fx-card fx-clear"><CardContent><div className="fx-bounce">✓</div>
-            <div className="fx-title">Nothing needs you</div>
-            <div className="fx-hint">New questions land here as cards. The factory keeps going on its own meanwhile.</div>
+            <div className="fx-title">Nothing here needs you</div>
+            <div className="fx-hint">New questions for this stage land here as cards. The factory keeps going on its own meanwhile.</div>
           </CardContent></Card>
           {flyers}
         </div>
@@ -258,10 +270,10 @@ function TopCard({ d, ctx, err, onChoose, onLater, onOpen, pos, canLater }) {
   };
   const style = leaving ? undefined : dx ? { transform: `translateX(${dx}px) rotate(${dx / 24}deg)`, transition: "none" } : undefined;
   return (
-    <Card className={`fx-card fx-top${leaving ? ` leave-${leaving}` : ""}`} style={style}
+    <Card id={`fx-d-${d.id}`} tabIndex={-1} className={`fx-card fx-top${leaving ? ` leave-${leaving}` : ""}`} style={style}
           onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={() => { drag.current = null; setDx(0); }}>
       <CardContent className="fx-stack-v">
-        {dx > 40 && !d.group ? <div className="fx-swipe right">★ {rec?.label}</div> : dx < -40 && canLater ? <div className="fx-swipe left">Later</div> : null}
+        {dx > 40 ? <div className="fx-swipe right">★ {rec?.label}</div> : dx < -40 && canLater ? <div className="fx-swipe left">Later</div> : null}
         <div className="fx-row between">
           <span className="fx-row"><Tone tone={d.tier === "now" || d.kind === "writeback" || d.kind === "blocked" ? "red" : "amber"}>{KIND[d.kind]}</Tone>
             {d.tier === "now" ? <span className="fx-urgent">work waits on you</span> : null}
@@ -271,11 +283,8 @@ function TopCard({ d, ctx, err, onChoose, onLater, onOpen, pos, canLater }) {
         {ctx ? <button className="fx-ctx" onClick={() => onOpen(d)}>{ctx} ›</button> : null}
         <div className="fx-q">{d.question}</div>
         {d.kind !== "writeback" ? <Fold className="fx-hint" text={d.detail?.reason} /> : null}
-        {d.group ? (<>  {/* a draft's plan questions + review: one card that opens the configurator */}
-          {d.result ? <div className="fx-hint">→ {d.result}</div> : null}
-          <Button onClick={() => onOpen(d)}>Open the plan ›</Button>
-        </>) : <DecisionBody d={d} err={err} onChoose={(o, n) => onChoose(d, o, n)} />}
-        <div className="fx-hint fx-gesture">{d.group ? (canLater ? "Swipe left for later" : "") : d.kind === "ask" ? `Tap an answer twice to confirm${canLater ? "; swipe left for later" : ""}` : `Swipe right for ★${canLater ? ", left for later" : ""}`}</div>
+        <DecisionBody d={d} err={err} onChoose={(o, n) => onChoose(d, o, n)} />
+        <div className="fx-hint fx-gesture">{d.kind === "ask" ? `Tap an answer twice to confirm${canLater ? "; swipe left for later" : ""}` : `Swipe right for ★${canLater ? ", left for later" : ""}`}</div>
       </CardContent>
     </Card>
   );
@@ -285,7 +294,7 @@ function ExecutorDelivery({ item, onDone }) {
   const action = useAction(onDone);
   const sending = action.busy || item.state === "sending";
   return (
-    <div className="fx-stack-v">
+    <div className="fx-stack-v" id={`fx-d-${item.decision_id}`} tabIndex={-1}>
       <div className="fx-row"><Tone tone="amber">{sending ? "Sending to executor" : "Executor answer not delivered"}</Tone><span className="fx-id">{item.run_id} · #{item.decision_id}</span></div>
       <div>{item.question}</div>
       <div>Recorded answer: <b>{item.answer}</b>. This answer will not be changed.</div>
@@ -381,16 +390,63 @@ const Writes = ({ writes }) => (writes.length ? <ul className="fx-writes">{write
     {w.decision === "flag" ? " · held" : w.approved_by ? ` · applied by ${w.approved_by}` : ""}
   </li>))}</ul> : null);
 
-// ---- lifecycle: dispatches as rows in an engineering table, one tab per stage ------------------------------
-const STAGES = [["tickets", "Tickets"], ["draft", "Draft"], ["run", "Run"], ["learn", "Learn"]];
-const stageOf = (d) => d.state === "draft" ? "draft" : ["staged", "executing", "done"].includes(d.state) ? "run" : "learn";
+// ---- lifecycle: one workspace per stage, dispatches as rows in an engineering table -------------------------------
+const STAGES = [["tickets", "Tickets"], ["verify", "Verify"], ["draft", "Draft"], ["plan", "Plan"], ["review", "Review"],
+                ["run", "Run"], ["reconcile", "Reconcile"], ["archive", "Archive"]];
+const SIDE = [["learn", "Learn"], ["costs", "Costs"]];  // supporting views beside the stages, not stages
+const LABEL = Object.fromEntries([...STAGES, ...SIDE]);
+const IDS = new Set(Object.keys(LABEL));
+const TICKET_MODES = ["tickets", "verify", "draft"];  // tickets.jsx workspaces, each with its view kept by the page
+const BLANK = { q: "", filter: "all", picked: [], open: null, busy: false, err: null };
+// What a stage's tab counts (the server's lifecycle.counts): tickets before they are grouped, dispatches after.
+const unit = (id, n) => (id === "tickets" || id === "verify" ? plural(n, "ticket") : plural(n, "dispatch", "dispatches"));
+// A stage's dispatches by the server's phase; Archive's are every archived one, from GET /archive (the overview carries
+// only the last five). Null: not loaded, or not a dispatch stage.
+const stageRows = (data, arch, stage) => (stage === "archive" ? arch?.rows || null
+  : ["draft", "plan", "review", "run", "reconcile"].includes(stage) ? data.dispatches.filter((d) => d.phase === stage) : null);
+const HEAD = { draft: "not offered to a planner yet", plan: "waiting on a plan", review: "with a plan to review",
+               run: "staged or executing", reconcile: "done or written back", archive: "archived, newest first" };
+
+// Where the page is, in the URL: ?stage=<view>, run=<run_id> (the selected dispatch), decision=<id> (what a link points
+// at), ticket=<ID> (its open sheet); the host's own parameters (profile) stay. Older links still land:
+// ?view=review&run=<run_id> is Review with that dispatch, ?ticket=<ID> alone Tickets with that sheet.
+function readLoc() {
+  const p = new URLSearchParams(location.search);
+  return { stage: IDS.has(p.get("stage")) ? p.get("stage") : p.get("view") === "review" ? "review" : "tickets",
+           run: p.get("run") || null, decision: Number(p.get("decision")) || null, ticket: p.get("ticket")?.toUpperCase() || null };
+}
+function locUrl(l) {
+  const u = new URL(location.href);
+  u.searchParams.delete("view");
+  u.searchParams.set("stage", l.stage);
+  ["run", "decision", "ticket"].forEach((k) => (l[k] ? u.searchParams.set(k, l[k]) : u.searchParams.delete(k)));
+  return u.href;
+}
+
+// The dashboard scrolls an element of its own, not the window.
+function scroller(el) {
+  for (let p = el?.parentElement; p; p = p.parentElement) if (/auto|scroll/.test(getComputedStyle(p).overflowY)) return p;
+  return document.scrollingElement;
+}
+// Puts a stage back at its scroll: at once, or as its content comes in (a ticket list fetches when it mounts). The
+// user's own scrolling wins; after 3s it gives up.
+function settle(el, y) {
+  const s = scroller(el), input = ["wheel", "touchstart", "keydown", "pointerdown"];
+  const ro = new ResizeObserver(() => { s.scrollTop = y; if (s.scrollTop >= y - 1) stop(); });
+  const t = setTimeout(stop, 3000);
+  function stop() { ro.disconnect(); clearTimeout(t); input.forEach((k) => s.removeEventListener(k, stop)); }
+  input.forEach((k) => s.addEventListener(k, stop, { passive: true }));
+  ro.observe(el);
+  return stop;
+}
 
 function DispatchRow({ d, title, needs, selected, onClick }) {
   const s = dispatchStatus(d);
   const cards = d.tickets || [];
   const repos = (() => { try { return JSON.parse(d.repos_json || "[]").map((r) => r.repo.split("/").pop()); } catch { return []; } })();
   return (
-    <div className={`fx-tr${selected ? " sel" : ""}`} onClick={onClick} role="button" tabIndex={0}
+    <div id={`fx-run-${d.run_id}`} className={`fx-tr${selected ? " sel" : ""}`} onClick={onClick} role="button" tabIndex={0}
+         aria-current={selected ? "true" : undefined}
          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { stop(e); onClick(); } }}>
       <div className="fx-tc fx-tc-st"><Tone tone={s.tone}>{s.label}</Tone></div>
       <div className="fx-tc fx-tc-ti">
@@ -421,7 +477,7 @@ function StageTable({ dispatches, titles, needsOf, selected, onSelect }) {
 
 // Run, beside the selected dispatch: the server's runtime read (dispatch_status.runtime, from recorded activity, open
 // decisions and executor deliveries). None (an older server, or not staged/executing): nothing shown, nothing guessed.
-// Its blocker or next step names any decision it is about (#id); that is answered in Needs you, never here.
+// Its blocker or next step names any decision it is about (#id); that is answered in Run's own deck, never here.
 function Runtime({ r }) {
   if (!r) return null;
   return (
@@ -435,16 +491,112 @@ function Runtime({ r }) {
   );
 }
 
-// ---- health + throughput -------------------------------------------------------------------------------------
+// Draft and Plan, from the record only: when planning was requested (the plan gate's offer, or a replan) and why the
+// planner's last plan was refused. Whether a planner is at work right now is not recorded, so it is never shown.
+function Planning({ d }) {
+  if (d.state !== "draft" || d.planned_at) return null;
+  const at = d.planning_requested_at;
+  return (
+    <div className="fx-stack-v fx-line">
+      <div className="fx-hint">{at ? `Planning requested ${ago(at)} (${localTime(at)}).` : "No offer to a planner recorded."}</div>
+      {d.planning_error ? <Fold className="fx-err" head="Last plan refused: " text={d.planning_error} /> : null}
+    </div>
+  );
+}
+
+// Archive: how the dispatch got here, from its transition log, and why it was rejected if it was.
+function Audit({ d }) {
+  return (
+    <div className="fx-stack-v fx-line">
+      {d.rejected_reason ? <Fold className="fx-hint" head="Rejected: " text={d.rejected_reason} /> : null}
+      <ol className="fx-audit">{(d.transitions || []).map((t, i) => (
+        <li key={i}>{t.from_state || "new"} → {t.to_state} · {t.actor} · {localTime(t.at)}</li>))}</ol>
+    </div>
+  );
+}
+
+// Reconcile: every Linear write not settled yet (planned, sent, failed, or held on an open decision), sweeps and
+// follow-ups too, as recorded. Nothing here applies one: a held write is its decision's (#id, a card in the deck).
+function Writebacks({ rows, onGo }) {
+  if (!rows.length) return null;
+  return (
+    <section className="fx-sec" aria-label="Unsettled Linear writes">
+      <div className="fx-k fx-line">{plural(rows.length, "Linear write")} not settled</div>
+      <ul className="fx-writes">{rows.map((w, i) => {
+        const held = w.decision === "flag";
+        return (
+          <li key={i} className={`w-${held ? "held" : w.status}`}>
+            <span className="mark">{held ? "⏸" : w.status === "failed" ? "✕" : "…"}</span>
+            {w.identifier || "?"} · Linear {w.op} · {held ? "held" : w.status} <span className="fx-hint">· {w.run_id}{w.reason ? ` · ${w.reason}` : ""}</span>
+            {w.decision_id ? <> <button className="fx-link-btn" onClick={() => onGo({ stage: "reconcile", decision: w.decision_id }, { jump: true })}>
+              #{w.decision_id} ›</button></> : null}
+          </li>
+        );
+      })}</ul>
+    </section>
+  );
+}
+
+// A stage's dispatches and, below, the selected one's own content. The selection is the user's: a refresh never swaps
+// it for another row; one that has left the stage says where it is now.
+function Dispatches({ stage, rows, byRun, titles, needsOf, sel, onGo, detail }) {
+  const cur = sel && rows.find((d) => d.run_id === sel);
+  const now = sel && !cur && byRun[sel]?.phase !== stage ? byRun[sel] : null;
+  return (<>
+    <div className="fx-k fx-line">{plural(rows.length, "dispatch", "dispatches")} {HEAD[stage]}</div>
+    {rows.length ? <StageTable dispatches={rows} titles={titles} needsOf={needsOf} selected={cur}
+                               onSelect={(run) => run !== sel && onGo({ stage, run })} /> : null}
+    {cur ? detail(cur) : sel ? (
+      <div className="fx-row between fx-moved" role="status">
+        <span className="fx-hint">{now ? `${sel} is in ${LABEL[now.phase]} now.`
+          : stage === "archive" ? `${sel} is not in the archive.` : `${sel} is not in the last refresh.`}</span>
+        {now || stage !== "archive" ? (
+          <Button size="sm" ghost onClick={() => onGo({ stage: now ? now.phase : "archive", run: sel }, { jump: true })}>
+            {now ? `Open in ${LABEL[now.phase]}` : "Look in Archive"} ›</Button>) : null}
+      </div>
+    ) : null}
+  </>);
+}
+
+// ---- health, the stages' job and sync lines, throughput ---------------------------------------------------------
 const JOB_NAME = { "factory-prune": "Verification", "[bot:planner] Plan drafts": "Planning",
                    "factory-propose": "Proposals", "factory-reconcile": "Write-back", "factory-backup": "Backup" };
+const JOB_OK = ["ok", "success", "succeeded"];
 function Health({ jobs }) {
   const name = (j) => JOB_NAME[j.name] || j.name;
-  const bad = jobs.filter((j) => j.last_status && !["ok", "success", "succeeded"].includes(j.last_status));
+  const bad = jobs.filter((j) => j.last_status && !JOB_OK.includes(j.last_status));
   return (
     <span className={`fx-health ${bad.length ? "bad" : "ok"}`} title={jobs.map((j) => `${name(j)}: ${j.last_status || "not run"}, ${epochAgo(j.last_run_at)}`).join("\n")}>
       <i />{bad.length ? bad.map((j) => `${name(j)} failed`).join(" · ") : "all jobs fine"}
     </span>
+  );
+}
+
+// A cron job's own last run, as its store records it. The job covers every ticket or draft: its status and error are
+// the job's, never one dispatch's or ticket's.
+function JobLine({ jobs, name, of }) {
+  const j = jobs.find((x) => x.name === name), head = `${JOB_NAME[name]} job (the whole job, not one ${of})`;
+  if (!j) return <div className="fx-hint fx-line">{head}: not in the cron store.</div>;
+  const bad = j.last_status && !JOB_OK.includes(j.last_status);
+  return (
+    <div className="fx-hint fx-line">
+      {head}: {j.paused_at || j.enabled === false ? "paused; " : ""}
+      {j.last_run_at ? `last ran ${epochAgo(j.last_run_at)}, ${j.last_status || "no status"}` : "not run yet"}
+      {j.schedule_display ? ` · ${j.schedule_display}` : ""}
+      {bad && j.last_error ? <Fold className="fx-err" text={j.last_error} /> : null}
+    </div>
+  );
+}
+
+// Tickets: how fresh the ledger is: when Linear was last ingested (tickets changed since the run before), the trunks.
+function Sync({ st }) {
+  const trunks = st.trunks || [], oldest = trunks.map((t) => t.fetched_at).sort()[0];
+  const linear = (st.sync || []).map((c) => `Linear ingested ${ago(c.last_run_at)}, ${plural(c.last_count, "ticket")} changed`);
+  return (
+    <div className="fx-hint fx-line">
+      {[...(linear.length ? linear : ["Linear not ingested yet"]),
+        trunks.length ? `${plural(trunks.length, "trunk")} fetched, the oldest ${ago(oldest)}` : null].filter(Boolean).join(" · ")}
+    </div>
   );
 }
 
@@ -477,29 +629,88 @@ const STAGE_COST = { captain: "Fleet captain (routing)", secondmate: "Domain lea
                      plan: "Planning", reconcile: "Write-back", chat: "Chat" };
 
 // ---- page ------------------------------------------------------------------------------------------------------
+// A tab strip: arrows, Home and End move the focus, Enter or Space opens the tab (so moving along never piles up
+// history entries), and one Tab key press reaches it: the open tab, else the first.
+function Tabs({ label, items, current, counts, onPick }) {
+  const keys = (e) => {
+    const tabs = [...e.currentTarget.querySelectorAll('[role="tab"]')], i = tabs.indexOf(document.activeElement);
+    const j = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+    if (i < 0 || j === undefined) return;
+    e.preventDefault();
+    tabs[(j + tabs.length) % tabs.length].focus();
+  };
+  const here = items.some(([id]) => id === current);
+  return (
+    <div role="tablist" aria-label={label} className="fx-tabs" onKeyDown={keys}>
+      {items.map(([id, name], k) => {
+        const on = id === current, n = counts?.[id];
+        return (
+          <button key={id} id={`fx-tab-${id}`} role="tab" aria-selected={on} aria-controls={on ? "fx-pane" : undefined}
+                  tabIndex={on || (!here && k === 0) ? 0 : -1} className={`fx-stage-tab${on ? " on" : ""}`}
+                  aria-label={n == null ? undefined : `${name}, ${unit(id, n)}`} title={n == null ? undefined : unit(id, n)}
+                  onClick={() => on || onPick(id)}>
+            {name}{n == null ? null : <span className="fx-count">{n}</span>}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// Needs you: everything waiting on a person, folded to one line; open, each line goes to its stage and the thing itself.
+function NeedsYou({ items, answers, onGo }) {
+  const ref = useRef(null);
+  const n = items.length;
+  const pick = (t) => { ref.current.open = false; onGo(t); };
+  return (
+    <details className="fx-needs-menu" ref={ref}>
+      <summary className={`fx-hello${n ? " you" : ""}`}>
+        {n ? `${plural(n, "thing")} need${n === 1 ? "s" : ""} you`
+          : answers ? `${plural(answers, "ticket")} need${answers === 1 ? "s" : ""} an answer in Linear` : "All clear"}
+      </summary>
+      <ul className="fx-needs-list">
+        {items.map((t) => (
+          <li key={t.key}><button type="button" className="fx-need" onClick={() => pick(t)}>
+            <span className="fx-row"><Tone tone={t.tone}>{t.kind}</Tone><span className="fx-hint">{LABEL[t.stage]} ›</span></span>
+            <span>{clip(t.text, 140)}</span>
+          </button></li>
+        ))}
+        {answers ? (
+          <li><button type="button" className="fx-need" onClick={() => pick({ stage: "verify", filter: "answer" })}>
+            <span className="fx-row"><Tone tone="amber">Answer in Linear</Tone><span className="fx-hint">Verify ›</span></span>
+            <span>{plural(answers, "ticket")} waiting on an answer in Linear</span>
+          </button></li>
+        ) : null}
+        {n || answers ? null : <li className="fx-hint">Nothing waits on you. A new question shows up here and in its stage.</li>}
+      </ul>
+    </details>
+  );
+}
+
 function FactoryPage() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loadedAt, setLoadedAt] = useState(null);
   const [live, setLive] = useState(false);
-  const [sel, setSel] = useState(null);
-  // ?ticket=<IDENT> opens the Tickets tab with that ticket's sheet (tickets.jsx reads the id)
-  const [tab, setTab] = useState(() => new URLSearchParams(location.search).get("ticket") ? "tickets" : null);  // null = pick from what's going on
   const [toast, setToast] = useState(null);
-  const [showTp, setShowTp] = useState(false);
-  // ?view=review&run=<run_id> opens that dispatch's plan (the configurator) in place of the page, e.g. from a Hermex push
-  const [review, setReview] = useState(() => { const p = new URLSearchParams(location.search); return p.get("view") === "review" ? p.get("run") : null; });
-  const top = useRef(null);
-  useEffect(() => { top.current?.scrollIntoView(); }, [review]);
+  const [loc, setLoc] = useState(readLoc);  // where the page is: stage, its selected dispatch, a target decision, open ticket
+  const [nav, setNav] = useState(0);        // counts deliberate moves and Back/Forward; a refresh never changes it
+  // tickets.jsx's views, one per ticket workspace, kept here so each outlives leaving it (a pending draft included)
+  const [views, setViews] = useState(() => {
+    const l = readLoc();
+    return Object.fromEntries(TICKET_MODES.map((m) => [m, { ...BLANK, open: m === l.stage ? l.ticket : null }]));
+  });
+  // one stable React-style setter per workspace (a next view or an updater): a late reply patches its own mode's view
+  const setView = useMemo(() => Object.fromEntries(TICKET_MODES.map((m) => [m, (next) =>
+    setViews((vs) => ({ ...vs, [m]: typeof next === "function" ? next(vs[m]) : next }))])), []);
+  const [arch, setArch] = useState({ rows: null, err: null });  // GET /archive, kept while elsewhere
+  const root = useRef(null);
   const strip = useRef(null);
-  const panel = useRef(null);  // the stage section, after the deck: switchTab brings it into view
-  useEffect(() => {  // the active stage tab fully in view (nearest edge), scrolling the strip only, never the page
-    const s = strip.current, t = s?.querySelector(".on");
-    if (!t) return;
-    const a = s.getBoundingClientRect(), b = t.getBoundingClientRect();
-    if (b.left < a.left) s.scrollLeft -= a.left - b.left + 4;
-    else if (b.right > a.right) s.scrollLeft += b.right - a.right + 4;
-  }, [tab, review, !data]);
+  const mem = useRef({});                 // per stage, while elsewhere: its selected dispatch and scroll
+  const after = useRef({ focus: true });  // what the next navigation's render does: focus its target, restore a scroll
+  const canon = useRef(false);
+  const latest = useRef(null);            // this render's state, for handlers that run later (Back, a late reply)
+  latest.current = { loc, views, data, arch };
   const [, tick] = useState(0);
   const inflight = useRef(false);
   const again = useRef(false);
@@ -526,83 +737,174 @@ function FactoryPage() {
     (data?.status?.written_back || []).forEach((w) => { m[w.identifier] ||= w.title; });
     return m;
   }, [data]);
+  useEffect(() => {  // Back and Forward: that entry's stage, selection and scroll; a ticket view keeps its live busy and err
+    const pop = () => {
+      const cur = latest.current.loc;
+      mem.current[cur.stage] = { run: cur.run, scroll: root.current ? scroller(root.current).scrollTop : 0 };
+      const l = readLoc();
+      if (TICKET_MODES.includes(l.stage)) setViews((vs) => ({ ...vs, [l.stage]: { ...vs[l.stage], open: l.ticket } }));
+      setLoc(l);
+      setNav((n) => n + 1);
+      after.current = { scroll: history.state?.fx?.scroll ?? mem.current[l.stage]?.scroll ?? 0 };
+    };
+    addEventListener("popstate", pop);
+    return () => removeEventListener("popstate", pop);
+  }, []);
+  useEffect(() => {  // first overview: a stage with no dispatch named pins its first row; an old link gets the new form
+    if (!data || canon.current) return;
+    canon.current = true;
+    const l = latest.current.loc, first = l.run || l.decision ? null : stageRows(data, null, l.stage)?.[0];
+    const next = first ? { ...l, run: first.run_id } : l;
+    history.replaceState(history.state, "", locUrl(next));
+    if (first) setLoc(next);
+  }, [data]);
+  const archived = data?.lifecycle?.counts?.archive;
+  useEffect(() => {  // Archive: fetched on entering it, and again when a dispatch gets archived while it is open
+    if (loc.stage !== "archive" || archived == null) return;
+    let current = true;  // a reply after leaving, or to an older fetch, is dropped
+    SDK.fetchJSON(`${API}/archive`).then((rows) => current && setArch({ rows, err: null }),
+                                          (e) => current && setArch((a) => ({ ...a, err: errText(e) })));
+    return () => { current = false; };
+  }, [loc.stage === "archive", archived]);
+  React.useLayoutEffect(() => {  // after a navigation, never a refresh: focus what it points at, or restore the scroll
+    const a = after.current;
+    if (!a || !data) return;
+    after.current = null;
+    if (a.focus && a.scroll != null) scroller(root.current).scrollTop = a.scroll;
+    const el = a.focus && ((loc.decision && document.getElementById(`fx-d-${loc.decision}`))
+      || (loc.run && document.getElementById(`fx-run-${loc.run}`)));
+    if (el) return void el.focus();
+    if (a.scroll != null) return settle(root.current, a.scroll);
+  }, [nav, !data]);
+  useEffect(() => {  // the open tab fully in view (nearest edge), scrolling the strip only, never the page
+    const s = strip.current, t = s?.querySelector(".on");
+    if (!t) return;
+    const a = s.getBoundingClientRect(), b = t.getBoundingClientRect();
+    if (b.left < a.left) s.scrollLeft -= a.left - b.left + 4;
+    else if (b.right > a.right) s.scrollLeft += b.right - a.right + 4;
+  }, [loc.stage, !data]);
 
   if (!data) return <div className="fx">{error ? <div className="fx-err">{error}</div> : <div className="fx-hint">Loading…</div>}</div>;
 
-  // The deck holds what needs a person: pushed (work waits) and digest ones; the factory takes the auto ones itself.
-  // A planner question sorts with its dispatch's review, just ahead of it: answer the plan, then approve it.
-  const open = data.status.decisions;
-  const reviewOf = Object.fromEntries(open.filter((x) => x.kind === "review").map((x) => [x.run_id, x]));
-  const lead = (x) => (x.kind === "plan" && reviewOf[x.run_id]) || x;
-  const decisions = open.filter((x) => x.tier !== "auto").sort((p, q) => {
-    const a = lead(p), b = lead(q);
-    return (b.tier === "now") - (a.tier === "now")
-      || (a.deadline ? Date.parse(a.deadline) : Infinity) - (b.deadline ? Date.parse(b.deadline) : Infinity)
-      || KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind) || a.id - b.id
-      || (p.kind === "review") - (q.kind === "review") || p.id - q.id;
-  });
-  const byRun = Object.fromEntries(data.dispatches.map((d) => [d.run_id, d]));
-  const answers = data.ticket_counts?.answer || 0;
-  const deliveries = data.status.executor_deliveries || [];
-  const needs = decisions.length + deliveries.length;
-  const needsOf = (runId) => open.filter((x) => x.run_id === runId && x.tier !== "auto").length;
-  // A draft's plan questions and review are one deck card that opens the configurator; light ones (★ starts or
-  // stops nothing, writes nothing) go to the Quick lane, ★ on all in one tap.
-  const light = (x) => x.tier !== "now" && !["plan", "review", "ask"].includes(x.kind) && !x.options.find((o) => o.id === x.recommended)?.weighty;
-  const grouped = new Set();
-  const deck = decisions.filter((x) => !light(x)).flatMap((x) => {
-    const d = byRun[x.run_id];
-    if (!((x.kind === "plan" || x.kind === "review") && d?.state === "draft")) return [x];
-    if (grouped.has(x.run_id)) return [];
-    grouped.add(x.run_id);
-    const n = open.filter((y) => y.kind === "plan" && y.run_id === x.run_id).length;
-    return [{ ...(reviewOf[x.run_id] || x), kind: "review", group: true, options: [], result: (d.tree || []).find((t) => t.id === "root")?.result,
-              question: `Review ${(d.tickets || []).map((c) => c.identifier).join(", ")}${n ? ` · ${plural(n, "question")}` : ""}` }];
-  });
-  const tix = Object.fromEntries(data.tickets.map((t) => [t.identifier, t]));
-  const rows = { tickets: [], draft: [], run: [], learn: [] };
-  data.dispatches.forEach((d) => rows[stageOf(d)].push(d));
-  const count = (stage) => stage === "tickets" ? (data.ticket_counts?.ready || 0) + answers : rows[stage].length;
-  // Default stage: what needs you, else where the dispatches are. A dispatch belongs to one stage for its whole
-  // life there, so a row only ever moves forward.
-  const active = tab && STAGES.some(([id]) => id === tab) ? tab
-    : (decisions[0] && byRun[decisions[0].run_id] ? stageOf(byRun[decisions[0].run_id]) : null)
-      || (rows.draft.length ? "draft" : rows.run.length ? "run" : "tickets");
-  const list = rows[active];
-  const current = (byRun[sel] && list.some((d) => d.run_id === sel) ? byRun[sel] : list[0]) || null;
-  const context = (x) => {
-    const base = byRun[x.run_id] ? clip(dispatchTitle(byRun[x.run_id], titles), 60) : x.identifier ? `${x.identifier} ${clip(x.title, 50)}` : null;
-    if (x.kind === "plan" || x.group) return x.kind === "plan" ? `${base} · step ${x.node_id}` : base;
-    const qs = x.kind === "review" ? open.filter((y) => y.kind === "plan" && y.run_id === x.run_id).length : 0;
-    return qs ? `${base} · ${plural(qs, "planner question")} still open, ★ on approval` : base;
+  // Every deliberate move (a tab, a row, a Needs you line, a link, a ticket sheet) is one history entry, so Back returns
+  // to it. Another stage comes back at its own scroll, or at the thing a jump points at; within a stage the page stays
+  // put. Entered with nothing selected, a live stage pins its first dispatch then, never on a later refresh (Archive's
+  // history is the user's to pick from).
+  const go = (to, { jump = false } = {}) => {
+    if (!IDS.has(to.stage)) return;  // a stage this page doesn't have: stay put
+    const { loc: cur, views: vs, data: dt, arch: ar } = latest.current;
+    const y = root.current ? scroller(root.current).scrollTop : 0, same = to.stage === cur.stage;
+    mem.current[cur.stage] = { run: cur.run, scroll: y };
+    const first = to.stage !== "archive" && stageRows(dt, ar, to.stage)?.[0];
+    const next = {
+      stage: to.stage,
+      run: to.run !== undefined ? to.run : same ? cur.run : mem.current[to.stage]?.run || first?.run_id || null,
+      decision: to.decision || null,
+      ticket: to.ticket !== undefined ? to.ticket?.toUpperCase() || null : vs[to.stage]?.open || null,
+    };
+    const url = locUrl(next);
+    if (url !== location.href) {  // this entry keeps its scroll for Back; the router's own state rides along
+      history.replaceState({ ...history.state, fx: { scroll: y } }, "", location.href);
+      history.pushState({ ...history.state, fx: null }, "", url);
+    }
+    if (to.ticket !== undefined && vs[to.stage]) setView[to.stage]((v) => ({ ...v, open: next.ticket }));
+    setLoc(next);
+    setNav((n) => n + 1);
+    after.current = jump ? { focus: true, scroll: same ? null : 0 } : same ? null : { scroll: mem.current[to.stage]?.scroll || 0 };
   };
-  const done4u = data.status.done_for_you || [];
-  const done = (r, d, msg) => {
+  const jumpTo = (t) => {  // a Needs you line; the Linear answers line opens Verify on that filter
+    if (t.filter) setView[t.stage]((v) => ({ ...v, filter: t.filter, q: "" }));
+    go(t, { jump: true });
+  };
+  const done = (r, d, msg) => {  // a toast and a refresh; where the page is stays the user's
     const o = d && d.options.find((x) => x.id === r?.chosen);
     setToast({ type: r?.after_error || r?.handoff_error ? "error" : "success",
                message: msg || (r?.after_error ? `Recorded, but: ${r.after_error}` : r?.handoff_error ? `Approved; starting is retried: ${r.handoff_error}` : `${o?.label || "Done"} ✓`) });
     load();
   };
-  const openReview = (run) => {  // the URL follows, so a reload or a shared link lands on the same plan
-    setReview(run);
-    const u = new URL(location.href);
-    if (run) { u.searchParams.set("view", "review"); u.searchParams.set("run", run); } else { u.searchParams.delete("view"); u.searchParams.delete("run"); }
-    history.replaceState(history.state, "", u);
+
+  // Decisions waiting on a person (the factory takes the auto ones itself), work waiting on you first, then the nearest
+  // deadline. Each lives in the stage the server's `phase` names, and only there.
+  const open = data.status.decisions;
+  const waiting = open.filter((x) => x.tier !== "auto").sort((p, q) => (q.tier === "now") - (p.tier === "now")
+    || (p.deadline ? Date.parse(p.deadline) : Infinity) - (q.deadline ? Date.parse(q.deadline) : Infinity)
+    || KIND_ORDER.indexOf(p.kind) - KIND_ORDER.indexOf(q.kind) || p.id - q.id);
+  const byRun = Object.fromEntries(data.dispatches.map((d) => [d.run_id, d]));
+  const reviewOf = Object.fromEntries(open.filter((x) => x.kind === "review").map((x) => [x.run_id, x]));
+  const deliveries = data.status.executor_deliveries || [];
+  const tix = Object.fromEntries(data.tickets.map((t) => [t.identifier, t]));
+  const done4u = data.status.done_for_you || [];
+  const needsOf = (runId) => waiting.filter((x) => x.run_id === runId).length;
+  // Needs you, one line per thing, each to its stage and the thing itself: an executor answer not delivered (Run), a
+  // draft's planner questions with its review (its plan in Review, at the first open question), any other decision (its
+  // card in its stage's deck, with its dispatch selected when that dispatch is in the same stage).
+  const grouped = new Set();
+  const targets = [
+    ...deliveries.map((x) => ({ key: `e${x.decision_id}`, stage: "run", run: x.run_id, decision: x.decision_id, text: x.question,
+                                tone: x.state === "sending" ? "amber" : "red", kind: x.state === "sending" ? "Answer sending" : "Answer not delivered" })),
+    ...waiting.flatMap((x) => {
+      if (x.phase !== "review") {
+        return [{ key: `d${x.id}`, stage: x.phase, run: byRun[x.run_id]?.phase === x.phase ? x.run_id : undefined, decision: x.id,
+                  tone: x.tier === "now" || x.kind === "writeback" || x.kind === "blocked" ? "red" : "amber", kind: KIND[x.kind], text: x.question }];
+      }
+      if (grouped.has(x.run_id)) return [];
+      grouped.add(x.run_id);
+      const qs = waiting.filter((y) => y.kind === "plan" && y.run_id === x.run_id).sort((a, b) => a.id - b.id);
+      const d = byRun[x.run_id];
+      return [{ key: `r${x.run_id}`, stage: "review", run: x.run_id, decision: (qs[0] || reviewOf[x.run_id] || x).id, tone: "amber",
+                kind: "Review", text: `${d ? dispatchTitle(d, titles) : x.run_id}${qs.length ? ` · ${plural(qs.length, "question")}` : ""}` }];
+    }),
+  ];
+  const context = (x) => (byRun[x.run_id] ? clip(dispatchTitle(byRun[x.run_id], titles), 60) : x.identifier ? `${x.identifier} ${clip(x.title, 50)}` : null);
+  const openCtx = (x) => (byRun[x.run_id] ? go({ stage: byRun[x.run_id].phase, run: x.run_id }, { jump: true })
+    : x.identifier ? go({ stage: "tickets", ticket: x.identifier }, { jump: true }) : null);
+  // A stage's own decisions: the deck, light ones (★ starts, stops and writes nothing) in the Quick lane, ★ on all in one
+  // tap. The one a link points at is always a card, brought to the front.
+  const deckOf = (stage) => {
+    const xs = waiting.filter((x) => x.phase === stage);
+    const light = (x) => x.id !== loc.decision && x.tier !== "now" && !["plan", "review", "ask"].includes(x.kind)
+      && !x.options.find((o) => o.id === x.recommended)?.weighty;
+    const cards = xs.filter((x) => !light(x));
+    return <>
+      {cards.length ? <Deck decisions={cards} context={context} onDone={done} onOpen={openCtx}
+                            front={loc.decision ? { id: loc.decision, nav } : null} /> : null}
+      <Quick items={xs.filter(light)} context={context} onDone={done} />
+    </>;
   };
-  const openNode = (x) => {
-    const run = byRun[x.run_id];
-    if (x.group) return openReview(x.run_id);
-    if (!run) return;
-    setTab(stageOf(run));
-    setSel(x.run_id);
-  };
-  // A tab click brings its stage into view: it sits after the deck, often below a phone's fold. Next frame, once React
-  // has rendered the new stage, so its own height counts; a refresh never scrolls.
-  const switchTab = (stage) => { setTab(stage); setSel(null); requestAnimationFrame(() => panel.current?.scrollIntoView()); };
-  const EMPTY = {
-    draft: "No draft right now. The factory proposes one when verified tickets accumulate, or draft your own in Tickets.",
-    run: "Nothing staged or executing right now.",
-    learn: "Nothing learned yet. Dispatches land here after they run and write back to Linear.",
+  const archRun = Object.fromEntries((arch.rows || []).map((d) => [d.run_id, d]));
+  const table = (stage, detail) => (
+    <Dispatches stage={stage} rows={stageRows(data, arch, stage) || []} byRun={{ ...byRun, ...archRun }} titles={titles}
+                needsOf={needsOf} sel={loc.run} onGo={go} detail={detail} />
+  );
+  const plan = (d) => <Plan key={d.run_id} d={d} tickets={tix} onDone={done} />;
+  const planning = (d) => <><Planning d={d} />{plan(d)}</>;
+  const ticketsOf = (m) => <TicketsTab data={data} mode={m} active view={views[m]} onViewChange={setView[m]} onDone={done} onNavigate={go} />;
+  const PANES = {
+    tickets: () => <><Sync st={data.status} />{ticketsOf("tickets")}</>,
+    verify: () => <><JobLine jobs={data.jobs} name="factory-prune" of="ticket" />{ticketsOf("verify")}</>,
+    draft: () => <>{deckOf("draft")}<section className="fx-sec">{table("draft", planning)}</section>{ticketsOf("draft")}</>,
+    plan: () => <><JobLine jobs={data.jobs} name="[bot:planner] Plan drafts" of="draft" />{table("plan", planning)}</>,
+    review: () => table("review", plan),
+    run: () => <>{deckOf("run")}<ExecutorDeliveries items={deliveries} onDone={done} />
+      {table("run", (d) => <><Runtime r={d.runtime} />{plan(d)}</>)}</>,
+    reconcile: () => <><JobLine jobs={data.jobs} name="factory-reconcile" of="dispatch" />{deckOf("reconcile")}
+      <Writebacks rows={data.writebacks || []} onGo={go} />{table("reconcile", plan)}</>,
+    archive: () => (arch.rows ? <>
+      {arch.err ? <div className="fx-err" role="alert">Refreshing the archive failed: {arch.err}. Showing it as last loaded.</div> : null}
+      {table("archive", (d) => <><Audit d={d} />{plan(d)}</>)}
+    </> : arch.err ? <div className="fx-err" role="alert">The archive did not load: {arch.err}</div> : <div className="fx-hint">Loading the archive…</div>),
+    learn: () => <>{deckOf("learn")}
+      <details className="fx-sec fx-fold" open>
+        <summary>Learnings <span className="fx-count">{(data.learnings || []).length}</span></summary>
+        <Learnings items={data.learnings || []} />
+      </details>
+      {done4u.length ? (
+        <details className="fx-sec fx-fold">
+          <summary>Done for you <span className="fx-count">{done4u.length}</span> <span className="fx-hint">this week</span></summary>
+          <DoneForYou items={done4u} />
+        </details>
+      ) : null}</>,
+    costs: () => <Throughput />,
   };
 
   const why = { asks: data.asks || {}, reviews: reviewOf };  // why.jsx threads, in the plan and on every decision
@@ -612,69 +914,21 @@ function FactoryPage() {
     </button>
     {error ? <div className="fx-err" role="alert">Last refresh failed: {error}. Showing last loaded decisions; refresh before acting.</div> : null}
   </>;
-  if (review) {
-    return (
-      <WhyContext.Provider value={why}>
-      <div className="fx" ref={top}>
-        <Toast toast={toast} />
-        <header className="fx-head">{connection}</header>
-        <ExecutorDeliveries items={deliveries.filter((item) => item.run_id === review)} onDone={done} />
-        {byRun[review] ? <Plan key={review} d={byRun[review]} tickets={tix} onDone={done} onClose={() => openReview(null)} /> : (
-          <div className="fx-row between"><span className="fx-empty">Dispatch {review} is not live any more.</span>
-            <button className="fx-x" onClick={() => openReview(null)} aria-label="Close">✕</button></div>)}
-      </div>
-      </WhyContext.Provider>
-    );
-  }
   return (
     <WhyContext.Provider value={why}>
-    <div className="fx" ref={top}>
+    <div className="fx" ref={root}>
       <Toast toast={toast} />
       <header className="fx-head">
-        <div className={`fx-hello${needs ? " you" : ""}`}>{needs ? `${plural(needs, "thing")} need${needs === 1 ? "s" : ""} you` : "All clear"}</div>
-        <div className="fx-row fx-hint">
-          <Health jobs={data.jobs} /><span>·</span>
-          {connection}
-          {answers ? <><span>·</span><span>{plural(answers, "ticket")} need answers in Linear</span></> : null}
-        </div>
+        <NeedsYou items={targets} answers={data.ticket_counts?.answer || 0} onGo={jumpTo} />
+        <div className="fx-row fx-hint"><Health jobs={data.jobs} /><span>·</span>{connection}</div>
       </header>
-      <div className="fx-stage-tabs" role="tablist" aria-label="Factory lifecycle" ref={strip}>
-        {STAGES.map(([id, label]) => (
-          <button key={id} role="tab" aria-selected={active === id} className={`fx-stage-tab${active === id ? " on" : ""}`}
-                  onClick={() => switchTab(id)}>
-            {label} <span className="fx-count">{count(id)}</span>
-          </button>
-        ))}
-      </div>
-      <ExecutorDeliveries items={deliveries} onDone={done} />
-
-      <Deck decisions={deck} context={context} onDone={(r, d) => done(r, d)} onOpen={openNode} />
-      <Quick items={decisions.filter(light)} context={context} onDone={done} />
-
-      <section className="fx-sec" ref={panel}>
-        <h2>{STAGES.find(([id]) => id === active)[1]}</h2>{/* the tabs sit above the deck: name the stage shown here */}
-        {active === "tickets" ? <TicketsTab data={data} onDone={done} /> : list.length ? (<>
-          <StageTable dispatches={list} titles={titles} needsOf={needsOf} selected={current} onSelect={setSel} />
-          {current ? <><Runtime r={current.runtime} /><Plan key={current.run_id} d={current} tickets={tix} onDone={done} /></> : null}
-        </>) : <div className="fx-empty">{EMPTY[active]}</div>}
+      <nav className="fx-stage-tabs" ref={strip} aria-label="Factory views">
+        <Tabs label="Lifecycle stages" items={STAGES} current={loc.stage} counts={data.lifecycle?.counts} onPick={(id) => go({ stage: id })} />
+        <Tabs label="Supporting views" items={SIDE} current={loc.stage} onPick={(id) => go({ stage: id })} />
+      </nav>
+      <section key={loc.stage} id="fx-pane" className="fx-pane" role="tabpanel" aria-labelledby={`fx-tab-${loc.stage}`} tabIndex={0}>
+        {PANES[loc.stage]()}
       </section>
-
-      {active === "learn" ? (<>
-        <details className="fx-sec fx-fold" open>
-          <summary>Learnings <span className="fx-count">{(data.learnings || []).length}</span></summary>
-          <Learnings items={data.learnings || []} />
-        </details>
-        <details className="fx-sec fx-fold" onToggle={(e) => setShowTp(e.currentTarget.open)}>
-          <summary>Throughput</summary>
-          {showTp ? <Throughput /> : null}
-        </details>
-        {done4u.length ? (
-          <details className="fx-sec fx-fold">
-            <summary>Done for you <span className="fx-count">{done4u.length}</span> <span className="fx-hint">this week</span></summary>
-            <DoneForYou items={done4u} />
-          </details>
-        ) : null}
-      </>) : null}
     </div>
     </WhyContext.Provider>
   );

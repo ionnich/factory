@@ -1,9 +1,10 @@
-// The plan as one outline, phone first (the "configurator"; the Draft tab's view of a draft): a sticky result header,
+// The plan as one outline, phone first (the "configurator"; Review's view of a planned draft): a sticky result header,
 // then ticket → result → numbered steps, each plan question a switch inside the step it is about, with its "why?"
 // thread (why.jsx). Flipping a switch changes nothing on the server: the picked option's `changes` are applied to the
 // outline and its `result` rewrites the header. "Lock in path" answers the open questions (POST /decisions/{id}, one by
-// one), then the review decision shows. While draft, `+ note` on the root, each ticket and each step. Read-only in Run
-// (the chosen path, steps ✓ from card comments) and Learn (predicted next to landed; untaken paths flip as ghosts).
+// one), then the review decision shows. While draft (Draft, Plan, Review), `+ note` on the root, each ticket and each
+// step. Read-only in Run (the chosen path, steps ✓ from card comments), Reconcile and Archive (predicted next to landed;
+// untaken paths flip as ghosts). Every question and the review carry id fx-d-<id>, so a link can focus them.
 import { API, ActErr, CARD, CARD_TONE, DecisionBody, Ext, Fold, NoteBox, Notes, Option, Silence, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose } from "./index.jsx";
 import { Jev, REL, jevFocus } from "./jev.jsx";
 import { Railway } from "./railway.jsx";
@@ -89,7 +90,8 @@ export function doneSteps(events) {
   return done;
 }
 
-const stageMode = (d) => d.state === "draft" ? "draft" : ["staged", "executing", "done"].includes(d.state) ? "run" : "learn";
+// The server's phase: Draft, Plan and Review configure; Run shows the chosen path; Reconcile and Archive what landed.
+const stageMode = (d) => (["draft", "plan", "review"].includes(d.phase) ? "draft" : d.phase === "run" ? "run" : "learn");
 
 // ---- one question: a switch ------------------------------------------------------------------------------------
 function Switch({ q, pick, onPick, locked, diff }) {
@@ -115,7 +117,7 @@ function Switch({ q, pick, onPick, locked, diff }) {
     </>);
   };
   return (
-    <div className={`fx-sw${diff ? " diff" : ""}${locked ? " locked" : ""}`} onClick={stop}>
+    <div id={`fx-d-${q.id}`} tabIndex={-1} className={`fx-sw${diff ? " diff" : ""}${locked ? " locked" : ""}`} onClick={stop}>
       <span className="fx-k">{q.open ? "Planner asks" : "Answered"} <span className="fx-id">#{q.id}</span></span>
       <div className="fx-sw-q">{q.question}</div>
       {q.now ? <div className="fx-hint">Today: {q.now}</div> : null}
@@ -255,17 +257,18 @@ function TicketSheet({ d, tickets, onClose }) {
 }
 
 function Review({ d, c }) {
-  return (<>
+  return (<div id={`fx-d-${d.id}`} tabIndex={-1}>
     <div className="fx-q small">{d.question}</div>
     <DecisionBody d={d} busy={c.busy} err={c.err} compact hideHold onChoose={(o, n) => c.choose(o, n).catch(() => {})} />
-  </>);
+  </div>);
 }
 
 // ---- the whole thing: result header + outline (+ railway on desktop) + bottom bar in review ---------------------
-export function Plan({ d: current, tickets = {}, onDone, onClose }) {
+export function Plan({ d: current, tickets = {}, onDone }) {
   const [snapshot, setSnapshot] = useState(null);
   const d = snapshot || current;
   const mode = stageMode(d);
+  const configuring = mode === "draft" && !!d.planned_at;  // a plan to configure: the sticky result and the bottom bar
   const qs = useMemo(() => planQs(d), [d]);
   const [flips, setFlips] = useState({});
   const [hold, setHold] = useState(false);
@@ -309,22 +312,19 @@ export function Plan({ d: current, tickets = {}, onDone, onClose }) {
     <div className={`fx-cfg${qs.length ? " map" : ""}`}>
       {qs.length ? <aside className="fx-cfg-map"><Railway d={d} qs={qs} pick={pick} onPick={onPick} free={editable} /></aside> : null}
       <div className="fx-cfg-main">
-        <header className={`fx-res${mode === "draft" ? " sticky" : ""}`}>
-          <div className="fx-row between">
-            <span className="fx-k">{mode === "draft" ? "Result" : mode === "run" ? "Chosen path" : ghost ? "Predicted · ghost path" : "Predicted"}</span>
-            {onClose ? <button className="fx-x" onClick={onClose} aria-label="Close">✕</button> : null}
-          </div>
+        <header className={`fx-res${configuring ? " sticky" : ""}`}>
+          <span className="fx-k">{mode === "draft" ? "Result" : mode === "run" ? "Chosen path" : ghost ? "Predicted · ghost path" : "Predicted"}</span>
           <div className={mode === "learn" ? "fx-res-cols" : undefined}>
             {res.length ? <ul className="fx-res-lines">{res.map((r, i) => (
               <li key={i} className={[hold && r.q && cmp.qs.has(r.q) && "diff", r.q && focusQs[r.q] === "result" && "jev-focus"].filter(Boolean).join(" ") || undefined}>{r.text}{r.q ? <span className="fx-id">#{r.q}</span> : null}</li>))}</ul>
-              : <div className="fx-hint">{d.review === "planning" ? "The planner is writing the plan." : "No predicted result in this plan."}</div>}
+              : <div className="fx-hint">{d.planned_at ? "No predicted result in this plan." : mode === "draft" ? "No plan yet." : "No plan was written."}</div>}
             {mode === "learn" ? <Landed d={d} /> : null}
           </div>
           {qs.length ? <button className={`fx-crumb${hold ? " on" : ""}`} title="Press and hold: every difference from ★"
                                onPointerDown={holdOn} onPointerUp={holdOff} onPointerLeave={holdOff} onPointerCancel={holdOff}
                                onContextMenu={(e) => e.preventDefault()}>{breadcrumb(qs, pick)}</button> : null}
           {qs.length && mode !== "run" ? <div className="fx-hint">{cmp.same ? "★ path" : `vs ★: ${vs}`}</div> : null}
-          {mode === "draft" ? <div className="fx-stack-v">
+          {configuring ? <div className="fx-stack-v">
             {d.review === "held" ? <div className="fx-hint">Held: no automatic start. Your plan choices are not submitted by Hold.</div> : review ? <Silence d={review} /> : null}
             {holdOption ? <Option key={review.id} d={review} o={holdOption} busy={busy || holdChoice.busy}
                                   onChoose={(o, n) => holdChoice.choose(o, n).catch(() => {})} /> : null}
@@ -332,7 +332,7 @@ export function Plan({ d: current, tickets = {}, onDone, onClose }) {
           </div> : null}
         </header>
         <Outline d={d} qs={qs} pick={pick} free={editable} onPick={onPick} cmp={hold ? cmp : null} tickets={tickets} onDone={onDone} />
-        {mode === "draft" ? (
+        {configuring ? (
           <div className="fx-cfg-bar">
             {open.length ? (
               <div className="fx-row">{ticketBtn}<span className="fx-grow" />
