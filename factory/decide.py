@@ -215,6 +215,8 @@ def _row(conn, r) -> dict:
                     for o in json.loads(d.pop("options_json"))]
     d["detail"] = json.loads(d.pop("detail_json"))
     d["open"] = d["chosen"] is None and d["void_reason"] is None
+    if d["open"] and d["kind"] == "ask":
+        d["tier"] = "now"  # Legacy earned-auto questions still need a visible, explicit human answer.
     if d["kind"] == "plan":  # the configurator's fields (absent on plans written before v13)
         x = d["detail"]
         d.update(key=x.get("key"), now=x.get("now"), evidence=x.get("evidence", []), depends_on=x.get("depends_on"))

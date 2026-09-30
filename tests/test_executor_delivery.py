@@ -135,6 +135,10 @@ class ExecutorDelivery(unittest.TestCase):
         self.assertEqual(question["tier"], "now")
         self.assertIsNone(question["deadline"])
         self.assertTrue(all(option["weighty"] for option in question["options"]))
+        with mock.patch.object(decide, "_tier", return_value="auto"):  # Stored before executor confirmation.
+            legacy = self.question()
+        self.assertEqual(decide.one(self.c, legacy)["tier"], "now")
+        self.assertEqual(self.c.execute("SELECT tier FROM decision WHERE id=?", (legacy,)).fetchone()[0], "auto")
 
     def test_v16_answer_is_unknown_not_silently_replayed(self):
         did = self.question()
