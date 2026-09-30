@@ -26,8 +26,14 @@ One-time, by hand:
   `hermes -p planner config set model.default deepseek-v4-pro`, `model.provider deepseek`, `plugins.enabled '[]'`,
   and in its `profile.yaml` `ui_meta: {hermes-bots: {title: Planner}}` (makes this a Bot Mode install, which gives
   every Bot Chat `message_agent`). Restart the gateway so it serves the profile, run `./install.sh` again.
-- factory-fleet: see `fleet/`. Primary runs in herdr workspace `factory`. `handoff` starts it there with
-  `fleet/launch-factory-primary.sh` when the workspace or agent is missing (reboot, crash, closed pane).
+- factory-fleet: see `fleet/`. Each `[[context]]` in `factory.toml` names its `route`: the factory-fleet home
+  (domain lead, `fx-*`) that runs its dispatches, per Domain where one repo has two owners; a ticket with no
+  route is never drafted. At approve the dispatch records the one owner of all its tickets (`dispatch.route`,
+  also `## Runs in` in dispatch.md). `handoff` sends it straight to that lead's live omp pane
+  (`factory-primary/state/<id>.meta`), which runs the `fleet/secondmate/dispatch-intake` skill and reports
+  through `factory card` / `decide ask` itself. The captain (primary, herdr workspace `factory`, started with
+  `fleet/launch-factory-primary.sh` when missing) gets only dispatches with no single owner or whose lead has no
+  live pane: it spawns or wakes the lead and routes as before.
 
 ## Use
 
@@ -95,7 +101,8 @@ One-time, by hand:
 - A dispatch is born a draft and leaves review only approved (`approved_by` set) or rejected with a reason;
   plan steps and notes are writable only while draft (triggers). Once staged it is immutable (`chflags uchg` +
   sha256); at most one executes.
-- `execute` only from a pane in herdr workspace `factory`; `handoff` resets the executor session (`/new`) first.
+- `execute` only from the dispatch's lead pane or a pane in herdr workspace `factory`; `handoff` resets that
+  session (`/new`) first, and refuses while the lead still has crews or decisions open.
 - Card `done` needs a merged PR in the ticket's repo with green checks.
 - Only `reconcile` writes Linear. State changes need an unassigned-or-lead ticket (and, for verdicts, an unchanged
   `updatedAt`); otherwise comment + held write. The reconcile agent may only reword prose or downgrade apply ->

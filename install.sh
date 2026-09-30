@@ -74,6 +74,14 @@ if [ -d "$fp" ]; then
   cp "$here/fleet/factory-primary/omp-config.yml" "$fp/.omp/config.yml"
 fi
 
+# factory-fleet domain leads: the dispatch-intake skill for dispatches the factory hands them directly (context
+# `route` in factory.toml); their charters say so (data/charter.md, "Factory-fleet contract").
+for home in "$HOME"/.local/share/factory-fleet/homes/fx-*/; do
+  [ -f "$home/.fm-secondmate-home" ] || continue
+  mkdir -p "$home/.omp/skills" && rm -rf "$home/.omp/skills/dispatch-intake"
+  cp -R "$here/fleet/secondmate/dispatch-intake" "$home/.omp/skills/dispatch-intake"
+done
+
 boards="$(hermes kanban boards list 2>/dev/null || true)"
 grep -q '^ *factory ' <<<"$boards" \
   || hermes kanban boards create factory --name "Software factory" --description "Dispatch cards; factory.db is authoritative"

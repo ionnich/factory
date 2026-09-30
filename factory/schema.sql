@@ -106,6 +106,7 @@ CREATE TABLE dispatch (
   created_at    TEXT NOT NULL,
   staged_at     TEXT, executing_at TEXT, done_at TEXT, reconciled_at TEXT, archived_at TEXT,
   executor_pane TEXT,
+  route         TEXT,                       -- factory-fleet home that runs it (context route); NULL = the captain routes
   -- review step (draft only): planner agent writes the plan, the user leaves notes, then approve/hold/reject. The
   -- review decision carries the clock (decision.due_at); a factory:propose draft may start without a person.
   drafted_by    TEXT,
@@ -133,7 +134,7 @@ BEGIN SELECT RAISE(ABORT, 'a draft leaves review only approved (staged) or rejec
 
 CREATE TRIGGER dispatch_frozen BEFORE UPDATE ON dispatch
 WHEN OLD.state <> 'draft' AND (NEW.body_sha256 IS NOT OLD.body_sha256 OR NEW.repos_json IS NOT OLD.repos_json
-  OR NEW.run_id IS NOT OLD.run_id OR NEW.created_at IS NOT OLD.created_at)
+  OR NEW.run_id IS NOT OLD.run_id OR NEW.created_at IS NOT OLD.created_at OR NEW.route IS NOT OLD.route)
 BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;
 
 CREATE TRIGGER dispatch_no_delete BEFORE DELETE ON dispatch

@@ -79,33 +79,39 @@ auto = true
 # ticket's `Repo:` line. Otherwise: needs-clarification "no bounded context".
 # Seeded 2026-09-29 from the recorded Domain -> repo lines in
 # ~/.local/share/firstmate/homes/primary/data/projects.md. Nothing here is inferred.
+# `route`: the factory-fleet home that runs the context's dispatches (factory-primary data/projects.md, captain
+# 2026-09-30); per Domain where one repo's domains have different owners. No route: tickets are never drafted.
 
 [[context]]
 name = "sec-filings"
 repo = "Finks-ai/finks-dagster"
 domains = ["SEC Filings"]
 witnesses = ["dagster-prod", "clickhouse-serving"]
+route = "fx-news-pipeline"
 
 [[context]]
 name = "sec-filings-compute"
 repo = "Finks-ai/finks-prism"
 domains = ["SEC Filings"]
+route = "fx-news-pipeline"
 
 [[context]]
 name = "search-api"
 repo = "Finks-ai/finks-api"
 domains = ["Search API", "External API Surface"]
+route = "fx-commercialize-api"
 
 [[context]]
 name = "insights"
 repo = "Finks-ai/finks-insights-service"
 domains = ["Insights"]
 witnesses = ["clickhouse-serving"]
+route = "fx-personalization"
 
 [[context]]
 name = "observability"
 repo = "Finks-ai/finks-overwatch"
-domains = ["Observability"]
+domains = ["Observability"]  # no route: finks-overwatch is UNREGISTERED in factory-fleet (nix-fleet owns it)
 
 # Added 2026-09-29 by operator decision (these tickets carry no Repo: line or span repos).
 [[context]]
@@ -113,12 +119,14 @@ name = "finks-data"
 repo = "Finks-ai/finks-dagster"
 domains = ["Finks Data", "FMP Ingestion Pipeline", "v0 Historical Ratios"]
 witnesses = ["dagster-prod", "clickhouse-serving"]
+route = { "Finks Data" = "fx-finks-data", "FMP Ingestion Pipeline" = "fx-financial-data", "v0 Historical Ratios" = "fx-financial-data" }
 
 [[context]]
 name = "connected-portfolios"
 repo = "Finks-ai/finks-portfolio-service"
 domains = ["Connected Portfolios"]
 witnesses = ["clickhouse-serving"]
+route = "fx-financial-data"
 
 # Added 2026-09-29 by operator decision. SEC Filings tickets reach it only via `Repo: finks-clustering-service`
 # (FIN-4115).
@@ -127,6 +135,7 @@ name = "news-clustering"
 repo = "Finks-ai/finks-clustering-service"
 domains = ["News Clustering", "SEC Filings"]
 witnesses = ["clickhouse-serving"]
+route = "fx-news-pipeline"
 
 # ---------------------------------------------------------------- witnesses (all read-only)
 [witness.dagster-prod]

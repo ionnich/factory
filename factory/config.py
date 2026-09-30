@@ -19,9 +19,15 @@ class Context:
     domains: list[str] = field(default_factory=list)
     linear_labels: list[str] = field(default_factory=list)
     witnesses: list[str] = field(default_factory=list)
+    # The factory-fleet home that runs this context's dispatches: one id, or {Domain: id} where one repo's
+    # domains have different owners. None: no fleet owner, so its tickets are never drafted.
+    route: str | dict[str, str] | None = None
 
     def matches(self, domain: str | None, labels: list[str]) -> bool:
         return domain in self.domains or bool(set(labels) & set(self.linear_labels))
+
+    def owner(self, domain: str | None) -> str | None:
+        return self.route.get(domain) if isinstance(self.route, dict) else self.route
 
 
 @dataclass

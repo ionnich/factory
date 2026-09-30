@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -252,6 +252,13 @@ BEGIN SELECT RAISE(ABORT, 'a confirmed write-back is final unless a person appli
   id TEXT PRIMARY KEY, stage TEXT NOT NULL, run_id TEXT, started_at TEXT NOT NULL, mtime REAL NOT NULL,
   input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL, usd REAL NOT NULL
 );""",
+    # v12: the factory-fleet home that runs a dispatch (factory.toml context route), frozen with the rest.
+    12: """ALTER TABLE dispatch ADD COLUMN route TEXT;
+DROP TRIGGER dispatch_frozen;
+CREATE TRIGGER dispatch_frozen BEFORE UPDATE ON dispatch
+WHEN OLD.state <> 'draft' AND (NEW.body_sha256 IS NOT OLD.body_sha256 OR NEW.repos_json IS NOT OLD.repos_json
+  OR NEW.run_id IS NOT OLD.run_id OR NEW.created_at IS NOT OLD.created_at OR NEW.route IS NOT OLD.route)
+BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;""",
 }
 
 

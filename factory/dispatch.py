@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import time
@@ -65,7 +66,9 @@ def candidates(cfg: Config, conn) -> dict:
             "card_status FROM dispatch_ticket t JOIN dispatch d USING (run_id) WHERE t.verdict_id=? "
             "AND NOT EXISTS (SELECT 1 FROM decision x WHERE x.run_id=t.run_id AND x.issue_id=t.issue_id "
             "AND x.kind='blocked' AND x.chosen='retry') ORDER BY d.created_at DESC LIMIT 1", (v["id"],)).fetchone()
+        owner = ctx and ctx.owner(prune.issue_fields(s)[0])
         why = ("unmapped" if ctx is None
+               else f"no factory-fleet owner for context {ctx.name} (route)" if owner is None
                else "no verdict" if v is None
                else f"verdict {v['kind']}" if v["kind"] != "valid"
                else f"verdict stale ({r})" if (r := prune.staleness(cfg, conn, s, ctx))
@@ -78,7 +81,7 @@ def candidates(cfg: Config, conn) -> dict:
             skipped.append({"identifier": ident, "reason": why})
             continue
         ok.append({"identifier": ident, "title": raw["title"], "url": raw["url"], "repo": ctx.repo,
-                   "context": ctx.name, "priority": raw["priority"], "state": raw["state"]["name"],
+                   "context": ctx.name, "route": owner, "priority": raw["priority"], "state": raw["state"]["name"],
                    "reason": v["reason"]})
     ok.sort(key=lambda c: (c["priority"] or 5, c["repo"]))
     return {"max_tickets": max_tickets(cfg), "candidates": ok, "skipped": skipped,
@@ -90,13 +93,15 @@ def max_tickets(cfg: Config) -> int:
 
 
 def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tree: list, rejected: str | None,
-            answers: list) -> str:
+            answers: list, route: str | None = None) -> str:
     notes = lambda node: [f"- {n['author']} ({n['at'][:16]}Z): {n['body'].strip()}" for n in node["notes"]]
     root = tree[0]
     lines = [f"# Dispatch {run_id}", ""]
     lines += ([f"**REJECTED in review** by {actor} at {when}: {rejected}", ""] if rejected else
               [f"Approved {when} by {actor}. This file is immutable (`chflags uchg`); factory.db holds its sha256.", ""])
     lines += ["## Repos", ""] + [f"- {repo} @ trunk `{sha}`" for repo, sha in sorted(trunks.items())]
+    lines += ["", "## Runs in", "", f"- `{route}` (factory-fleet), handed this dispatch directly by the factory"
+              if route else "- factory-primary routes each card (no single factory-fleet owner)"]
     lines += ["", "## Rules", "",
               "- Work only the tickets below. One PR per ticket, against the repo's trunk.",
               "- Follow each ticket's plan in dependency order. Operator notes and answered questions are binding and "
@@ -444,16 +449,25 @@ def approve(cfg: Config, conn, run_id: str, actor: str) -> dict:
     immutable dispatch.md. `start` then hands it to the executor."""
     _draft(conn, run_id)
     tickets, trunks = _tickets_for_render(cfg, conn, run_id, check=True)
+    route = _route(cfg, conn, tickets)
     now = db.now()
-    body = _render(run_id, now, actor, trunks, tickets, tree(conn, run_id), None, _answers(conn, run_id)).encode()
+    body = _render(run_id, now, actor, trunks, tickets, tree(conn, run_id), None, _answers(conn, run_id),
+                   route).encode()
     path = cfg.dispatches / run_id / "dispatch.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     with db.tx(conn):
         path.write_bytes(body)
-        conn.execute("UPDATE dispatch SET state='staged', body_sha256=?, staged_at=?, approved_by=?, last_actor=? "
-                     "WHERE run_id=?", (hashlib.sha256(body).hexdigest(), now, actor, actor, run_id))
+        conn.execute("UPDATE dispatch SET state='staged', body_sha256=?, staged_at=?, approved_by=?, last_actor=?, "
+                     "route=? WHERE run_id=?", (hashlib.sha256(body).hexdigest(), now, actor, actor, route, run_id))
     os.chflags(path, stat.UF_IMMUTABLE)
-    return {"run_id": run_id, "path": str(path)}
+    return {"run_id": run_id, "path": str(path), "route": route}
+
+
+def _route(cfg: Config, conn, tickets: list) -> str | None:
+    """The one factory-fleet home that owns every ticket (context route by Domain), else None: the captain routes."""
+    owners = {cfg.context(t["context"]).owner(prune.issue_fields(prune.latest(conn, t["identifier"]))[0])
+              for t in tickets}
+    return owners.pop() if len(owners) == 1 else None
 
 
 def start(cfg: Config, conn, run_id: str) -> dict:
@@ -558,34 +572,66 @@ def _send(pane_id: str, texts: list[str]) -> None:
         time.sleep(3)
 
 
+FLEET_HOMES = Path.home() / ".local" / "share" / "factory-fleet" / "homes"
+
+
+def _lead_pane_id(route: str) -> str | None:
+    """The herdr pane factory-primary spawned the domain lead into (state/<route>.meta), if it was ever spawned."""
+    meta = FLEET_HOMES / "factory-primary" / "state" / f"{route}.meta"
+    if not meta.exists():
+        return None
+    return dict(x.split("=", 1) for x in meta.read_text().splitlines() if "=" in x).get("herdr_pane_id")
+
+
+def _target(cfg: Config, d) -> tuple[dict, str]:
+    """Who runs a dispatch: its route's domain lead when its omp pane is alive, else the captain (factory-primary),
+    which routes each card itself and spawns or wakes the lead. Returns (pane, who)."""
+    if d["route"] and (pid := _lead_pane_id(d["route"])):
+        pane = {p["pane_id"]: p for p in _herdr("pane", "list")["result"]["panes"]}.get(pid)
+        if pane and pane.get("agent") == "omp":
+            return pane, d["route"]
+    return _executor(cfg.raw.get("executor", {}).get("workspace", "factory")), "factory-primary"
+
+
+def _lead_busy(route: str) -> bool:
+    """The lead still supervises crews or holds decisions: a /new now would drop what it has not written down."""
+    f = FLEET_HOMES / route / "state" / "home-summary.json"
+    s = json.loads(f.read_text()) if f.exists() else {}
+    return bool(s.get("active_children") or s.get("decisions_open"))
+
+
 def handoff(cfg: Config, conn, run_id: str) -> dict:
-    """Hand a staged dispatch to the executor: fresh omp session (/new), then `run dispatch-intake <run_id>`."""
+    """Hand a staged dispatch to whoever runs it (`_target`): fresh omp session (/new), then
+    `run dispatch-intake <run_id>`."""
     d = conn.execute("SELECT * FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
     if d is None or d["state"] != "staged":
         raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not staged")
     if busy := conn.execute("SELECT run_id FROM dispatch WHERE state='executing'").fetchone():
         raise StageError(f"dispatch {busy[0]} is still executing")
-    pane = _executor(cfg.raw.get("executor", {}).get("workspace", "factory"))
+    pane, who = _target(cfg, d)
     if pane.get("agent_status") not in ("idle", "done"):
-        raise StageError(f"executor pane {pane['pane_id']} is {pane.get('agent_status')}; not resetting a busy session")
+        raise StageError(f"{who} pane {pane['pane_id']} is {pane.get('agent_status')}; not resetting a busy session")
+    if who != "factory-primary" and _lead_busy(who):
+        raise StageError(f"{who} still has crews or decisions open; not resetting its session")
     sent = ["/new", f"run dispatch-intake {run_id}"]  # session reset at every dispatch boundary
     _send(pane["pane_id"], sent)
-    return {"run_id": run_id, "executor_pane": pane["pane_id"], "sent": sent}
+    return {"run_id": run_id, "executor_pane": pane["pane_id"], "via": who, "sent": sent}
 
 
 def resume(cfg: Config, conn, run_id: str) -> dict:
-    """The "restart the executor" choice on an executing dispatch: start factory-primary if it is gone, interrupt it if it is
-    stuck mid-turn, then a fresh session runs intake again (`execute` re-attaches; finished cards stay finished)."""
-    d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+    """The "restart the executor" choice on an executing dispatch: interrupt whoever runs it if it is stuck mid-turn
+    (starting the captain if it is gone), then a fresh session runs intake again (`execute` re-attaches; finished
+    cards stay finished)."""
+    d = conn.execute("SELECT * FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
     if d is None or d["state"] != "executing":
         raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not executing")
-    pane = _executor(cfg.raw.get("executor", {}).get("workspace", "factory"))
+    pane, who = _target(cfg, d)
     if pane.get("agent_status") not in ("idle", "done"):
         _herdr("pane", "send-keys", pane["pane_id"], "esc")
         time.sleep(2)
     sent = ["/new", f"run dispatch-intake {run_id}"]
     _send(pane["pane_id"], sent)
-    return {"run_id": run_id, "executor_pane": pane["pane_id"], "sent": sent}
+    return {"run_id": run_id, "executor_pane": pane["pane_id"], "via": who, "sent": sent}
 
 
 def tell_executor(conn, run_id: str, text: str) -> str:
@@ -598,19 +644,22 @@ def tell_executor(conn, run_id: str, text: str) -> str:
 
 
 def execute(cfg: Config, conn, run_id: str, actor: str) -> dict:
-    """staged -> executing, only from a pane in the executor's herdr workspace, only on an intact file. On an
-    executing dispatch (after "restart the executor") it re-attaches this pane, unless another live omp owns it."""
+    """staged -> executing, only from the pane that runs it (the route's domain lead, or a pane in the captain's
+    herdr workspace), only on an intact file. On an executing dispatch (after "restart the executor") it re-attaches
+    this pane, unless another live omp owns it."""
     want = cfg.raw.get("executor", {}).get("workspace", "factory")
     ws, pane = os.environ.get("HERDR_WORKSPACE_ID"), os.environ.get("HERDR_PANE_ID")
     if not ws or not pane:
         raise StageError("execute runs only inside the executor's herdr pane (no HERDR_WORKSPACE_ID)")
-    r = subprocess.run(["herdr", "workspace", "get", ws], capture_output=True, text=True, timeout=10)
-    label = json.loads(r.stdout)["result"]["workspace"]["label"] if r.returncode == 0 else None
-    if label != want:
-        raise StageError(f"caller workspace {ws} is {label!r}, not the executor workspace {want!r}")
     d = conn.execute("SELECT * FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
     if d is None or d["state"] not in ("staged", "executing"):
         raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not staged")
+    if not (d["route"] and pane == _lead_pane_id(d["route"])):
+        r = subprocess.run(["herdr", "workspace", "get", ws], capture_output=True, text=True, timeout=10)
+        label = json.loads(r.stdout)["result"]["workspace"]["label"] if r.returncode == 0 else None
+        if label != want:
+            raise StageError(f"caller pane {pane} is neither {d['route'] or 'a route'}'s lead nor in the executor "
+                             f"workspace {want!r} (it is in {label!r})")
     path = cfg.dispatches / run_id / "dispatch.md"
     if hashlib.sha256(path.read_bytes()).hexdigest() != d["body_sha256"]:
         raise StageError(f"{path} does not match its staged sha256; refusing")
@@ -686,12 +735,18 @@ def card(cfg: Config, conn, run_id: str, ident: str, kind: str, actor: str,
         if not body:
             raise StageError("done needs --body: the landed outcome, one or two sentences")
         os.environ.setdefault("GITHUB_TOKEN", secret(cfg, "GITHUB_TOKEN"))
-        r = subprocess.run(["gh", "pr", "view", pr, "--json", "state,mergeCommit"],
+        # A lead's pane may not have the nix profile on PATH; look where the fleet's launch scripts put gh.
+        gh = shutil.which("gh") or shutil.which("gh", path=os.pathsep.join(
+            [f"/etc/profiles/per-user/{os.environ.get('USER', '')}/bin", "/run/current-system/sw/bin",
+             "/opt/homebrew/bin", str(Path.home() / ".local" / "bin")]))
+        if not gh:
+            raise StageError("gh not found on PATH or in the nix/homebrew profiles; done needs it to check the PR")
+        r = subprocess.run([gh, "pr", "view", pr, "--json", "state,mergeCommit"],
                            capture_output=True, text=True, timeout=60)
         view = json.loads(r.stdout) if r.returncode == 0 else {}
         if view.get("state") != "MERGED":
             raise StageError(f"{pr} is {view.get('state', 'unreadable')}, not merged; done means landed")
-        r = subprocess.run(["gh", "pr", "checks", pr], capture_output=True, text=True, timeout=120)
+        r = subprocess.run([gh, "pr", "checks", pr], capture_output=True, text=True, timeout=120)
         if r.returncode:  # 1 = failing, 8 = pending
             raise StageError(f"{pr} checks are not green (gh pr checks exit {r.returncode}); done refused")
         meta = {"pr": pr, "commit": view["mergeCommit"]["oid"], "checks": "gh pr checks: all passed"}
@@ -744,12 +799,13 @@ def _emergency(cfg: Config, conn, ident: str) -> str | None:
 
 def _cohort(cfg: Config, conn, auto: list) -> list[str]:
     """Assemble one dispatch around the top candidate: the candidates that share its Linear Domain project first,
-    then those in its repo, up to stage.max_tickets. The planner may still drop a ticket that doesn't fit (it
-    judges atomicity and ease); grouping itself is by facts, not guesses."""
+    then those in its repo with the same fleet owner (so one home runs it), up to stage.max_tickets. The planner may
+    still drop a ticket that doesn't fit (it judges atomicity and ease); grouping itself is by facts, not guesses."""
     domain = lambda c: prune.issue_fields(prune.latest(conn, c["identifier"]))[0]
     seed = auto[0]
     same_domain = [c for c in auto[1:] if domain(c) == domain(seed)]
-    same_repo = [c for c in auto[1:] if c["repo"] == seed["repo"] and c not in same_domain]
+    same_repo = [c for c in auto[1:] if c["repo"] == seed["repo"] and c["route"] == seed["route"]
+                 and c not in same_domain]
     return [c["identifier"] for c in [seed, *same_domain, *same_repo]][:max_tickets(cfg)]
 
 

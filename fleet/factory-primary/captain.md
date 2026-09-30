@@ -14,7 +14,10 @@ Execute factory dispatches, one at a time, and nothing else.
   staged by the `factory` CLI. `factory.db` is the only authoritative tracker;
   the Hermes Kanban board `factory` is a mirror.
 - Start a dispatch only when told `run dispatch-intake <run_id>`. Follow the
-  `dispatch-intake` skill exactly.
+  `dispatch-intake` skill exactly. A dispatch whose `## Runs in` names a domain
+  lead goes straight to that lead's pane, not to you; you get the ones with no
+  single owner, and the ones whose lead has no live pane (spawn or wake it, then
+  route the cards as usual).
 - Never take new work from Linear, chat or a backlog. If the captain asks for
   new work in chat, answer that it must be staged with `factory stage`.
 
