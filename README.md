@@ -40,9 +40,9 @@ One-time, by hand:
 - Dashboard: Hermes dashboard, **Factory** tab, phone first, a stack of cards, live (the tab refreshes the moment
   `factory.db` changes, over `/stream`; no polling). **Needs you** is a deck of
   decisions: the question, the options with what each leads to, the recommended one marked ★ and why. Tap an
-  option (a second tap confirms ones that start or stop work or write Linear; some ask for a reason), swipe
-  right to take ★, left for later. A tap answers at once: the card flies off while the server confirms, and comes
-  back on top with the reason if it refuses. `why?` under any decision (and under each plan question) asks the
+  option (a second tap confirms executor answers and ones that start or stop work or write Linear; some ask for a
+  reason), swipe right to take a lightweight ★, left for later. Canceled gestures do nothing. Once confirmed,
+  the card flies off while the server responds, and comes back with the reason if refused. `why?` under any decision asks the
   planner inline (see Why? below). A draft's planner questions and its review are one card ("Review FIN-4146 · 2
   questions") that opens the **plan** full-page (the configurator; also `/factory?view=review&run=<run_id>`, so a
   push can link straight in). On a phone it is one column: a sticky **result** (the dispatch's predicted result
@@ -53,8 +53,12 @@ One-time, by hand:
   switch inside the step it is about (★ marked; each option shows its change, cost, risk); a question that only
   matters under one answer appears once that answer is picked. Flipping a switch sends nothing: the outline redraws
   under that option's plan changes (changed steps get a yellow bar, added ones a `+`, dropped ones strike through
-  and fold). **Lock in path** answers every open question with what is picked, then the review (approve / hold /
-  reject) takes its place. The ticket button opens each ticket's verdict and evidence. On a desktop a railway map
+  and fold). The sticky header always shows the review deadline/silence policy and **Hold**, even with unanswered
+  questions. Hold requires a reason and submits no plan choices. **Lock in path** answers every open question
+  with the selected snapshot; switches, railway choices and Hold are disabled during submission. If a later
+  answer fails, earlier saved answers remain and the page refreshes with an explicit partial-completion warning.
+  Approval/rejection then appears below; Hold remains in the header. Connection failures and Refresh stay visible
+  inside the configurator. The ticket button opens each ticket's verdict and evidence. On a desktop a railway map
   sits beside it (now → question → each option on its own track, one row apart → rejoin → … → result; ★ solid, picked path lit, the rest
   faded), one selection with the switches. Open decisions whose ★ starts, stops or writes nothing are the
   **Quick** lane under the deck: tap one to see its options, or "Take all ★" (`POST /decisions/ok`, the chat's "ok").
@@ -82,11 +86,17 @@ One-time, by hand:
   "ok" to a digest takes every ★ in it with one confirmation. The **planner** bot (`hermes -p planner`, or its
   Bot Chat in Hermex) wrote the plans and explains them ("why 3 steps for FIN-3661?"); it changes nothing.
   The factory bot hands it "ask the planner …" with `message_agent` and relays the reply.
-- Decisions (`factory decide list|choose|ok|ask`): every choice the factory needs from you is a decision with 2+
+- Decisions (`factory decide list|choose|ok|ask|resend`): every choice the factory needs from you is a decision with 2+
   options, what each leads to, and one recommended with why. Kinds: a draft's review (approve / hold / reject),
   planner questions (at most 2 per draft), executor questions mid-run (`decide ask`; the answer is typed into its
   pane), a blocked ticket (write back / retry with guidance), a missing or quiet executor (restart / wait / stop),
   a held Linear write (apply anyway / skip / do it yourself), a proposed learning (keep / drop).
+  Executor answers and their exact outbound messages commit together. A failed or interrupted send stays visible
+  under Needs you after refresh, with **Resend recorded answer** (`factory decide resend <id>`, dashboard
+  `POST /decisions/{id}/resend`, or chat action `resend` with `decision_id`). Resending cannot change the answer;
+  it targets the run's current executor pane. Sent answers, terminal runs and concurrent sends are refused.
+  Interrupted sends are never replayed automatically: once their sender exits, the UI warns that delivery is
+  unknown and a resend may duplicate it. Check the executor first. A reused live PID conservatively blocks recovery.
 - Why? (`factory ask new|run|answer|list`): `why?` under any decision in the tab asks the planner inline. `ask new`
   records it (one pending ask per decision) and spawns a detached `factory ask run <id>`, which runs
   `hermes -p planner chat --oneshot -Q -t file --run-budget 150 --query-file <prompt> [--resume <session>]` (the
@@ -100,12 +110,19 @@ One-time, by hand:
   withdrawn as `replanned`, and the plan gate picks it up again as unplanned. Notes and answered questions stay.
 - Asking less (`decide.py`). Each decision gets a tier when asked. **Auto**: the factory takes ★ on its next pass
   and lists it under "Done for you": nothing to weigh (a code check held a Linear write), the executor's first
-  crash in a dispatch (restarted once), or a kind where you took ★ the last 5 times (one override and it asks
-  again). **Now**: work is stopped on you (an executor question, a second crash): pushed at once to the factory
-  Bot Chat (Hermex), at most `notify.interrupts_per_day` (3) a day, the rest wait for the digest. **Digest**:
-  everything else, at `notify.digest` (09:00, 17:00), one line each with what silence does. Silence takes ★ 2h
-  (review of a factory draft) or 24h (blocked ticket, held write, quiet executor) after the digest, unless your
-  last answer of that kind overrode ★; then it waits for you. A person's draft always waits.
+  crash in a dispatch (restarted once), or an eligible kind where you took ★ the last 5 times (one override and it asks
+  again). Planner and executor questions never earn automatic answers. **Now**: work is stopped on you (an executor
+  question, a second crash): pushed at once to the factory Bot Chat (Hermex), at most `notify.interrupts_per_day`
+  (3) a day, the rest wait for the digest. **Digest**: everything else, at `notify.digest` (09:00, 17:00).
+  Silence takes ★ 2h (review) or 24h (blocked ticket, held write, quiet executor) after **confirmed Bot Chat
+  delivery**, unless your last answer of that kind overrode ★. A person's or held draft always waits.
+  Preparing output does not start a clock. `propose --announce` binds notices to its exact running
+  `factory-propose` cron execution via the exec script's parent PID; the next proposal tick reads
+  `~/.hermes/cron/executions.db` read-only. Only `completed` + `delivery_outcome=delivered` starts the window at
+  the receipt's finish time. Missing, queued, failed or unknown receipts leave silence disabled; a later delivered
+  digest can establish the first receipt. This confirms delivery to Bot Chat, not an iPhone read receipt.
+  Manual/unbound proposal output is a non-consuming preview. Schema v18 clears unverified clocks on still-open
+  non-auto decisions; historical answers remain unchanged.
 - Review: `factory stage` makes a **draft**. The planner bot's routine (every 10m) writes its plan tree: a theme,
   tickets nested under the ones they build on (misfits dropped with a reason), steps per ticket (`FIN-1/2`,
   nested `FIN-1/2.1`) with `depends_on` edges, questions, and a review recommendation. For the phone
@@ -155,8 +172,8 @@ One-time, by hand:
   flag; a held write is re-applied only by a person (`approved_by`), and then the agent cannot hold it again.
 - A decision has >= 2 distinct options (id, label, leads_to) and recommends one; it is answered once (with the
   text the option asks for) or withdrawn once, never edited or deleted; its tier is fixed when asked and its clock
-  (`notified_at`, `due_at`) is set once while open (triggers). A person's draft, or one they held, is never
-  started without them.
+  (`notified_at`, `due_at`) is set once while open (triggers). Silence also requires a confirmed notice receipt;
+  executor questions always wait for an explicit answer. A person's draft, or one they held, never starts without them.
 - `stage` skips tickets named in nix-fleet backlogs or nix-fleet herdr workspace labels.
 - A verdict is dispatched at most once (a blocked card needs the ticket to change first, or your "retry" on
   the block, whose guidance becomes a note on the next draft); `valid` verdicts expire
