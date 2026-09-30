@@ -2,12 +2,13 @@
 //   Needs you: a deck of decisions. Each is a question with options, what each leads to, and the factory's
 //     recommendation. Tap an option, or swipe right to take the recommendation, left for later.
 //   Lifecycle: one tab per factory stage — Ingest (tickets), Draft (assemble + revise/edit), Run (staged, executing,
-//     done), Learn (reconciled, archived, throughput). Dispatches are rows in an engineering table; open one to see
+//     done), Learn (reconciled, archived, learnings, throughput). Dispatches are rows in an engineering table; open one to see
 //     its DAG as folded cards down a rail (dispatch → review → tickets → steps → results), decisions hanging off
 //     the node they're about.
 // Every action goes through the plugin API to the factory CLI, which enforces the invariants.
 // Built by install.sh (`bun build`, classic JSX via tsconfig.json) to dist/index.js; React and the shadcn-style
 // components come from the dashboard SDK.
+import { Learnings } from "./learn.jsx";
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect, useCallback, useRef, useMemo } = SDK.hooks;
@@ -47,8 +48,9 @@ const ActErr = ({ err }) => (err ? <div className="fx-err" role="alert">{err}</d
 
 // ---- plain words ----------------------------------------------------------------------------------------------
 const KIND = { review: "Review", plan: "Planner asks", ask: "Executor asks", blocked: "Blocked",
-               "executor-gone": "Executor gone", "dispatch-stuck": "Gone quiet", writeback: "Held Linear write" };
-const KIND_ORDER = ["review", "ask", "executor-gone", "dispatch-stuck", "blocked", "writeback", "plan"];
+               "executor-gone": "Executor gone", "dispatch-stuck": "Gone quiet", writeback: "Held Linear write",
+               learning: "Keep a learning?" };
+const KIND_ORDER = ["review", "ask", "executor-gone", "dispatch-stuck", "blocked", "writeback", "plan", "learning"];
 const CARD = { ready: "not started", running: "in progress", done: "done", blocked: "blocked" };
 const CARD_TONE = { ready: "gray", running: "blue", done: "green", blocked: "amber" };
 const RECHECK = { new: "Not verified yet", "ticket-changed": "Changed in Linear since it was verified",
@@ -895,6 +897,10 @@ function FactoryPage() {
             <DoneForYou items={done4u} />
           </details>
         ) : null}
+        <details className="fx-sec fx-fold" open>
+          <summary>Learnings <span className="fx-count">{(data.learnings || []).length}</span></summary>
+          <Learnings items={data.learnings || []} />
+        </details>
         <details className="fx-sec fx-fold" onToggle={(e) => setShowTp(e.currentTarget.open)}>
           <summary>Throughput</summary>
           {showTp ? <Throughput /> : null}

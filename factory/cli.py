@@ -9,7 +9,7 @@ import statistics
 import sys
 from datetime import UTC, datetime, timedelta
 
-from . import config, costs, db, decide, dispatch, linear, prune, reconcile, repos, witness
+from . import config, costs, db, decide, dispatch, learn, linear, prune, reconcile, repos, witness
 
 
 def out(obj) -> None:
@@ -71,6 +71,10 @@ def cmd_propose(cfg, conn, a):
         costs.sync(conn, cfg.db.parent)
     except Exception as e:
         print(f"factory: cost sync: {type(e).__name__}: {e}", file=sys.stderr)
+    try:  # learnings are derived too; proposals it opens reach the user in the next digest
+        learn.sync(cfg, conn)
+    except Exception as e:
+        print(f"factory: learn sync: {type(e).__name__}: {e}", file=sys.stderr)
     if not a.announce:
         return out({**res, "messages": msgs})
     if msgs:  # cron stdout -> bot-chat:factory (Hermex); nothing to say = no message
@@ -87,6 +91,10 @@ def cmd_draft(cfg, conn, a):
                 cfg, conn, d["run_id"], check=False)[0]]
             for t in ctx["tickets"]:
                 t["mirror"] = str(cfg.mirror_path(t["repo"]))
+            ctx["learnings"] = learn.relevant(
+                conn, {t["repo"] for t in ctx["tickets"]},
+                [e["path"] for t in ctx["tickets"] for e in t["evidence"] if e.get("type") == "file"],
+                "\n".join(f"{t['title']}\n{t['description']}" for t in ctx["tickets"]))
         return print(json.dumps({"wakeAgent": bool(ctx), "context": {"draft": ctx}}, default=str))
     if a.dcmd == "plan":
         try:
@@ -234,6 +242,7 @@ def cmd_overview(cfg, conn, a):
                          [x["run_id"] for x in st["decisions"] if x["run_id"] and x["kind"] == "blocked"] +
                          [x["run_id"] for x in st["archived"]])  # last closed ones, for the Learn tab
     out({"status": st, "tickets": tickets(cfg, conn), "candidates": dispatch.candidates(cfg, conn),
+         "learnings": learn.rows(conn),
          "dispatches": [dispatch_status(cfg, conn, r) for r in runs
                         if conn.execute("SELECT 1 FROM dispatch WHERE run_id=?", (r,)).fetchone()]})
 

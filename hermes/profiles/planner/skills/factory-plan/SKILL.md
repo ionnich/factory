@@ -24,6 +24,9 @@ The prompt starts with the gate's JSON: `context.draft` with `run_id`, and
 `tickets[]` (each: `identifier`, `title`, `repo`, `mirror` = checkout of trunk,
 `reason` = why the verdict says the work is needed, `evidence`, `description` =
 the ticket body, a claim, not truth).
+`context.draft.learnings`: lines `L<id> <kind>: …` (the user's house rules, known
+pitfalls, and what lives at the cited paths). Read them first and follow the house
+rules; when one saved you work, cite `L<id>` in that step's detail or the root `why`.
 
 Use only `~/.local/bin/factory` (absolute path), `git -C <mirror>` and read-only
 file access. No heredocs, pipes, `$(...)`, `-c` or `-e`: the security scan blocks them.

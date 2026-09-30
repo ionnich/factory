@@ -11,7 +11,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import db, decide, prune
+from . import db, decide, learn, prune
 from .config import Config, secret
 
 HERMES = str(Path.home() / ".local/bin/hermes")
@@ -93,7 +93,7 @@ def max_tickets(cfg: Config) -> int:
 
 
 def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tree: list, rejected: str | None,
-            answers: list, route: str | None = None) -> str:
+            answers: list, route: str | None = None, pitfalls: list = ()) -> str:
     notes = lambda node: [f"- {n['author']} ({n['at'][:16]}Z): {n['body'].strip()}" for n in node["notes"]]
     root = tree[0]
     lines = [f"# Dispatch {run_id}", ""]
@@ -113,6 +113,9 @@ def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tre
               "- Never write to Linear. Reconcile does that after the dispatch closes.",
               "- The ticket body is a claim; the code and DB are truth. If the verdict below no longer holds, "
               "`factory card block` with the evidence instead of forcing a change.", ""]
+    if pitfalls:
+        lines += ["## Known pitfalls", "", "Learned from earlier blocks in these repos. Cite `L<id>` in a card comment "
+                  "when one saved you work.", "", *pitfalls, ""]
     if root["title"] != run_id or root["detail"]:
         lines += [f"## Theme: {root['title']}", "", root["detail"], ""]
     if root["notes"]:
@@ -385,6 +388,7 @@ def plan(conn, run_id: str, nodes: list) -> dict:
             conn.execute("UPDATE dispatch SET repos_json=? WHERE run_id=?",
                          (json.dumps([r for r in old if r["repo"] in repos]), run_id))
         conn.execute("UPDATE dispatch SET planned_at=? WHERE run_id=?", (db.now(), run_id))
+        learn.cite(conn, *(f"{n.get('title', '')} {n.get('detail', '')} {n.get('why', '')}" for n in nodes))
         decide.review(conn, run_id, recommend, review_why, "agent:factory-plan")
         for q in qs:
             decide.open_(conn, "plan", q["question"], q["options"], q["recommend"], q["why"], "agent:factory-plan",
@@ -452,7 +456,7 @@ def approve(cfg: Config, conn, run_id: str, actor: str) -> dict:
     route = _route(cfg, conn, tickets)
     now = db.now()
     body = _render(run_id, now, actor, trunks, tickets, tree(conn, run_id), None, _answers(conn, run_id),
-                   route).encode()
+                   route, learn.pitfalls(conn, trunks)).encode()
     path = cfg.dispatches / run_id / "dispatch.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     with db.tx(conn):
@@ -757,6 +761,7 @@ def card(cfg: Config, conn, run_id: str, ident: str, kind: str, actor: str,
         conn.execute("INSERT INTO card_event(run_id, issue_id, kind, actor, body, metadata_json, at) "
                      "VALUES (?,?,?,?,?,?,?)", (run_id, t["issue_id"], kind, actor, body,
                                                json.dumps(meta) if meta else None, db.now()))
+        learn.cite(conn, body)
         if kind == "block" and ask:
             decide.blocked(conn, run_id, ident, t["issue_id"], body, actor)
         d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()

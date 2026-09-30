@@ -312,7 +312,7 @@ CREATE TABLE decision (
   node_id      TEXT NOT NULL DEFAULT 'root',
   issue_id     TEXT,
   kind         TEXT NOT NULL CHECK (kind IN
-    ('review', 'plan', 'blocked', 'executor-gone', 'dispatch-stuck', 'writeback', 'ask')),
+    ('review', 'plan', 'blocked', 'executor-gone', 'dispatch-stuck', 'writeback', 'ask', 'learning')),
   ref          TEXT,                         -- kind-specific key, e.g. the writeback op
   question     TEXT NOT NULL CHECK (length(trim(question)) > 0),
   options_json TEXT NOT NULL CHECK (json_valid(options_json) AND json_array_length(options_json) >= 2),
@@ -389,3 +389,24 @@ CREATE TABLE cost_session (
   input      INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL,
   usd        REAL NOT NULL
 );
+
+-- Learnings: one- or two-line facts that save agents tokens, each with provenance (source), anchors (repo paths)
+-- and expiry. codemap (what lives at a path) is harvested from verdict evidence and plan steps and is active at
+-- once; pitfall (from blocks) and house_rule (from the user's plan answers) are proposed and become active when the
+-- user keeps them (decision kind 'learning', ref = id). Active ones expire when trunk changes an anchor. Derived by
+-- `learn.sync`; uses counts `L<id>` cited in verdict reasons, plans and card comments.
+CREATE TABLE learning (
+  id             INTEGER PRIMARY KEY,
+  kind           TEXT NOT NULL CHECK (kind IN ('codemap', 'pitfall', 'house_rule')),
+  scope          TEXT NOT NULL,              -- repo OWNER/NAME
+  body           TEXT NOT NULL CHECK (length(trim(body)) > 0 AND length(body) <= 300),
+  anchors_json   TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(anchors_json)),
+  trunk_sha      TEXT,                       -- anchors checked at this trunk
+  source         TEXT NOT NULL,              -- verdict:<id> | step:<run_id>:<step_id> | decision:<id> | theme:<label>
+  status         TEXT NOT NULL CHECK (status IN ('active', 'proposed', 'expired', 'rejected')),
+  created_at     TEXT NOT NULL,
+  expired_reason TEXT,
+  uses           INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (kind, scope, source, anchors_json)  -- harvested once, never again after it expires or is rejected
+);
+CREATE UNIQUE INDEX learning_codemap ON learning(scope, anchors_json) WHERE kind = 'codemap' AND status = 'active';
