@@ -354,12 +354,14 @@ function QuickRow({ d, ctx, onDone }) {
   const rec = d.options.find((o) => o.id === d.recommended);
   const rel = d.kind === "learning" ? d.jev?.relation : null;
   return (
-    <li className="fx-quick-row" onClick={() => setOpen(!open)}>
-      <div><span className="star">★</span><b>{rec?.label}</b> · {d.question}</div>
-      {ctx ? <div className="fx-hint">{ctx}</div> : null}
-      {rel && rel.learning_id != null ? (
-        <div className={`fx-hint${rel.kind === "conflicts" ? " fx-err" : ""}`}>{REL[rel.kind] || "related to"} <span className="fx-id">L{rel.learning_id}</span>{rel.body ? ` · ${rel.body}` : ""}</div>
-      ) : null}
+    <li className="fx-quick-row">
+      <button type="button" className="fx-quick-head" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <span><span className="star">★</span><b>{rec?.label}</b> · {d.question}</span>
+        {ctx ? <span className="fx-hint">{ctx}</span> : null}
+        {rel && rel.learning_id != null ? (
+          <span className={`fx-hint${rel.kind === "conflicts" ? " fx-err" : ""}`}>{REL[rel.kind] || "related to"} <span className="fx-id">L{rel.learning_id}</span>{rel.body ? ` · ${rel.body}` : ""}</span>
+        ) : null}
+      </button>
       {open ? <DecisionBody d={d} busy={c.busy} err={c.err} compact onChoose={(o, n) => c.choose(o, n).catch(() => {})} /> : null}
     </li>
   );
