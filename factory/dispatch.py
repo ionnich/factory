@@ -249,12 +249,13 @@ def review(d, due: str | None = None) -> str | None:
 
 
 # A dispatch's lifecycle stage from its own record (SQL over dispatch columns): draft until the plan gate offered it to
-# the planner (or a replan asked), plan until a plan is written, review until it leaves draft (held too), run while
-# staged or executing, reconcile while done or reconciled, archive once archived (rejected drafts too).
+# the planner, a replan asked, or a plan for it was refused (a refusal is planning, never a made-up offer), plan until a
+# plan is written, review until it leaves draft (held too), run while staged or executing, reconcile while done or
+# reconciled, archive once archived (rejected drafts too).
 PHASE = ("CASE WHEN state = 'draft' AND planned_at IS NOT NULL THEN 'review' "
-         "WHEN state = 'draft' AND planning_requested_at IS NOT NULL THEN 'plan' WHEN state = 'draft' THEN 'draft' "
-         "WHEN state IN ('staged', 'executing') THEN 'run' WHEN state IN ('done', 'reconciled') THEN 'reconcile' "
-         "ELSE 'archive' END")
+         "WHEN state = 'draft' AND (planning_requested_at IS NOT NULL OR planning_error IS NOT NULL) THEN 'plan' "
+         "WHEN state = 'draft' THEN 'draft' WHEN state IN ('staged', 'executing') THEN 'run' "
+         "WHEN state IN ('done', 'reconciled') THEN 'reconcile' ELSE 'archive' END")
 
 
 def stage(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool = False) -> dict:

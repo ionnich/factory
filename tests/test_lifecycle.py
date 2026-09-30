@@ -34,7 +34,9 @@ def run_cli(fn, cfg, conn, a):
 
 class Phases(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
         self.c = db.connect(self.tmp / "t.db")
         self.addCleanup(self.c.close)
         self.c.execute("INSERT INTO linear_snapshot VALUES ('i1','FIN-1',?,?,'unstarted',1,?)",
@@ -65,15 +67,17 @@ class Phases(unittest.TestCase):
         self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) "
                        "VALUES ('d2','draft','[]','x','2026-09-02T00:00:00Z')")
         self.assertEqual((self.phase(), self.planning()), ("draft", (None, None)))  # nothing offered yet
-        self.assertEqual(self.gate()["context"]["draft"]["run_id"], "d1")
-        self.assertEqual((self.phase("d1"), self.phase("d2")), ("plan", "draft"))  # one offer per gate tick
+        offer = self.gate()["context"]["draft"]  # the planner is handed the offer as it was committed
         offered = self.planning()[0]
         self.assertIsNotNone(offered)
-        for steps, why in (("[{", "not JSON"), (json.dumps(PLAN[::2]), "FIN-1 result")):  # the planner's refusals
-            with self.subTest(why), self.assertRaises(dispatch.StageError):
-                self.plan(steps)
-            self.assertEqual((self.phase(), self.planning()[0]), ("plan", offered))
-            self.assertIn(why, self.planning()[1])
+        self.assertEqual((offer["run_id"], offer["phase"], offer["planning_requested_at"]),
+                         ("d1", self.phase(), offered))
+        self.assertEqual((self.phase("d1"), self.phase("d2")), ("plan", "draft"))  # one offer per gate tick
+        for steps in ("[{", json.dumps(PLAN[::2])):  # the planner's refusals: not JSON, FIN-1 without its result
+            with self.subTest(steps):
+                with self.assertRaises(dispatch.StageError) as refused:
+                    self.plan(steps)
+                self.assertEqual((self.phase(), self.planning()), ("plan", (offered, str(refused.exception))))
         self.plan(json.dumps(PLAN))
         self.assertEqual((self.phase(), self.planning()[1]), ("review", None))  # a written plan clears the refusal
         dispatch.hold(self.c, "d1", "look first", "user")
@@ -90,6 +94,20 @@ class Phases(unittest.TestCase):
                             ("archived", "archive")):
             self.c.execute("UPDATE dispatch SET state=? WHERE run_id='d1'", (state,))
             self.assertEqual(self.phase(), want, state)
+
+    def test_a_draft_planned_while_the_gate_gathers_its_context_is_not_offered(self):
+        def planned_meanwhile(*_, **__):
+            self.c.execute("UPDATE dispatch SET planned_at=? WHERE run_id='d1'", (SNAP,))
+            return [], {}
+        with mock.patch.object(dispatch, "_tickets_for_render", side_effect=planned_meanwhile):
+            got = run_cli(cli.cmd_draft, self.cfg, self.c, SimpleNamespace(dcmd="gate"))
+        self.assertEqual((got, self.phase(), self.planning()),
+                         ({"wakeAgent": False, "context": {"draft": None}}, "review", (None, None)))
+
+    def test_a_refused_plan_is_planning_even_without_an_offer(self):
+        with self.assertRaises(dispatch.StageError) as refused:  # a plan submitted by hand, no gate before it
+            self.plan("[{")
+        self.assertEqual((self.phase(), self.planning()), ("plan", (None, str(refused.exception))))
 
     def test_upgrade_records_no_offer_an_old_draft_never_had(self):
         path = self.tmp / "v19.db"
@@ -126,7 +144,9 @@ class Overview(unittest.TestCase):
     another lead's; dispatches in every stage, six of them archived (five rejected drafts)."""
 
     def setUp(self):
-        tmp = Path(tempfile.mkdtemp())
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        tmp = Path(d.name)
         self.c = c = db.connect(tmp / "t.db")
         self.addCleanup(c.close)
         self.cfg = Config(raw={"linear": {"lead": "me@x"}}, db=tmp / "t.db", mirrors=tmp, dispatches=tmp,
