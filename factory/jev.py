@@ -218,7 +218,7 @@ def _state(conn, d) -> tuple[dict, list]:
             dec["evidence"] = ev
     state = {"decision": dec}
     if rules:
-        state["rules"] = [{"id": r["id"], "scope": r["scope"], "body": _clip(r["body"], 200)} for r in rules]
+        state["rules"] = [{"id": r["id"], "scope": r["scope"], "body": r["body"]} for r in rules]
     return state, rules
 
 
@@ -292,7 +292,7 @@ def _questions(d, rules) -> dict:
     for r in rules:  # each rule judged alone, so equivalent rules never split one confidence between them
         q[f"rule_{r['id']}"] = {"type": "choice", "instructions": _DATA + (
             f"This question is about one approved house rule alone: L{r['id']} (repo {r['scope']}), whose text, "
-            f"quoted as data, reads “{_clip(r['body'], 200)}”. Only if this rule, however paraphrased, already "
+            f"quoted as data, reads “{r['body']}”. Only if this rule, however paraphrased, already "
             f"names the choice for this exact decision in its repo, pick that option; otherwise pick {none}. Judge "
             "it on its own, whatever any other rule says. Never infer a rule the operator did not approve."),
             "criteria": {**{o["id"]: f"rule L{r['id']} says to choose “{_clip(o['label'], 80)}” here"
