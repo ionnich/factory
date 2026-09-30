@@ -406,7 +406,7 @@ BEGIN SELECT RAISE(ABORT, 'a decision''s clock (notified_at, due_at) is set once
 );""",
     # v20: the Plan stage from the record: when the plan gate offered a draft to the planner (or a replan asked for a
     # new plan), and why its last plan was refused. Nothing is backfilled: an old unplanned draft carries no offer and
-    # stays in Draft until the gate's next tick.
+    # stays in Draft until the gate offers it or a plan for it is refused.
     20: """ALTER TABLE dispatch ADD COLUMN planning_requested_at TEXT;
 ALTER TABLE dispatch ADD COLUMN planning_error TEXT;""",
 }

@@ -109,8 +109,11 @@ def cmd_draft(cfg, conn, a):
                 "SELECT node_id, author, body, at FROM dispatch_note WHERE run_id=? ORDER BY id", (d["run_id"],))
                 if r["node_id"] not in ids]
             with db.tx(conn):  # the Plan stage: offered to the planner now (an offer, not proof a planner runs)
-                conn.execute("UPDATE dispatch SET planning_requested_at=? WHERE run_id=? AND state='draft' AND "
-                             "planned_at IS NULL", (db.now(), d["run_id"]))
+                offer = conn.execute("UPDATE dispatch SET planning_requested_at=? WHERE run_id=? AND state='draft' "
+                                     f"AND planned_at IS NULL RETURNING planning_requested_at, {dispatch.PHASE} phase",
+                                     (db.now(), d["run_id"])).fetchone()
+            # hand over the offer as committed; a draft planned or rejected while its context was gathered gets none
+            ctx = ctx | dict(offer) if offer else None
         return print(json.dumps({"wakeAgent": bool(ctx), "context": {"draft": ctx}}, default=str))
     if a.dcmd == "plan":
         try:
