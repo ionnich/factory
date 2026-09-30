@@ -149,12 +149,34 @@ async def take_stars(body: Ok):
     return await factory("decide", "ok", *map(str, body.ids), "--actor", "user:dashboard", timeout=300)
 
 
+class Replan(BaseModel):
+    reason: str = Field(min_length=1, max_length=3900)
+
+
+@router.post("/drafts/{run_id}/replan")
+async def replan(run_id: str, body: Replan):
+    # the plan gate picks the draft up again on its next tick
+    return await factory("draft", "replan", run_id_ok(run_id), f"--reason={text_ok(body.reason, 'reason')}",
+                         "--actor", "user:dashboard")
+
+
 @router.post("/decisions/{decision_id}")
 async def choose(decision_id: int, body: Choice):
     # an approval freezes and hands off, and may have to start the executor agent first
     note = [f"--note={text_ok(body.note, 'note')}"] if body.note and body.note.strip() else []
     return await factory("decide", "choose", str(decision_id), body.option, *note, "--actor", "user:dashboard",
                          timeout=300)
+
+
+class Ask(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/decisions/{decision_id}/asks")
+async def ask(decision_id: int, body: Ask):
+    # returns at once (pending); the planner's answer lands in factory.db and /stream refreshes the tab
+    return await factory("ask", "new", str(decision_id), f"--text={text_ok(body.text, 'question')}",
+                         "--actor", "user:dashboard")
 
 
 @router.get("/metrics")

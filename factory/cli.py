@@ -9,7 +9,7 @@ import statistics
 import sys
 from datetime import UTC, datetime, timedelta
 
-from . import config, costs, db, decide, dispatch, learn, linear, prune, reconcile, repos, witness
+from . import ask, config, costs, db, decide, dispatch, learn, linear, prune, reconcile, repos, witness
 
 
 def out(obj) -> None:
@@ -95,6 +95,11 @@ def cmd_draft(cfg, conn, a):
                 conn, {t["repo"] for t in ctx["tickets"]},
                 [e["path"] for t in ctx["tickets"] for e in t["evidence"] if e.get("type") == "file"],
                 "\n".join(f"{t['title']}\n{t['description']}" for t in ctx["tickets"]))
+            # notes on steps a replan cleared: gone from the tree, still binding (answered questions: `decisions`)
+            ids = {n["id"] for n in ctx["tree"]}
+            ctx["earlier_notes"] = [dict(r) for r in conn.execute(
+                "SELECT node_id, author, body, at FROM dispatch_note WHERE run_id=? ORDER BY id", (d["run_id"],))
+                if r["node_id"] not in ids]
         return print(json.dumps({"wakeAgent": bool(ctx), "context": {"draft": ctx}}, default=str))
     if a.dcmd == "plan":
         try:
@@ -102,6 +107,8 @@ def cmd_draft(cfg, conn, a):
         except json.JSONDecodeError as e:
             raise dispatch.StageError(f"--steps is not JSON: {e}")
         return out(dispatch.plan(cfg, conn, a.run_id, steps))
+    if a.dcmd == "replan":
+        return out(dispatch.replan(conn, a.run_id, a.reason, a.actor))
     return out(dispatch.note(conn, a.run_id, a.node, a.body, a.actor))
 
 
@@ -241,10 +248,12 @@ def cmd_overview(cfg, conn, a):
     runs = dict.fromkeys([d["run_id"] for d in st["dispatches"]] +
                          [x["run_id"] for x in st["decisions"] if x["run_id"] and x["kind"] == "blocked"] +
                          [x["run_id"] for x in st["archived"]])  # last closed ones, for the Learn tab
+    dispatches = [dispatch_status(cfg, conn, r) for r in runs
+                  if conn.execute("SELECT 1 FROM dispatch WHERE run_id=?", (r,)).fetchone()]
+    shown = [x["id"] for x in st["decisions"]] + [x["id"] for d in dispatches for x in d["decisions"]]
     out({"status": st, "tickets": tickets(cfg, conn), "candidates": dispatch.candidates(cfg, conn),
          "learnings": learn.rows(conn),
-         "dispatches": [dispatch_status(cfg, conn, r) for r in runs
-                        if conn.execute("SELECT 1 FROM dispatch WHERE run_id=?", (r,)).fetchone()]})
+         "dispatches": dispatches, "asks": ask.rows(conn, set(shown))})  # "why?" threads by decision id
 
 
 def status(cfg, conn) -> dict:
@@ -432,6 +441,10 @@ def main(argv=None):
     s.add_argument("--node", default="root")
     s.add_argument("--body", required=True)
     s.add_argument("--actor", default="user")
+    s = dr.add_parser("replan", help="send a planned draft back to the planner with a reason (a binding root note)")
+    s.add_argument("run_id")
+    s.add_argument("--reason", required=True)
+    s.add_argument("--actor", default="user")
     dr.add_parser("gate", help="Hermes pre-check for the factory-plan job (last line = wakeAgent JSON)")
     sub.choices["draft"].set_defaults(fn=cmd_draft)
     x = sub.add_parser("decide", help="decisions waiting on a person: options, what each leads to, a recommendation"
@@ -456,6 +469,23 @@ def main(argv=None):
     s.add_argument("ids", type=int, nargs="+")
     s.add_argument("--actor", default="user")
     sub.choices["decide"].set_defaults(fn=cmd_decide)
+    s = sub.add_parser("ask", help="\"why?\" on a decision: the planner explains inline").add_subparsers(
+        dest="acmd", required=True)
+    s2 = s.add_parser("new", help="ask; spawns the planner detached (one pending ask per decision)")
+    s2.add_argument("decision_id", type=int)
+    s2.add_argument("--text", required=True)
+    s2.add_argument("--actor", default="user")
+    s2 = s.add_parser("run", help="the detached wrapper: run the planner for a pending ask, store the result")
+    s2.add_argument("id", type=int)
+    s2 = s.add_parser("answer", help="store the answer of a pending ask")
+    s2.add_argument("id", type=int)
+    g = s2.add_mutually_exclusive_group(required=True)
+    g.add_argument("--text")
+    g.add_argument("--file")
+    s2.add_argument("--session", help="the Hermes session to resume for follow-ups")
+    s2 = s.add_parser("list", help="one decision's thread (JSON)")
+    s2.add_argument("decision_id", type=int)
+    sub.choices["ask"].set_defaults(fn=lambda cfg, conn, a: out(ask.cli(cfg, conn, a)))
     s = sub.add_parser("backup", help="consistent, integrity-checked copy of factory.db; keeps the newest N")
     s.add_argument("--keep", type=int, default=14)
     s.set_defaults(fn=cmd_backup)

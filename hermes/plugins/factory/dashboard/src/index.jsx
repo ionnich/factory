@@ -17,6 +17,7 @@ const { Button, Badge, Card, CardContent, Input, Tabs, TabsList, TabsTrigger, To
 const h = React.createElement;
 const Fragment = React.Fragment;  // for <>…</>
 const API = "/api/plugins/factory";
+import { Why, WhyContext } from "./why.jsx";
 
 
 const ago = (iso) => (iso ? SDK.utils.isoTimeAgo(iso) : "never");
@@ -148,13 +149,14 @@ function Silence({ d }) {
 }
 
 function DecisionBody({ d, onChoose, busy, err, compact }) {
-  if (!d.open) return <Answered d={d} />;
+  if (!d.open) return <><Answered d={d} /><Why d={d} /></>;
   return (
     <>
       <div className="fx-why"><span className="star">★</span> {d.options.find((o) => o.id === d.recommended)?.label}: {d.why}</div>
       <div className="fx-opts">{sortOptions(d).map((o) => <Option key={o.id} d={d} o={o} busy={busy} onChoose={onChoose} />)}</div>
       <ActErr err={err} />
       {!compact ? <Silence d={d} /> : null}
+      <Why d={d} />
     </>
   );
 }
@@ -893,6 +895,7 @@ function FactoryPage() {
     );
   }
   return (
+    <WhyContext.Provider value={{ asks: data.asks || {}, reviews: reviewOf }}>
     <div className="fx" ref={top}>
       <Toast toast={toast} />
       <header className="fx-head">
@@ -952,6 +955,7 @@ function FactoryPage() {
         </details>
       </>) : null}
     </div>
+    </WhyContext.Provider>
   );
 }
 

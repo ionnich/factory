@@ -562,6 +562,28 @@ def hold(conn, run_id: str, reason: str, actor: str) -> dict:
     return {"run_id": run_id, "review": "held"}
 
 
+def replan(conn, run_id: str, reason: str, actor: str) -> dict:
+    """Send a planned draft back to the planner: the reason becomes a binding root note, the plan and its open
+    review/plan decisions go, and the plan gate picks the draft up again. Answered questions and notes stay."""
+    d = _draft(conn, run_id)
+    if not d["planned_at"]:
+        raise StageError(f"{run_id} has no plan yet")
+    reason = reason.strip()
+    if not reason or len(reason) > 3900:
+        raise StageError("say why it is replanned (1-3900 characters)")
+    with db.tx(conn):
+        conn.execute("INSERT INTO dispatch_note(run_id, node_id, author, body, at) VALUES (?,?,?,?,?)",
+                     (run_id, "root", actor, f"Replan: {reason}", db.now()))
+        steps = conn.execute("DELETE FROM dispatch_step WHERE run_id=?", (run_id,)).rowcount
+        conn.execute("UPDATE ask SET status='failed', error='replanned', answered_at=? WHERE status='pending' AND "
+                     "decision_id IN (SELECT id FROM decision WHERE run_id=? AND kind IN ('review','plan') "
+                     f"AND {decide.OPEN})", (db.now(), run_id))
+        voided = decide.void(conn, "run_id=? AND kind IN ('review','plan')", (run_id,), "replanned")
+        conn.execute("UPDATE dispatch SET planned_at=NULL, held_reason=NULL, last_actor=? WHERE run_id=?",
+                     (actor, run_id))
+    return {"run_id": run_id, "review": "planning", "steps_cleared": steps, "decisions_voided": voided}
+
+
 def _tickets_for_render(cfg: Config, conn, run_id: str, check: bool) -> tuple[list, dict]:
     """Ticket data as drafted (snapshot + verdict pinned in dispatch_ticket). check=True refuses when the ticket or
     its verdict moved during review: the reviewed plan would no longer match."""
