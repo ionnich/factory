@@ -150,6 +150,16 @@ def show(conn, run_id: str) -> dict:
                               "WHERE run_id=? ORDER BY l.identifier, op", (run_id,))]}
 
 
+def unresolved(conn) -> list:
+    """The Reconcile stage's open writes across every run (dispatch, sweep-, followup-): planned, sent and failed ones
+    (skips write nothing), and held ones whose decision is still open (decision_id). A pure read; nothing is applied."""
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM (SELECT l.identifier, w.run_id, w.op, w.status, w.decision, w.reason, (SELECT max(x.id) FROM "
+        "decision x WHERE x.kind='writeback' AND x.run_id=w.run_id AND x.issue_id=w.issue_id AND x.ref=w.op AND "
+        f"{decide.OPEN}) decision_id FROM writeback w LEFT JOIN linear_latest l USING (issue_id)) WHERE "
+        "(status <> 'confirmed' AND decision <> 'skip') OR decision_id IS NOT NULL ORDER BY run_id, identifier, op")]
+
+
 def resolve(conn, run_id: str, identifier: str, op: str, body: str | None, flag_reason: str | None) -> dict:
     """Agent edits: prose of comment/description rows, or downgrade apply -> flag. Nothing else, and never a write
     a person chose to apply."""

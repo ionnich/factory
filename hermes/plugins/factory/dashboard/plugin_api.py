@@ -72,6 +72,11 @@ async def all_tickets():  # the Tickets tab's list; kept off /overview, which re
     return await factory("tickets", "--all")
 
 
+@router.get("/archive")
+async def archive():  # the Archive stage: every archived dispatch (rejected drafts too), newest first; fetched on open
+    return await factory("status", "--archived")
+
+
 @router.get("/tickets/{ident}/timeline")
 async def ticket_timeline(ident: str):
     if not IDENT.match(ident):
