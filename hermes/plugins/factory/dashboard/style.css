@@ -67,7 +67,7 @@
 .fx-q.small { font-size: .98rem; margin: .2rem 0 .35rem; }
 .fx-why { font-size: .86rem; padding: .45rem .6rem; border-radius: 10px;
           background: color-mix(in srgb, var(--a) 11%, transparent); overflow-wrap: anywhere; }
-/* a long explanation (Fold in index.jsx): folded to a preview; open, the whole text takes the preview's place */
+/* a long explanation (Fold in index.jsx): its opening words are the summary, … while folded; open, the rest follows */
 .fx-more { overflow-wrap: anywhere; }
 .fx-more > summary { cursor: pointer; }
 .fx-more[open] .fx-pv { display: none; }
