@@ -158,11 +158,12 @@ def pitfalls(conn, repos_) -> list[str]:
 # than the proposal so a judgment never points forward); the state is the repo and the learning bodies, quoted as
 # data to judge. Each judgment is persisted immediately through jev.store (core owns the separate jev_advice
 # table — decision.detail_json and its trigger stay untouched), so a later proposal in the same pass sees the group
-# root its target just stored. A pass runs like core's refresh: least recently attempted first, within a budget
-# that also caps each call. Unchanged inputs (core's fingerprint) reuse the last successful judgment; failed or
-# disabled calls stay visible and are retried on a later pass; a vanished candidate set clears any stale
-# relationship. Reads go through jev.read under the learning's own repo. Guidance never answers the decision and
-# never changes a learning's status.
+# its target just stored. A pass runs like core's refresh: least recently attempted first, within a budget that
+# also caps each call. Unchanged inputs (core's fingerprint) reuse the last successful judgment without a call, but
+# its group is local: rebuilt from the target's served advice, stored only when it moved. Failed or disabled calls
+# stay visible and are retried on a later pass; a vanished candidate set clears any stale relationship. Reads go
+# through jev.read under the learning's own repo. Guidance never answers the decision and never changes a
+# learning's status.
 # ponytail: 40 candidates → 121 choice options with "none", well inside the 255-choice ceiling; the cap is
 # latency, not the API — raise to 84 (the real ceiling) only if duplicate recall measurably misses at 40.
 JEV_CANDIDATES = 40
@@ -214,17 +215,20 @@ def _jev_relation(choice, candidates: list[dict]) -> dict | None:
     return {"kind": kind, "learning_id": target["id"], "body": target["body"]} if target else None
 
 
-def _jev_group(conn, lid: int, target: int) -> str | None:
+def _jev_group(conn, l: dict, target: int) -> str | None:
     """learning:<root>: every member of a duplicate/supports component points at its lowest id, and the root points
-    nowhere, so group links can never form cycles."""
-    root = min(lid, target)
+    nowhere, so group links can never form cycles. The target's group counts only as its served advice shows it
+    under this repo (a group whose relation went stale is gone there), and only while that root is still an active
+    or proposed learning in this repo: a link still current never carries a rejected, expired or relocated root."""
+    root = min(l["id"], target)
     row = conn.execute("SELECT id FROM decision WHERE kind='learning' AND ref=? ORDER BY id LIMIT 1",
                        (str(target),)).fetchone()
-    if row:
-        g = (jev.stored(conn, row["id"]) or {}).get("group")
-        if isinstance(g, str) and g.startswith("learning:") and g[9:].isdigit():
-            root = min(root, int(g[9:]))
-    return f"learning:{root}" if root < lid else None
+    g = ((jev.read(conn, row["id"], [], {l["scope"]}) if row else None) or {}).get("group")
+    if isinstance(g, str) and g.startswith("learning:") and g[9:].isdigit() and conn.execute(
+            "SELECT 1 FROM learning WHERE id=? AND scope=? AND status IN ('active', 'proposed')",
+            (int(g[9:]), l["scope"])).fetchone():
+        root = min(root, int(g[9:]))
+    return f"learning:{root}" if root < l["id"] else None
 
 
 def _jev_build(res: dict, fp: str, conn, l: dict, candidates: list[dict]) -> dict:
@@ -242,7 +246,7 @@ def _jev_build(res: dict, fp: str, conn, l: dict, candidates: list[dict]) -> dic
         if rel and conf is not None and conf >= JEV_CONF:
             out["relation"] = rel
             if rel["kind"] in ("duplicate", "supports"):
-                group = _jev_group(conn, l["id"], rel["learning_id"])
+                group = _jev_group(conn, l, rel["learning_id"])
                 if group:
                     out["group"] = group
     else:
@@ -257,8 +261,9 @@ def _jev_refresh(cfg, conn, budget: float | None = jev.REFRESH_BUDGET) -> None:
     a second left, and the rest waits for a later pass. None: no pass bound (explicit factory jev sync); each call
     keeps its own timeout. The network call happens here, never under a transaction; each result is persisted at
     once through core's jev.store, whose own short transaction rechecks the decision is still open, so one answered
-    or withdrawn while in flight is left untouched, and a later proposal in the same pass sees the group root its
-    duplicate/supports target just stored."""
+    or withdrawn while in flight is left untouched, and a later proposal in the same pass sees the group its
+    duplicate/supports target just stored. An unchanged success makes no call but is regrouped from its target's
+    current advice (the target was re-judged or regrouped since, say after it in a pass), stored only if it moved."""
     deadline = None if budget is None else time.monotonic() + budget
     opens = conn.execute(
         "SELECT d.id did, l.id lid, l.kind, l.scope, l.body FROM decision d "
@@ -278,7 +283,14 @@ def _jev_refresh(cfg, conn, budget: float | None = jev.REFRESH_BUDGET) -> None:
             {k: c[k] for k in ("id", "status", "source", "scope")} for c in candidates]}, [], questions)
         cur = jev.stored(conn, d["did"]) or {}
         if cur.get("status") == "ok" and cur.get("fingerprint") == fp:
-            continue  # unchanged successful judgment: reuse it
+            # Unchanged successful judgment: reuse it, no call. Its group is local, though: rebuild it from the
+            # target's current advice and store the judgment again only when the group moved.
+            rel = cur.get("relation") or {}
+            group = _jev_group(conn, l, rel["learning_id"]) if rel.get("kind") in ("duplicate", "supports") else None
+            if group != cur.get("group"):
+                cur.pop("group", None)
+                jev.store(conn, d["did"], {**cur, "group": group} if group else cur)
+            continue
         if not candidates:
             if "relation" in cur or "group" in cur:
                 # Nothing left to compare: clear the relationship the vanished candidate set produced.

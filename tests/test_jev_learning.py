@@ -245,6 +245,40 @@ class JevLearning(unittest.TestCase):
         self.assertEqual(g2, f"learning:{c0}")  # adopts the component root, not the direct target
         self.assertLess(int(g2.split(":")[1]), lid2)  # group targets always sit below the member's own id
 
+    def test_a_cached_judgment_regroups_without_a_call_and_a_rejected_root_never_returns(self):
+        lid1, did1 = self.propose("a.py: root fact", source="decision:1")
+        lid2, did2 = self.propose("b.py: middle fact", source="decision:2")
+        lid3, did3 = self.propose("c.py: leaf fact", source="decision:3")
+        lid4, did4 = self.propose("d.py: outer leaf fact", source="decision:4")
+        target = {"b.py: middle fact": lid1, "c.py: leaf fact": lid2, "d.py: outer leaf fact": lid3}
+        down, calls = {"b.py: middle fact"}, []
+
+        def respond(cfg, state, questions, timeout=None):
+            body = state["proposal"]["body"]
+            calls.append(body)
+            if body in down:
+                return {"status": "unavailable", "error": "typesafe api: TimeoutError"}
+            return ok(f"duplicate:{target[body]}")
+
+        group = lambda did: self.advice(did).get("group")
+        with mock.patch.object(jev, "evaluate", side_effect=respond):
+            learn.sync(self.cfg, self.c)  # the middle's call fails: the chain groups under the leaf's direct target
+            self.assertEqual([group(did3), group(did4)], [f"learning:{lid2}"] * 2)
+            down.clear()
+            calls.clear()
+            learn.sync(self.cfg, self.c)  # the middle is re-judged into the root's group; both leaves are unchanged
+            self.assertEqual(calls, ["b.py: middle fact"])  # the leaves' cached judgments made no call...
+            self.assertEqual([group(did3), group(did4)], [f"learning:{lid1}"] * 2)  # ...yet moved with the chain
+            decide.choose(self.cfg, self.c, did1, "reject", "user")
+            self.assertEqual(jev.stored(self.c, did2)["group"], f"learning:{lid1}")  # raw: still the rejected root
+            # The middle's served advice lost its stale relation, so the leaf groups under the middle; the leaf's
+            # own link is still current, yet the rejected root it carries never passes to the outer leaf.
+            self.assertEqual(learn._jev_group(self.c, {"id": lid3, "scope": "r"}, lid2), f"learning:{lid2}")
+            self.assertEqual(learn._jev_group(self.c, {"id": lid4, "scope": "r"}, lid3), f"learning:{lid3}")
+            learn.sync(self.cfg, self.c)  # least recently judged first: both leaves before the middle clears
+        self.assertEqual([group(did3), group(did4)], [f"learning:{lid2}"] * 2)
+        self.assertIsNone(group(did2))
+
     def test_unrelated_repo_candidate_is_never_compared(self):
         other = self.candidate("other.py: x lives here", scope="elsewhere")
         _, did = self.propose("the parser lives in other.py")
