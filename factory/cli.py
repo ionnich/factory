@@ -146,7 +146,14 @@ def cmd_decide(cfg, conn, a):
 
 
 def cmd_jev(cfg, conn, a):
-    out(jev.refresh(cfg, conn, budget=None))  # explicit sync: judge the whole queue, no tick budget
+    """Explicit sync, and nothing else (no ingest, handoff or answer): the whole open plan/ask/review queue without
+    the tick budget, then the learning slice's relations on open learning decisions."""
+    res = {"decisions": jev.refresh(cfg, conn, budget=None)}
+    learn._jev_refresh(cfg, conn)  # reports nothing itself: show what each open learning decision now carries
+    res["learnings"] = [{"decision": d["id"], **{k: v for k, v in d["jev"].items()
+                                                 if k in ("status", "confidence", "relation", "group", "error")}}
+                        for d in decide.rows(conn) if d["kind"] == "learning" and d["jev"]]
+    out(res)
 
 
 def _dispatch_repos(conn, run_ids) -> set[str]:
@@ -713,7 +720,8 @@ def main(argv=None):
     s.set_defaults(fn=cmd_witness)
     s = sub.add_parser("jev", help="Jev judgment guidance for open decisions").add_subparsers(dest="jcmd",
                                                                                               required=True)
-    s2 = s.add_parser("sync", help="re-judge open plan/ask/review decisions (also runs each propose tick)")
+    s2 = s.add_parser("sync", help="re-judge open plan/ask/review decisions and proposed learnings' relations "
+                                   "(propose ticks do both)")
     s2.set_defaults(fn=cmd_jev)
 
     a = p.parse_args(argv)

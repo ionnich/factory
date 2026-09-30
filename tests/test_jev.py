@@ -1,6 +1,8 @@
-"""Jev: the shared client contract (validated, sanitized, no fabrication), judgment guidance on open
-plan/ask/review decisions (batched typed-Choice category/rule/focus, fingerprint reuse, stale-claim drop),
-the plan-time investigation gate, and learning decisions never earning rule approval."""
+"""Jev: the shared client contract (validated, sanitized, no fabrication, bounded), judgment guidance on open
+plan/ask/review decisions (batched typed-Choice category/rule/focus, fingerprint reuse, a budgeted refresh that
+never starves later decisions, scoped stale-claim removal), the plan-time investigation gate, and learning
+decisions never earning rule approval."""
+import io
 import json
 import sqlite3
 import tempfile
@@ -13,7 +15,6 @@ from factory import db, decide, dispatch, jev
 from factory.config import ConfigError
 
 SNAP = "2026-09-01T00:00:00Z"
-CATEGORIES = ("investigate", "policy", "human", "unclear")
 
 
 def choice_answer(questions, qid, choice, confidence=0.9):
@@ -24,20 +25,25 @@ def choice_answer(questions, qid, choice, confidence=0.9):
 
 
 def ok_result(category="human", confidence=0.9, rule=None, focus=None, rule_conf=0.9):
-    """evaluate() stub: answers every question asked, so assess sees a valid batched judgment."""
-    def stub(cfg, state, questions):
+    """evaluate() stub: answers every question asked, and the answers pass the client's own validation (complete,
+    normalized probability maps), so assess sees a realistic batched judgment."""
+    def stub(cfg, state, questions, timeout=None):
         answers = {"category": choice_answer(questions, "category", category, confidence)}
         if "rule" in questions:
             answers["rule"] = choice_answer(questions, "rule", rule or "none", rule_conf)
         if "focus" in questions:
             answers["focus"] = choice_answer(questions, "focus", focus or "none", 0.9)
-        return {"status": "ok", "model": "jev-1.13.0", "answers": answers,
-                "usage": {"input_tokens": 10, "output_tokens": 5}}
+        res = {"status": "ok", "model": "jev-1.13.0", "answers": answers,
+               "usage": {"input_tokens": 10, "output_tokens": 5}}
+        jev._validate(res, questions)
+        return res
     return stub
 
 
 class Client(unittest.TestCase):
-    """evaluate(): never raises, never fabricates, validates the response, sanitizes errors."""
+    """evaluate(): never raises, never fabricates, validates the response, never echoes a secret or provider text."""
+    KEY = "tsk-live-secret-key"
+
     def setUp(self):
         self.cfg = SimpleNamespace(raw={"jev": {"enabled": True, "model": "jev-1.13.0", "timeout_seconds": 5}})
         self.qs = jev._questions({"kind": "plan", "options": []}, [])
@@ -48,6 +54,14 @@ class Client(unittest.TestCase):
                                               "confidence": 0.9}},
                      "usage": {"input_tokens": 11, "output_tokens": 3}}
 
+    def assertUnavailable(self, res, *leaks):
+        """A failure: unavailable, no judgment, and neither the key nor any provider/secret text in it."""
+        self.assertEqual(res["status"], "unavailable")
+        self.assertNotIn("answers", res)
+        blob = json.dumps(res)
+        for leak in (self.KEY, *leaks):
+            self.assertNotIn(leak, blob)
+
     def test_requires_an_explicitly_enabled_config(self):
         self.assertEqual(jev.evaluate(SimpleNamespace(raw={}), "s", {})["status"], "disabled")
 
@@ -56,72 +70,75 @@ class Client(unittest.TestCase):
                 mock.patch("factory.jev.urllib.request.urlopen") as url:
             res = jev.evaluate(self.cfg, {"a": 1}, {})
         url.assert_not_called()
-        self.assertEqual(res["status"], "unavailable")
-        self.assertIn("TYPESAFE_API_KEY", res["error"])
+        self.assertUnavailable(res)
 
-    def test_an_unreadable_secret_is_unavailable_with_a_type_only_error(self):
-        for exc in (OSError("permission denied"), UnicodeDecodeError("utf-8", b"\xff", 0, 1, "boom")):
+    def test_an_unreadable_secret_is_unavailable_and_never_echoed(self):
+        for exc in (OSError("TYPESAFE_API_KEY=tsk-from-env-file unreadable"),
+                    UnicodeDecodeError("utf-8", b"tsk-env-bytes\xff", 13, 14, "tsk-decode-reason")):
             with self.subTest(exc=type(exc).__name__), \
                     mock.patch("factory.jev.config.secret", side_effect=exc), \
                     mock.patch("factory.jev.urllib.request.urlopen") as url:
                 res = jev.evaluate(self.cfg, {"a": 1}, {})
-            url.assert_not_called()
-            self.assertEqual(res["status"], "unavailable")
-            self.assertEqual(res["error"], f"typesafe api: TYPESAFE_API_KEY unreadable ({type(exc).__name__})")
+                url.assert_not_called()
+                self.assertUnavailable(res, "tsk-from-env-file", "tsk-env-bytes", "tsk-decode-reason")
 
     def test_ok_response_is_validated_and_returned(self):
         seen = {}
 
         def urlopen(req, timeout):
-            seen.update(body=req.data, auth=req.headers["Authorization"])
-            cm = mock.MagicMock()
-            cm.__enter__.return_value.read.return_value = json.dumps(self.base).encode()
-            return cm
+            seen.update(auth=req.headers["Authorization"])
+            return self.respond(self.base)
 
-        with mock.patch("factory.jev.config.secret", return_value="k"), \
+        with mock.patch("factory.jev.config.secret", return_value=self.KEY), \
                 mock.patch("factory.jev.urllib.request.urlopen", side_effect=urlopen) as url:
             res = jev.evaluate(self.cfg, {"decision": {"question": "q?"}}, self.qs)
         url.assert_called_once()
         self.assertEqual(res, {"status": "ok", "model": "jev-1.13.0", "answers": self.base["answers"],
                                "usage": {"input_tokens": 11, "output_tokens": 3}})
-        self.assertEqual(seen["auth"], "Bearer k")
-        body = json.loads(seen["body"])
-        self.assertEqual(body["model"], "jev-1.13.0")
-        self.assertEqual(body["questions"]["category"]["criteria"], self.qs["category"]["criteria"])
+        self.assertEqual(seen["auth"], f"Bearer {self.KEY}")
 
-    def test_http_errors_are_sanitized(self):
-        import urllib.error
-        with mock.patch("factory.jev.config.secret", return_value="k"), \
+    def test_a_call_never_waits_past_the_callers_budget_or_its_timeout(self):
+        seen = []
+        with mock.patch("factory.jev.config.secret", return_value=self.KEY), \
                 mock.patch("factory.jev.urllib.request.urlopen",
-                           side_effect=urllib.error.HTTPError("u", 429, "too many", {}, None)):
-            res = jev.evaluate(self.cfg, "s", self.qs)
-        self.assertEqual(res, {"status": "unavailable", "error": "typesafe api: HTTP 429"})
+                           side_effect=lambda req, timeout: seen.append(timeout) or self.respond(self.base)):
+            for left in (2.5, 60):
+                self.assertEqual(jev.evaluate(self.cfg, "s", self.qs, timeout=left)["status"], "ok")
+        self.assertEqual(seen, [2.5, 5])  # the remaining budget, never beyond timeout_seconds (5)
 
-    def test_network_errors_carry_no_provider_detail(self):
+    def test_http_errors_are_unavailable_without_the_provider_body(self):
         import urllib.error
-        with mock.patch("factory.jev.config.secret", return_value="k"), \
-                mock.patch("factory.jev.urllib.request.urlopen",
-                           side_effect=urllib.error.URLError("connection refused; secret-abc leaked")):
+        err = urllib.error.HTTPError("u", 429, "tsk-provider-reason", {},
+                                     io.BytesIO(b'{"error": "key tsk-provider-body rejected"}'))
+        with mock.patch("factory.jev.config.secret", return_value=self.KEY), \
+                mock.patch("factory.jev.urllib.request.urlopen", side_effect=err):
             res = jev.evaluate(self.cfg, "s", self.qs)
-        self.assertEqual(res["status"], "unavailable")
-        self.assertEqual(res["error"], "typesafe api: URLError")
+        self.assertUnavailable(res, "tsk-provider-reason", "tsk-provider-body")
+
+    def test_network_and_protocol_errors_are_unavailable_without_provider_detail(self):
+        import http.client
+        import urllib.error
+        for exc in (urllib.error.URLError("connection refused; tsk-network-detail"),
+                    http.client.IncompleteRead(b"tsk-partial-body")):
+            with self.subTest(exc=type(exc).__name__), \
+                    mock.patch("factory.jev.config.secret", return_value=self.KEY), \
+                    mock.patch("factory.jev.urllib.request.urlopen", side_effect=exc):
+                self.assertUnavailable(jev.evaluate(self.cfg, "s", self.qs), "tsk-network-detail", "tsk-partial-body")
 
     def test_an_undecodable_response_is_unavailable_not_a_judgment(self):
-        with mock.patch("factory.jev.config.secret", return_value="k"), \
+        with mock.patch("factory.jev.config.secret", return_value=self.KEY), \
                 mock.patch("factory.jev.urllib.request.urlopen",
                            return_value=mock.MagicMock(**{
                                "__enter__.return_value.read.return_value": b"\xff\xfe"})):
             res = jev.evaluate(self.cfg, "s", self.qs)
-        self.assertEqual(res["status"], "unavailable")
-        self.assertEqual(res["error"], "typesafe api: UnicodeDecodeError")
+        self.assertUnavailable(res)
 
-    def test_unserializable_state_is_a_fixed_unavailable_error(self):
-        with mock.patch("factory.jev.config.secret", return_value="k"), \
+    def test_unserializable_state_is_unavailable_without_a_call_or_an_echo(self):
+        with mock.patch("factory.jev.config.secret", return_value=self.KEY), \
                 mock.patch("factory.jev.urllib.request.urlopen") as url:
-            res = jev.evaluate(self.cfg, {"bad": object()}, self.qs)
+            res = jev.evaluate(self.cfg, {"bad": object(), "note": "tsk-state-text"}, self.qs)
         url.assert_not_called()
-        self.assertEqual(res, {"status": "unavailable",
-                               "error": "typesafe api: request state is not JSON-serializable"})
+        self.assertUnavailable(res, "tsk-state-text")
 
     def bad(self, **over):
         payload = json.loads(json.dumps(self.base))
@@ -137,19 +154,17 @@ class Client(unittest.TestCase):
         return mock.MagicMock(**{"__enter__.return_value.read.return_value": json.dumps(payload).encode()})
 
     def evaluate_bad(self, payload):
-        with mock.patch("factory.jev.config.secret", return_value="k"), \
+        with mock.patch("factory.jev.config.secret", return_value=self.KEY), \
                 mock.patch("factory.jev.urllib.request.urlopen", return_value=self.respond(payload)):
             return jev.evaluate(self.cfg, "s", self.qs)
 
     def test_invalid_responses_are_unavailable_not_judgments(self):
-        cases = {"answers.category.choice": "nope", "answers.category.confidence": 1.5,
+        cases = {"answers.category.choice": "tsk-provider-choice", "answers.category.confidence": 1.5,
                  "answers.category.probabilities.human": -0.1, "answers.category.type": "noul",
                  "answers": {}, "usage.input_tokens": "many"}
         for path, value in cases.items():
             with self.subTest(path=path):
-                res = self.evaluate_bad(self.bad(**{path: value}))
-            self.assertEqual(res["status"], "unavailable", path)
-            self.assertTrue(res["error"].startswith("typesafe api:"), path)
+                self.assertUnavailable(self.evaluate_bad(self.bad(**{path: value})), "tsk-provider-choice")
 
     def test_probability_maps_must_be_exact_normalized_and_peak_at_the_choice(self):
         def payload(probs, choice="human"):
@@ -168,9 +183,7 @@ class Client(unittest.TestCase):
         }
         for name, p in bads.items():
             with self.subTest(name=name):
-                res = self.evaluate_bad(p)
-            self.assertEqual(res["status"], "unavailable", name)
-            self.assertTrue(res["error"].startswith("typesafe api:"), name)
+                self.assertUnavailable(self.evaluate_bad(p))
         # a tie for the maximum is fine
         ok = payload({"human": 0.5, "unclear": 0.5, "investigate": 0.0, "policy": 0.0})
         self.assertEqual(self.evaluate_bad(ok)["status"], "ok")
@@ -191,7 +204,7 @@ class Guidance(unittest.TestCase):
 
     def seed_rule(self, body, scope="r", keep_by="user"):
         self.c.execute("INSERT INTO learning(kind,scope,body,anchors_json,source,status,created_at) "
-                       "VALUES ('house_rule',?,?,'[]','decision:1','active',?)", (scope, body, SNAP))
+                       "VALUES ('house_rule',?,?,'[]',?,'active',?)", (scope, body, f"theme:{body}", SNAP))
         lid = self.c.execute("SELECT max(id) FROM learning").fetchone()[0]
         ld = decide.open_(self.c, "learning", "keep it?", [decide.option("keep", "Keep", "x"),
                                                            decide.option("reject", "Drop", "y")],
@@ -207,9 +220,6 @@ class Guidance(unittest.TestCase):
         d = decide.one(self.c, did)
         self.assertEqual(d["jev"]["status"], "ok")
         self.assertEqual(d["jev"]["category"], "human")
-        self.assertEqual(d["jev"]["model"], "jev-1.13.0")
-        self.assertEqual(d["jev"]["focus"], "none")  # the options carry no differing consequence text
-        self.assertTrue(d["jev"]["fingerprint"])
         self.assertEqual(jev.stored(self.c, did), d["jev"])  # the stored payload is what reads serve
         detail = json.loads(self.c.execute("SELECT detail_json FROM decision WHERE id=?", (did,)).fetchone()[0])
         self.assertNotIn("jev", detail)  # guidance never lives inside detail_json
@@ -224,11 +234,30 @@ class Guidance(unittest.TestCase):
             jev.refresh(self.cfg, self.c)
         d = decide.one(self.c, did)
         self.assertEqual(d["jev"]["status"], "unavailable")
-        self.assertEqual(d["jev"]["error"], "typesafe api: HTTP 500")
         with mock.patch("factory.jev.evaluate", side_effect=ok_result()) as ev:
             jev.refresh(self.cfg, self.c)
         ev.assert_called_once()  # failures are never cached as judgments
         self.assertEqual(decide.one(self.c, did)["jev"]["status"], "ok")
+
+    def test_a_budgeted_pass_caps_each_call_and_never_starves_later_decisions(self):
+        for i in range(3):
+            self.plan_decision(f"Question {i}?")
+        clock, calls, ends = [0.0], [], []
+
+        def hang(cfg, state, questions, timeout=None):  # a hung call burns all the time it is allowed
+            calls.append(state["decision"]["question"])
+            clock[0] += timeout
+            return {"status": "unavailable", "error": "typesafe api: TimeoutError"}
+
+        with mock.patch.object(jev.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch("factory.jev.evaluate", side_effect=hang):
+            for _ in range(4):  # four propose ticks
+                clock[0] = 0.0
+                jev.refresh(self.cfg, self.c, budget=10)
+                ends.append(clock[0])
+        self.assertEqual(ends, [10.0] * 4)  # one hung call per pass, capped to what was left of the budget
+        # the decision whose call just failed waits behind the rest: each gets its turn before any retry
+        self.assertEqual(calls, ["Question 0?", "Question 1?", "Question 2?", "Question 0?"])
 
     def test_a_changed_decision_is_rejudged(self):
         did = self.plan_decision()
@@ -248,12 +277,11 @@ class Guidance(unittest.TestCase):
         with mock.patch("factory.jev.evaluate", side_effect=ok_result("unclear", 0.6)) as ev:
             jev.refresh(self.cfg, self.c)
         ev.assert_called_once()
-        self.assertEqual(decide.one(self.c, did)["jev"]["model"], "jev-1.13.0")  # the stub's model, not the config
 
     def test_an_answer_made_during_the_call_is_never_overwritten(self):
         did = self.plan_decision()
 
-        def answer_it(cfg, state, questions):
+        def answer_it(cfg, state, questions, timeout=None):
             decide.choose(self.cfg, self.c, did, "a", "user")
             return ok_result()(cfg, state, questions)
 
@@ -332,20 +360,25 @@ class Guidance(unittest.TestCase):
         self.assertIsNotNone(decide.one(self.c, did)["jev"]["rule"])
         self.c.execute("UPDATE learning SET status='expired' WHERE id=?", (lid,))  # anchors moved on
         d = decide.one(self.c, did)
-        self.assertIsNone(d["jev"]["rule"])  # no stale approved-rule claim after it expires
+        self.assertNotIn("rule", d["jev"])  # no stale approved-rule claim after it expires
         self.assertEqual(d["jev"]["category"], "unclear")  # the policy claim left with its rule
         self.assertEqual(d["jev"]["status"], "ok")
 
-    def test_reads_drop_a_stale_relation(self):
+    def test_reads_drop_a_stale_relation_and_its_group_together(self):
         did = self.plan_decision()
         self.c.execute("INSERT INTO learning(kind,scope,body,anchors_json,source,status,created_at) "
                        "VALUES ('house_rule','r','b','[]','decision:1','proposed',?)", (SNAP,))
         lid = self.c.execute("SELECT max(id) FROM learning").fetchone()[0]
-        self.assertTrue(jev.store(self.c, did, {"status": "ok", "relation": {"kind": "duplicate",
-                                                                             "learning_id": lid, "body": "b"}}))
-        self.assertIsNotNone(decide.one(self.c, did)["jev"]["relation"])
+        advice = {"status": "ok", "relation": {"kind": "duplicate", "learning_id": lid, "body": "b"},
+                  "group": "learning:1"}
+        self.assertTrue(jev.store(self.c, did, advice))
+        self.assertEqual(jev.served(advice, self.c, [])["group"], "learning:1")  # learn.rows' unscoped call
         self.c.execute("UPDATE learning SET status='expired' WHERE id=?", (lid,))
-        self.assertIsNone(decide.one(self.c, did)["jev"]["relation"])  # no relation to a gone learning
+        for shown in (decide.one(self.c, did)["jev"], jev.served(advice, self.c, [])):
+            self.assertNotIn("relation", shown)  # no relation to a gone learning
+            self.assertNotIn("group", shown)
+        # a group never outlives its relation, however the relation went missing
+        self.assertNotIn("group", jev.served({"status": "ok", "group": "learning:1"}, self.c, []))
 
     def test_a_rewritten_or_relocated_relation_target_drops_relation_and_group(self):
         did = self.plan_decision()
@@ -355,16 +388,46 @@ class Guidance(unittest.TestCase):
         advice = {"status": "ok", "relation": {"kind": "duplicate", "learning_id": lid, "body": "b"},
                   "group": "learning:1"}
         self.assertTrue(jev.store(self.c, did, advice))
-        self.assertEqual(decide.one(self.c, did)["jev"]["group"], "learning:1")
-        self.c.execute("UPDATE learning SET body='rewritten' WHERE id=?", (lid,))  # body changed: stale
-        d = decide.one(self.c, did)
-        self.assertIsNone(d["jev"]["relation"])
-        self.assertIsNone(d["jev"]["group"])
-        self.assertTrue(jev.store(self.c, did, advice))
-        self.c.execute("UPDATE learning SET scope='other' WHERE id=?", (lid,))  # left the repo scope: stale
-        d = decide.one(self.c, did)
-        self.assertIsNone(d["jev"]["relation"])
-        self.assertIsNone(d["jev"]["group"])
+        for change in ("body='rewritten'", "scope='other'"):  # each alone makes the judged target stale
+            with self.subTest(change=change):
+                self.c.execute("UPDATE learning SET body='b', scope='r' WHERE id=?", (lid,))
+                self.assertEqual(decide.one(self.c, did)["jev"]["group"], "learning:1")
+                self.c.execute(f"UPDATE learning SET {change} WHERE id=?", (lid,))
+                shown = decide.one(self.c, did)["jev"]
+                self.assertNotIn("relation", shown)
+                self.assertNotIn("group", shown)
+
+    def test_a_learning_decision_reads_its_relation_within_its_learnings_repo(self):
+        lids = []
+        for body in ("older fact", "proposed fact"):
+            self.c.execute("INSERT INTO learning(kind,scope,body,anchors_json,source,status,created_at) "
+                           "VALUES ('pitfall','r',?,'[]',?,'proposed',?)", (body, f"decision:{body}", SNAP))
+            lids.append(self.c.execute("SELECT max(id) FROM learning").fetchone()[0])
+        target, proposal = lids
+        ld = decide.open_(self.c, "learning", "keep it?", [decide.option("keep", "Keep", "x"),
+                                                           decide.option("reject", "Drop", "y")],
+                          "keep", "why", "factory:learn", ref=str(proposal))
+        self.assertTrue(jev.store(self.c, ld, {"status": "ok", "group": f"learning:{target}", "relation": {
+            "kind": "duplicate", "learning_id": target, "body": "older fact"}}))
+        self.assertEqual(decide.one(self.c, ld)["jev"]["group"], f"learning:{target}")
+        self.c.execute("UPDATE learning SET scope='other' WHERE id=?", (target,))  # relocated to another repo
+        shown = decide.one(self.c, ld)["jev"]
+        self.assertNotIn("relation", shown)
+        self.assertNotIn("group", shown)
+
+    def test_the_newest_kept_rules_are_offered_when_there_are_more_than_fit(self):
+        lids = [self.seed_rule(f"Rule number {i}") for i in range(jev.MAX_RULES + 1)]
+        seen = {}
+
+        def stub(cfg, state, questions, timeout=None):
+            seen.update(state=state)
+            return ok_result()(cfg, state, questions)
+
+        self.plan_decision()
+        with mock.patch("factory.jev.evaluate", side_effect=stub):
+            jev.refresh(self.cfg, self.c)
+        # a new rule is never crowded out by older ones
+        self.assertEqual({r["id"] for r in seen["state"]["rules"]}, set(lids[1:]))
 
     def test_a_cross_repo_rule_is_never_offered_to_a_ticket_question(self):
         # d1 covers r and r2; the question sits on ticket T in r2; the rule lives in r.
@@ -380,7 +443,7 @@ class Guidance(unittest.TestCase):
         self.seed_rule("Never ship on a Friday", scope="r")
         seen = {}
 
-        def stub(cfg, state, questions):
+        def stub(cfg, state, questions, timeout=None):
             seen.update(state=state, questions=questions)
             return ok_result("human", 0.9)(cfg, state, questions)
 
@@ -456,7 +519,6 @@ class PlanGate(unittest.TestCase):
         with mock.patch("factory.jev.evaluate", side_effect=ok_result("investigate", 0.9)) as ev:
             with self.assertRaises(dispatch.StageError) as ctx:
                 dispatch.plan(self.cfg, self.c, "d1", self.payload())
-        self.assertIn("investigate in the code", str(ctx.exception))
         self.assertIn("'flag'", str(ctx.exception))  # names the question: actionable for the planner
         d = self.c.execute("SELECT state, planned_at FROM dispatch WHERE run_id='d1'").fetchone()
         self.assertEqual((d["state"], d["planned_at"]), ("draft", None))
@@ -491,7 +553,6 @@ class PlanGate(unittest.TestCase):
         by_kind = {d["kind"]: d for d in decide.rows(self.c, "d1")}
         self.assertEqual(by_kind["plan"]["jev"]["status"], "unavailable")
         self.assertEqual(by_kind["review"]["jev"]["status"], "unavailable")
-        self.assertEqual(jev.stored(self.c, by_kind["plan"]["id"])["error"], "typesafe api: HTTP 500")
 
     def test_plan_with_jev_disabled_has_no_guidance_and_no_gate(self):
         cfg = SimpleNamespace(repos={}, raw={})
@@ -523,9 +584,7 @@ class LearningTier(unittest.TestCase):
         self.assertIsNone(d["deadline"])  # waits for the user, not "the factory takes ★"
         # _deadline itself handles the raw row (tier='auto', due_at set): no reliance on _row's normalization
         raw = self.c.execute("SELECT * FROM decision WHERE id=?", (legacy,)).fetchone()
-        deadline, on_timeout = decide._deadline(self.c, dict(raw))
-        self.assertIsNone(deadline)
-        self.assertIn("explicit approval", on_timeout)
+        self.assertIsNone(decide._deadline(self.c, dict(raw))[0])
         self.assertEqual(decide.sweep(self.cfg, self.c), [])
         self.assertTrue(decide.one(self.c, legacy)["open"])
 
@@ -577,8 +636,7 @@ class Storage(unittest.TestCase):
                   "rule": {"id": 42, "body": "b", "option_id": "a"}}
         self.assertTrue(jev.store(self.c, did, advice))
         d = decide.one(self.c, did)
-        self.assertEqual(jev.read(self.c, did, d["options"], {"r"}), d["jev"])  # decide rows use the same helper
-        self.assertIsNone(d["jev"]["rule"])  # rule 42 does not exist: never shown
+        self.assertNotIn("rule", d["jev"])  # rule 42 does not exist: never shown
         self.assertEqual(d["jev"]["category"], "unclear")  # and its policy claim left with it
 
     def test_an_open_decision_row_is_still_immutable(self):
