@@ -372,6 +372,22 @@ WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
   OR (OLD.due_at IS NOT NULL AND NEW.due_at IS NOT OLD.due_at)
 BEGIN SELECT RAISE(ABORT, 'a decision''s clock (notified_at, due_at) is set once, while it is open'); END;
 
+-- Exact recorded executor answer, queued with the choice; retries never choose again. Only explicit retries send.
+CREATE TABLE executor_delivery (
+  decision_id INTEGER PRIMARY KEY REFERENCES decision(id),
+  answer TEXT NOT NULL,
+  message TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'sent', 'failed')),
+  error TEXT,
+  attempted_at TEXT,
+  sent_at TEXT,
+  sender_pid INTEGER CHECK (sender_pid > 0),
+  CHECK ((state = 'sending') = (sender_pid IS NOT NULL))
+);
+CREATE TRIGGER executor_delivery_frozen BEFORE UPDATE OF decision_id, answer, message ON executor_delivery
+WHEN NEW.decision_id IS NOT OLD.decision_id OR NEW.answer IS NOT OLD.answer OR NEW.message IS NOT OLD.message
+BEGIN SELECT RAISE(ABORT, 'the recorded executor answer is immutable'); END;
+
 -- What the factory told the user in the factory Bot Chat (Hermex): pushes when work is stopped on them (capped
 -- per day) and the digest at notify.digest times (one per slot, recorded even when it had nothing to say).
 CREATE TABLE notice (

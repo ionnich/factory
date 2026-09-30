@@ -6,12 +6,13 @@ ones whose time came; `notify` pushes the ones that stop work and puts the rest 
 takes ★ only for kinds where the user's last answer agreed with it; EARNED_AFTER straight ★ answers and the
 factory stops asking that kind."""
 import json
+import os
 from datetime import UTC, datetime, timedelta
 
 from . import db, dispatch
 
-# Choices that start real work, stop it, or write Linear: the chat tool asks the human through Hermes's approval
-# prompt before sending one of these.
+# Choices that start real work, stop it, write Linear or direct an executor: the chat tool asks the human through
+# Hermes's approval prompt before sending one of these.
 WEIGHTY = {("review", "approve"), ("writeback", "apply"), ("executor-gone", "restart"), ("executor-gone", "stop"),
            ("dispatch-stuck", "restart"), ("dispatch-stuck", "stop")}
 OPEN = "chosen IS NULL AND void_reason IS NULL"
@@ -52,6 +53,8 @@ def streak(conn, kind: str) -> int | None:
 def _tier(conn, kind: str, run_id: str | None, options: list) -> str:
     """auto: nothing for a person to weigh, or ★ earned. now: work is stopped until the user answers. digest: it
     can wait for the next digest. A person's draft, or one they held, is never started without them."""
+    if kind == "ask":
+        return "now"  # Directing an executor always needs a fresh human choice, never an earned auto-answer.
     earned = kind != "plan" and (streak(conn, kind) or 0) >= EARNED_AFTER
     if kind == "review":
         d = conn.execute("SELECT drafted_by, emergency, held_reason FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
@@ -64,7 +67,7 @@ def _tier(conn, kind: str, run_id: str | None, options: list) -> str:
         return "now" if again else "auto"
     if earned:
         return "auto"
-    return "now" if kind == "ask" else "digest"
+    return "digest"
 
 
 def option(id: str, label: str, leads_to: str, note: str | None = None) -> dict:
@@ -208,7 +211,8 @@ def _deadline(conn, d) -> tuple[str | None, str]:
 
 def _row(conn, r) -> dict:
     d = dict(r)
-    d["options"] = [{**o, "weighty": (d["kind"], o["id"]) in WEIGHTY} for o in json.loads(d.pop("options_json"))]
+    d["options"] = [{**o, "weighty": d["kind"] == "ask" or (d["kind"], o["id"]) in WEIGHTY}
+                    for o in json.loads(d.pop("options_json"))]
     d["detail"] = json.loads(d.pop("detail_json"))
     d["open"] = d["chosen"] is None and d["void_reason"] is None
     if d["kind"] == "plan":  # the configurator's fields (absent on plans written before v13)
@@ -307,7 +311,9 @@ def _ask(cfg, conn, d, choice, note, actor):
     label = next(o["label"] for o in d["options"] if o["id"] == choice)
     text = (f"Answer to factory decision #{d['id']} ({d['question']}): {label}." + (f" Note: {note}" if note else "")
             + f" (by {actor}; also in `factory decide list {d['run_id']} --all`)")
-    return {}, lambda: {"sent_to_executor": dispatch.tell_executor(conn, d["run_id"], text)}
+    conn.execute("INSERT INTO executor_delivery(decision_id, answer, message, state) VALUES (?,?,?,'pending')",
+                 (d["id"], label, text))
+    return {}, lambda: resend(conn, d["id"])
 
 
 def _learning(cfg, conn, d, choice, note, actor):
@@ -347,6 +353,79 @@ def choose(cfg, conn, did: int, choice: str, actor: str, note: str | None = None
         except dispatch.StageError as e:  # the answer stands; the side effect is retried or shown to the user
             out["after_error"] = str(e)
     return out
+
+
+def _recover_delivery(conn, delivery) -> str | None:
+    """A dead sender leaves an unknown outcome, not permission to retry automatically."""
+    if delivery["state"] != "sending":
+        return None
+    try:
+        os.kill(delivery["sender_pid"], 0)
+    except ProcessLookupError:
+        error = "Previous sender exited before recording delivery. The answer may have arrived; resending may duplicate it."
+        with db.tx(conn):
+            changed = conn.execute("UPDATE executor_delivery SET state='failed', sender_pid=NULL, error=? "
+                                   "WHERE decision_id=? AND state='sending' AND sender_pid=?",
+                                   (error, delivery["decision_id"], delivery["sender_pid"])).rowcount
+        return error if changed else None
+    except PermissionError:
+        pass  # The process may still be sending; absence of permission is not absence of a sender.
+    # ponytail: a reused live PID blocks recovery; wait for it to exit rather than risking a second sender.
+    return None
+
+
+def executor_deliveries(conn, run_id: str | None = None) -> list[dict]:
+    """Unsent answers still relevant to an executing run; no outbound message or sender identity in status."""
+    sql = ("SELECT e.decision_id, d.run_id, d.question, e.answer, e.state, e.error, e.attempted_at, e.sent_at, "
+           "e.sender_pid FROM executor_delivery e JOIN decision d ON d.id=e.decision_id "
+           "JOIN dispatch r ON r.run_id=d.run_id WHERE r.state='executing' AND e.state<>'sent'")
+    rows = conn.execute(sql + (" AND d.run_id=?" if run_id else "") + " ORDER BY e.decision_id",
+                        (run_id,) if run_id else ()).fetchall()
+    out = []
+    for row in rows:
+        delivery = dict(row)
+        if error := _recover_delivery(conn, delivery):
+            delivery.update(state="failed", error=error)
+        delivery.pop("sender_pid")
+        out.append(delivery)
+    return out
+
+
+def resend(conn, did: int) -> dict:
+    """Deliver only the frozen answer. An interrupted sender must be gone before explicit recovery is offered."""
+    if conn.in_transaction:
+        raise dispatch.StageError("commit the recorded answer before sending it to the executor")
+    with db.tx(conn):
+        d = one(conn, did)
+        if d is None:
+            raise dispatch.StageError(f"no decision {did}")
+        if d["kind"] != "ask" or d["chosen"] is None:
+            raise dispatch.StageError(f"decision {did} is not an answered executor question")
+        _executing(conn, d)
+        delivery = conn.execute("SELECT * FROM executor_delivery WHERE decision_id=?", (did,)).fetchone()
+        if delivery is None:
+            raise dispatch.StageError(f"decision {did} has no recorded executor delivery")
+        if delivery["state"] == "sent":
+            raise dispatch.StageError(f"decision {did} was already sent; not sending it again")
+        if error := _recover_delivery(conn, delivery):
+            return {"decision": did, "after_error": error + " Check the executor before choosing Resend again."}
+        if delivery["state"] == "sending":
+            raise dispatch.StageError(f"decision {did} is being sent; concurrent resend refused")
+        conn.execute("UPDATE executor_delivery SET state='sending', error=NULL, attempted_at=?, sender_pid=? "
+                     "WHERE decision_id=?", (db.now(), os.getpid(), did))
+    try:
+        _executing(conn, d)
+        pane = dispatch.tell_executor(conn, d["run_id"], delivery["message"])
+    except Exception as e:
+        error = f"{str(e) or type(e).__name__}. Delivery may have reached the executor; resending may duplicate it."
+        with db.tx(conn):
+            conn.execute("UPDATE executor_delivery SET state='failed', error=?, sender_pid=NULL WHERE decision_id=?",
+                         (error, did))
+        return {"decision": did, "after_error": error}
+    with db.tx(conn):
+        conn.execute("UPDATE executor_delivery SET state='sent', error=NULL, sent_at=?, sender_pid=NULL "
+                     "WHERE decision_id=?", (db.now(), did))
+    return {"decision": did, "sent_to_executor": pane}
 
 
 def snoozed(conn, run_id: str, kind: str, hours: float) -> bool:

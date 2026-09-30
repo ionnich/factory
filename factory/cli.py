@@ -123,6 +123,8 @@ def cmd_decide(cfg, conn, a):
                 raise dispatch.StageError(f"--option {o!r}: want 'id|label|what it leads to'")
             opts.append(decide.option(*parts))
         return out(decide.ask(conn, a.run_id, a.node, a.question, opts, a.recommend, a.why, a.actor))
+    if a.xcmd == "resend":
+        return out(decide.resend(conn, a.id))
     if a.xcmd == "ok":
         runs = [d["run_id"] for i in a.ids if (d := decide.one(conn, i)) and d["kind"] == "review"
                 and d["recommended"] == "approve"]
@@ -278,6 +280,7 @@ def status(cfg, conn) -> dict:
         "dispatches": q("SELECT run_id, state, staged_at, executing_at, done_at FROM dispatch "
                         "WHERE state <> 'archived' ORDER BY created_at"),
         "decisions": decide.rows(conn),  # everything waiting on a person, with options and a recommendation
+        "executor_deliveries": decide.executor_deliveries(conn),
         "done_for_you": decide.done_for_you(conn, week),  # what the factory answered on its own this week
         "kanban": cfg.kanban,
         # Last stage of the lifecycle: what the factory closed out recently.
@@ -315,6 +318,7 @@ def dispatch_status(cfg, conn, run_id):
         "transitions": [dict(r) for r in conn.execute(
             "SELECT from_state, to_state, actor, at FROM transition_log WHERE run_id=? ORDER BY id", (run_id,))],
         "decisions": decide.rows(conn, run_id, open_only=False),
+        "executor_deliveries": decide.executor_deliveries(conn, run_id),
         "writes": reconcile.show(conn, run_id)["writes"],  # what reconcile wrote (or holds) in Linear
         # what the executor reported per card: step progress ("FIN-1/2 done") and the done summary, for the outline
         "events": [dict(r) for r in conn.execute(
@@ -611,6 +615,8 @@ def main(argv=None):
     s.add_argument("option")
     s.add_argument("--note", help="the text an option asks for (a reason, guidance)")
     s.add_argument("--actor", default="user")
+    s = x.add_parser("resend", help="send only an executor question's recorded answer; uncertain delivery may duplicate")
+    s.add_argument("id", type=int)
     s = x.add_parser("ask", help="executor: ask the captain mid-run; the answer is typed into the executor pane")
     s.add_argument("run_id")
     s.add_argument("--node", default="root", help="root, a ticket id or a step id")

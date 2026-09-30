@@ -180,6 +180,12 @@ async def choose(decision_id: int, body: Choice):
                          timeout=300)
 
 
+@router.post("/decisions/{decision_id}/resend")
+async def resend(decision_id: int):
+    # No option/note accepted: only the immutable answer can be sent.
+    return await factory("decide", "resend", str(decision_id))
+
+
 class Ask(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
 

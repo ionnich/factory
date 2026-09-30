@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -361,6 +361,30 @@ CREATE UNIQUE INDEX ask_one_pending ON ask(decision_id) WHERE status = 'pending'
 CREATE TRIGGER dispatch_step_no_delete BEFORE DELETE ON dispatch_step
 WHEN (SELECT state FROM dispatch WHERE run_id = OLD.run_id) IS NOT 'draft'
 BEGIN SELECT RAISE(ABORT, 'the plan is frozen once the dispatch leaves draft'); END;""",
+    # v17: answering an executor question and queuing its exact message commit together. Old sends are unknown.
+    17: """CREATE TABLE executor_delivery (
+  decision_id INTEGER PRIMARY KEY REFERENCES decision(id),
+  answer TEXT NOT NULL,
+  message TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'sent', 'failed')),
+  error TEXT,
+  attempted_at TEXT,
+  sent_at TEXT,
+  sender_pid INTEGER CHECK (sender_pid > 0),
+  CHECK ((state = 'sending') = (sender_pid IS NOT NULL))
+);
+CREATE TRIGGER executor_delivery_frozen BEFORE UPDATE OF decision_id, answer, message ON executor_delivery
+WHEN NEW.decision_id IS NOT OLD.decision_id OR NEW.answer IS NOT OLD.answer OR NEW.message IS NOT OLD.message
+BEGIN SELECT RAISE(ABORT, 'the recorded executor answer is immutable'); END;
+INSERT INTO executor_delivery(decision_id, answer, message, state, error)
+SELECT d.id, json_extract(o.value, '$.label'),
+  'Answer to factory decision #' || d.id || ' (' || d.question || '): ' || json_extract(o.value, '$.label') || '.'
+    || CASE WHEN d.chosen_note IS NOT NULL THEN ' Note: ' || d.chosen_note ELSE '' END
+    || ' (by ' || d.chosen_by || '; also in `factory decide list ' || d.run_id || ' --all`)',
+  'failed', 'Delivery predates durable tracking; it may already have arrived. Resending may duplicate it.'
+FROM decision d JOIN dispatch r ON r.run_id=d.run_id, json_each(d.options_json) o
+WHERE d.kind='ask' AND d.chosen IS NOT NULL AND r.state='executing'
+  AND json_extract(o.value, '$.id')=d.chosen;""",
 }
 
 
