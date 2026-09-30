@@ -297,6 +297,11 @@ def _blocked(cfg, conn, d, choice, note, actor):
 def _executor(cfg, conn, d, choice, note, actor):
     _executing(conn, d)
     run_id = d["run_id"]
+    # Quiet while work waits on a person is not stuck: watch() withdraws this alert, and no answer may act on it
+    # meanwhile (sweep's ★ "wait" would snooze the next real one). The executor-gone alert never pauses.
+    if d["kind"] == "dispatch-stuck" and (waiting := dispatch._waiting_on(conn, run_id)):
+        raise dispatch.StageError(f"dispatch {run_id} waits on a person (decision #{waiting[0]}); this gone-quiet "
+                                  "alert no longer applies")
     if choice == "restart":
         return {}, lambda: {"resumed": dispatch.resume(cfg, conn, run_id)}
     if choice == "stop":
