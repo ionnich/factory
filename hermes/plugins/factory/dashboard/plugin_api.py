@@ -139,6 +139,17 @@ async def draft_note(run_id: str, body: Note):
                          f"--body={text_ok(body.body, 'note')}", "--actor", "user:dashboard")
 
 
+class Replan(BaseModel):
+    reason: str = Field(min_length=1, max_length=3900)
+
+
+@router.post("/drafts/{run_id}/replan")
+async def replan(run_id: str, body: Replan):
+    # the plan gate picks the draft up again on its next tick
+    return await factory("draft", "replan", run_id_ok(run_id), f"--reason={text_ok(body.reason, 'reason')}",
+                         "--actor", "user:dashboard")
+
+
 @router.post("/decisions/{decision_id}")
 async def choose(decision_id: int, body: Choice):
     # an approval freezes and hands off, and may have to start the executor agent first

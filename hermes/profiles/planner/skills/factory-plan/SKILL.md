@@ -25,6 +25,8 @@ The prompt starts with the gate's JSON: `context.draft` with `run_id`, and
 `reason` = why the verdict says the work is needed, `evidence`, `description` =
 the ticket body, a claim, not truth).
 
+A draft with a `Replan: <reason>` note (in `tree[0].notes`) was sent back by the user: the new plan must address that reason and honor the other notes (`tree[].notes`, `earlier_notes`) and answered questions (`decisions` with `chosen`).
+
 Use only `~/.local/bin/factory` (absolute path), `git -C <mirror>` and read-only
 file access. No heredocs, pipes, `$(...)`, `-c` or `-e`: the security scan blocks them.
 

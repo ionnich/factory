@@ -87,6 +87,11 @@ def cmd_draft(cfg, conn, a):
                 cfg, conn, d["run_id"], check=False)[0]]
             for t in ctx["tickets"]:
                 t["mirror"] = str(cfg.mirror_path(t["repo"]))
+            # notes on steps a replan cleared: gone from the tree, still binding (answered questions: `decisions`)
+            ids = {n["id"] for n in ctx["tree"]}
+            ctx["earlier_notes"] = [dict(r) for r in conn.execute(
+                "SELECT node_id, author, body, at FROM dispatch_note WHERE run_id=? ORDER BY id", (d["run_id"],))
+                if r["node_id"] not in ids]
         return print(json.dumps({"wakeAgent": bool(ctx), "context": {"draft": ctx}}, default=str))
     if a.dcmd == "plan":
         try:
@@ -94,6 +99,8 @@ def cmd_draft(cfg, conn, a):
         except json.JSONDecodeError as e:
             raise dispatch.StageError(f"--steps is not JSON: {e}")
         return out(dispatch.plan(conn, a.run_id, steps))
+    if a.dcmd == "replan":
+        return out(dispatch.replan(conn, a.run_id, a.reason, a.actor))
     return out(dispatch.note(conn, a.run_id, a.node, a.body, a.actor))
 
 
@@ -419,6 +426,10 @@ def main(argv=None):
     s.add_argument("run_id")
     s.add_argument("--node", default="root")
     s.add_argument("--body", required=True)
+    s.add_argument("--actor", default="user")
+    s = dr.add_parser("replan", help="send a planned draft back to the planner with a reason (a binding root note)")
+    s.add_argument("run_id")
+    s.add_argument("--reason", required=True)
     s.add_argument("--actor", default="user")
     dr.add_parser("gate", help="Hermes pre-check for the factory-plan job (last line = wakeAgent JSON)")
     sub.choices["draft"].set_defaults(fn=cmd_draft)

@@ -1,5 +1,6 @@
 """Decisions: always a real choice with a recommendation, answered once, and the review's answer carries the
 planner's open questions with it. Asking less: what is taken without asking, and what reaches the user when."""
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -8,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from factory import db, decide, dispatch
+from factory import ask, cli, db, decide, dispatch
 
 SNAP = "2026-09-01T00:00:00Z"
 OPTS = [decide.option("a", "A", "leads to a"), decide.option("b", "B", "leads to b", note="why b?")]
@@ -100,6 +101,36 @@ class Decisions(unittest.TestCase):
             decide.choose(self.cfg, self.c, review["id"], "reject", "user", note="wrong cohort")
         left = [d for d in decide.rows(self.c, "d1", open_only=False) if d["kind"] == "plan"]
         self.assertEqual([d["void_reason"] for d in left], ["the draft was rejected"])
+
+    def test_replan_clears_the_plan_and_the_gate_takes_it_again(self):
+        self.plan()
+        self.c.execute("INSERT INTO dispatch_note(run_id,node_id,author,body,at) VALUES ('d1','FIN-1/2','u','use x',?)",
+                       (SNAP,))
+        q = next(d for d in decide.rows(self.c, "d1") if d["kind"] == "plan")
+        ask.new(self.c, q["id"], "why real?", "user", spawn=lambda *a, **k: None)
+        with self.assertRaises(dispatch.StageError):  # needs a reason
+            dispatch.replan(self.c, "d1", " ", "user")
+        res = dispatch.replan(self.c, "d1", "split FIN-1 into two PRs", "user")
+        self.assertEqual((res["steps_cleared"], res["decisions_voided"]), (3, 2))
+        self.assertEqual(self.c.execute("SELECT count(*) FROM dispatch_step WHERE run_id='d1'").fetchone()[0], 0)
+        self.assertEqual({d["void_reason"] for d in decide.rows(self.c, "d1", open_only=False)}, {"replanned"})
+        self.assertEqual(self.c.execute("SELECT status, error FROM ask").fetchone()[:], ("failed", "replanned"))
+        d = self.c.execute("SELECT planned_at, held_reason FROM dispatch WHERE run_id='d1'").fetchone()
+        self.assertEqual(d[:], (None, None))
+        with self.assertRaises(dispatch.StageError):  # nothing to replan until the planner writes again
+            dispatch.replan(self.c, "d1", "again", "user")
+        cfg = SimpleNamespace(dispatches=Path(tempfile.mkdtemp()), mirror_path=lambda r: Path("/m") / r)
+        with mock.patch("builtins.print") as p, \
+                mock.patch.object(dispatch, "_tickets_for_render", return_value=([], {})):
+            cli.cmd_draft(cfg, self.c, SimpleNamespace(dcmd="gate"))
+        gate = json.loads(p.call_args[0][0])
+        self.assertTrue(gate["wakeAgent"])
+        self.assertEqual(gate["context"]["draft"]["run_id"], "d1")
+        self.assertEqual([n["body"] for n in gate["context"]["draft"]["tree"][0]["notes"]],
+                         ["Replan: split FIN-1 into two PRs"])
+        self.assertEqual([n["body"] for n in gate["context"]["draft"]["earlier_notes"]], ["use x"])
+        self.plan()  # the planner writes a new plan
+        self.assertEqual(len(decide.rows(self.c, "d1")), 2)
 
 
 class AskingLess(unittest.TestCase):

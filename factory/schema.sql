@@ -140,7 +140,7 @@ BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;
 CREATE TRIGGER dispatch_no_delete BEFORE DELETE ON dispatch
 BEGIN SELECT RAISE(ABORT, 'dispatches are never deleted; a draft leaves approved or rejected'); END;
 
--- Plan tree of a draft, written once by the planner agent, only while draft. Rows: `root` (the dispatch's theme),
+-- Plan tree of a draft, written once by the planner agent, only while draft (a replan clears it for a new one). Rows: `root` (the dispatch's theme),
 -- a ticket id (its role; `parent` = the ticket it is nested under, NULL = root), or a step (`FIN-1/2`, nested
 -- `FIN-1/2.1`; parent derived from the id). depends_on = DAG edges across the dispatch.
 CREATE TABLE dispatch_step (
@@ -158,7 +158,8 @@ BEGIN SELECT RAISE(ABORT, 'the plan is frozen once the dispatch leaves draft'); 
 CREATE TRIGGER dispatch_step_no_update BEFORE UPDATE ON dispatch_step
 BEGIN SELECT RAISE(ABORT, 'plan steps are written once'); END;
 CREATE TRIGGER dispatch_step_no_delete BEFORE DELETE ON dispatch_step
-BEGIN SELECT RAISE(ABORT, 'plan steps are written once'); END;
+WHEN (SELECT state FROM dispatch WHERE run_id = OLD.run_id) IS NOT 'draft'
+BEGIN SELECT RAISE(ABORT, 'the plan is frozen once the dispatch leaves draft'); END;
 
 -- Review notes on any node (`root`, a ticket id, a step id). Append-only, only while draft; frozen into
 -- dispatch.md, where they bind the executor.

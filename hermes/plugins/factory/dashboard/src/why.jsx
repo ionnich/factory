@@ -1,7 +1,7 @@
 // "why?" on a decision: ask the planner, see its answer inline. Asks come from overview.asks
 // ({decision id: [{id, question, answer, status: pending|answered|failed, error, asked_at, answered_at}]}) via
-// WhyContext, with the open review decision per run (to hold a draft with an answer); the answer lands in
-// factory.db, /stream fires and the tab reloads, so there is no polling here.
+// WhyContext, with the open review decision per run (a planned draft still in review can be replanned with an
+// answer); the answer lands in factory.db, /stream fires and the tab reloads, so there is no polling here.
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect, useContext } = SDK.hooks;
@@ -31,7 +31,7 @@ export function Why({ d }) {
   const [err, setErr] = useState(null);
   const pending = thread.some((a) => a.status === "pending");
   const review = reviews[d.run_id];
-  const canHold = review && review.options.some((o) => o.id === "hold");
+  const canReplan = !!review;  // an open review = a planned draft, not yet approved or rejected
   const send = (q, after) => {
     setBusy(true); setErr(null);
     return post(q.path, q.body).then(() => { setBusy(false); after && after(); }, (e) => { setBusy(false); setErr(errText(e)); });
@@ -47,10 +47,11 @@ export function Why({ d }) {
             : a.status === "failed" ? <div className="fx-err">{a.error}{" "}
               {!pending ? <button className="fx-link-btn" disabled={busy} onClick={() => ask(a.question)}>retry</button> : null}</div>
             : <div className="fx-pre">{a.answer}</div>}
-          {a.status === "answered" && i === thread.length - 1 && canHold ? (
+          {a.status === "answered" && i === thread.length - 1 && canReplan ? (
             <button className="fx-link-btn" disabled={busy}
-                    onClick={() => send({ path: `/decisions/${review.id}`, body: { option: "hold", note: a.answer.slice(0, 3900) } })}>
-              hold the draft with this</button>) : null}
+                    onClick={() => send({ path: `/drafts/${d.run_id}/replan`,
+                                          body: { reason: `${a.question}\n${a.answer}`.slice(0, 3900) } })}>
+              replan with this</button>) : null}
         </div>
       ))}
       {!pending ? (

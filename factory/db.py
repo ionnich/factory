@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -267,6 +267,11 @@ BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;""",
   session_id TEXT, asked_by TEXT NOT NULL, asked_at TEXT NOT NULL, answered_at TEXT, error TEXT,
   CHECK ((status = 'answered') = (answer IS NOT NULL) AND (status = 'failed') = (error IS NOT NULL)));
 CREATE UNIQUE INDEX ask_one_pending ON ask(decision_id) WHERE status = 'pending';""",
+    # v16: replan. A draft's plan steps may be cleared (only while draft) so the planner writes a new plan.
+    16: """DROP TRIGGER dispatch_step_no_delete;
+CREATE TRIGGER dispatch_step_no_delete BEFORE DELETE ON dispatch_step
+WHEN (SELECT state FROM dispatch WHERE run_id = OLD.run_id) IS NOT 'draft'
+BEGIN SELECT RAISE(ABORT, 'the plan is frozen once the dispatch leaves draft'); END;""",
 }
 
 
