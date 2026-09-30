@@ -53,7 +53,7 @@ max_tickets = 8  # a dispatch is a cohort of related tickets (same Domain, then 
 foreign_backlogs = ["~/.local/share/firstmate/homes/*/data/backlog.md"]
 
 [executor]
-# herdr workspace of factory-primary; `watch` flags an executing dispatch with no card activity this long.
+# herdr workspace of factory-primary; `watch` flags inactivity except while an executor answer is pending.
 workspace = "factory"
 stuck_hours = 6
 

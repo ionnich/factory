@@ -42,8 +42,9 @@ One-time, by hand:
   decisions: the question, the options with what each leads to, the recommended one marked ★ and why. Tap an
   option (a second tap confirms executor answers and ones that start or stop work or write Linear; some ask for a
   reason), swipe right to take a lightweight ★, left for later. Canceled gestures do nothing. Once confirmed,
-  the card flies off while the server responds, and comes back with the reason if refused. `why?` under any decision asks the
-  planner inline (see Why? below). A draft's planner questions and its review are one card ("Review FIN-4146 · 2
+  the card flies off while the server responds, and comes back with the reason if refused. Long explanations and
+  completed why threads start folded; questions, options, deadlines, pending work and errors stay visible.
+  `why?` under any decision asks the planner inline (see Why? below). A draft's planner questions and its review are one card ("Review FIN-4146 · 2
   questions") that opens the **plan** full-page (the configurator; also `/factory?view=review&run=<run_id>`, so a
   push can link straight in). On a phone it is one column: a sticky **result** (the dispatch's predicted result
   plus one line per question from the picked option, tagged `#id`; the picked path as a breadcrumb — press and
@@ -62,7 +63,7 @@ One-time, by hand:
   sits beside it (now → question → each option on its own track, one row apart → rejoin → … → result; ★ solid, picked path lit, the rest
   faded), one selection with the switches. Open decisions whose ★ starts, stops or writes nothing are the
   **Quick** lane under the deck: tap one to see its options, or "Take all ★" (`POST /decisions/ok`, the chat's "ok").
-  Below the deck the factory is one tab per lifecycle stage: **Tickets** (every ticket in scope or ever touched —
+  Lifecycle tabs sit below the health header, above the decision deck: **Tickets** (every ticket in scope or ever touched —
   `factory tickets --all`, fetched only while the tab is open; the overview carries just the per-filter counts —
   newest activity first, filtered ready / needs answer / stale / in dispatch / done / not ours, plus a search; ready
   ones are ticked into a draft, with the factory's recommended next group one tap away; a row opens a sheet with the
@@ -70,8 +71,9 @@ One-time, by hand:
   (superseded ones too), dispatch transitions, notes, decisions asked and answered, card events, write-backs and our
   own Linear writes, oldest first — `factory ticket-timeline <ID>`; `/factory?ticket=<ID>` opens that sheet),
   **Draft** (rows are drafts; the selected one shows its plan, the configurator above), **Run** (staged, executing,
-  done: the plan read-only on the chosen path, card status per ticket, a step ✓ once a card comment says so, e.g.
-  "FIN-1/2 done"), and **Learn** (reconciled and the last archived ones: the plan with "predicted" next to "landed"
+  done: recorded last activity, blocker and next step for staged/executing dispatches, then the plan read-only on
+  the chosen path, card status per ticket, a step ✓ once a card comment says so, e.g. "FIN-1/2 done"),
+  and **Learn** (reconciled and the last archived ones: the plan with "predicted" next to "landed"
   — done summary, PR and write-backs per ticket — where untaken answers still flip as ghosts; then **Learnings**,
   **Throughput** with cost, and **Done for you** — what the factory answered itself this week). Dispatches are rows
   in an engineering table (stage, dispatch, tickets, progress, what waits on you, age; the columns fold on a phone).
@@ -221,5 +223,8 @@ One-time, by hand:
 - A verdict is dispatched at most once (a blocked card needs the ticket to change first, or your "retry" on
   the block, whose guidance becomes a note on the next draft); `valid` verdicts expire
   after 7 days. Tickets in the team's review state (Ready for QA) are out of scope: they wait on a human.
-- The reconcile gate asks about an executing dispatch whose executor pane is gone or with no card activity for
-  `executor.stuck_hours` (not again for that long after "wait"; withdrawn once it clears).
+- The reconcile gate still checks for a missing executor while work waits on a person. Inactivity alerts pause
+  while an executor question is open or its recorded answer has not arrived; existing quiet alerts are withdrawn,
+  never answered on the user's behalf. The `executor.stuck_hours` clock uses the latest card event, dispatch start
+  or successful answer delivery, not the choice or a failed send. After "wait", it does not ask again for that long.
+  Run shows recorded blockers, not a claim that a missing alert proves executor health.
