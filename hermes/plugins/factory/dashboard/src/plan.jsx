@@ -255,13 +255,7 @@ export function Plan({ d: current, tickets = {}, onDone, onClose }) {
   const d = snapshot || current;
   const mode = stageMode(d);
   const qs = useMemo(() => planQs(d), [d]);
-  const storageKey = `factory:plan:${d.run_id}`;
-  const [flips, setFlips] = useState(() => {
-    try { return JSON.parse(sessionStorage.getItem(storageKey) || "{}"); } catch { return {}; }
-  });
-  useEffect(() => {
-    try { sessionStorage.setItem(storageKey, JSON.stringify(flips)); } catch { /* Preview still works without browser storage. */ }
-  }, [storageKey, flips]);
+  const [flips, setFlips] = useState({});
   const [hold, setHold] = useState(false);
   const [sheet, setSheet] = useState(false);
   const [busy, setBusy] = useState(false);
