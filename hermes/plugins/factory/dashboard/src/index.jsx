@@ -92,9 +92,10 @@ function Option({ d, o, onChoose, busy }) {
   useEffect(() => { if (!armed) return; const t = setTimeout(() => setArmed(false), 4000); return () => clearTimeout(t); }, [armed]);
   const rec = o.id === d.recommended;
   const go = () => {
+    if (busy) return;
     if (o.note && !noting) return setNoting(true);
     if (o.note && !text.trim()) return;
-    if (o.weighty && !armed) return setArmed(true);
+    if ((o.weighty || d.kind === "ask") && !armed) return setArmed(true);
     onChoose(o.id, text.trim() || undefined);
   };
   return (
@@ -136,12 +137,12 @@ function Silence({ d }) {
   return <div className="fx-hint">If you stay silent{when}: {d.on_timeout}.</div>;
 }
 
-function DecisionBody({ d, onChoose, busy, err, compact }) {
+function DecisionBody({ d, onChoose, busy, err, compact, hideHold }) {
   if (!d.open) return <><Answered d={d} /><Why d={d} /></>;
   return (
     <>
       <div className="fx-why"><span className="star">★</span> {d.options.find((o) => o.id === d.recommended)?.label}: {d.why}</div>
-      <div className="fx-opts">{sortOptions(d).map((o) => <Option key={o.id} d={d} o={o} busy={busy} onChoose={onChoose} />)}</div>
+      <div className="fx-opts">{sortOptions(d).filter((o) => !hideHold || o.id !== "hold").map((o) => <Option key={o.id} d={d} o={o} busy={busy} onChoose={onChoose} />)}</div>
       <ActErr err={err} />
       {!compact ? <Silence d={d} /> : null}
       <Why d={d} />
@@ -232,13 +233,13 @@ function TopCard({ d, ctx, err, onChoose, onLater, onOpen, pos, canLater }) {
     if (!drag.current) return;
     drag.current = null;
     if (dx < -110 && canLater) { setLeaving("left"); setTimeout(() => { setLeaving(null); setDx(0); onLater(); }, 280); return; }
-    if (dx > 110 && rec && !rec.note && !rec.weighty) { setDx(0); onChoose(d, rec.id); return; }
+    if (dx > 110 && d.kind !== "ask" && rec && !rec.note && !rec.weighty) { setDx(0); onChoose(d, rec.id); return; }
     setDx(0);  // weighty or needs words: swipe only points at it; tap the ★ option
   };
   const style = leaving ? undefined : dx ? { transform: `translateX(${dx}px) rotate(${dx / 24}deg)`, transition: "none" } : undefined;
   return (
     <Card className={`fx-card fx-top${leaving ? ` leave-${leaving}` : ""}`} style={style}
-          onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}>
+          onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={() => { drag.current = null; setDx(0); }}>
       <CardContent className="fx-stack-v">
         {dx > 40 && !d.group ? <div className="fx-swipe right">★ {rec?.label}</div> : dx < -40 && canLater ? <div className="fx-swipe left">Later</div> : null}
         <div className="fx-row between">
@@ -254,10 +255,34 @@ function TopCard({ d, ctx, err, onChoose, onLater, onOpen, pos, canLater }) {
           {d.result ? <div className="fx-hint">→ {d.result}</div> : null}
           <Button onClick={() => onOpen(d)}>Open the plan ›</Button>
         </>) : <DecisionBody d={d} err={err} onChoose={(o, n) => onChoose(d, o, n)} />}
-        <div className="fx-hint fx-gesture">{d.group ? (canLater ? "Swipe left for later" : "") : `Swipe right for ★${canLater ? ", left for later" : ""}`}</div>
+        <div className="fx-hint fx-gesture">{d.group ? (canLater ? "Swipe left for later" : "") : d.kind === "ask" ? `Tap an answer twice to confirm${canLater ? "; swipe left for later" : ""}` : `Swipe right for ★${canLater ? ", left for later" : ""}`}</div>
       </CardContent>
     </Card>
   );
+}
+
+function ExecutorDelivery({ item, onDone }) {
+  const action = useAction(onDone);
+  const sending = action.busy || item.state === "sending";
+  return (
+    <div className="fx-stack-v">
+      <div className="fx-row"><Tone tone="amber">{sending ? "Sending to executor" : "Executor answer not delivered"}</Tone><span className="fx-id">{item.run_id} · #{item.decision_id}</span></div>
+      <div>{item.question}</div>
+      <div>Recorded answer: <b>{item.answer}</b>. This answer will not be changed.</div>
+      <ActErr err={item.error} />
+      <ActErr err={action.err} />
+      <Button size="sm" disabled={sending} onClick={() => action.run(`/decisions/${item.decision_id}/resend`, {})}>
+        {sending ? "Sending…" : "Resend recorded answer"}
+      </Button>
+    </div>
+  );
+}
+
+function ExecutorDeliveries({ items, onDone }) {
+  if (!items.length) return null;
+  return <section className="fx-sec fx-stack-v" aria-label="Executor answer delivery">
+    {items.map((item) => <ExecutorDelivery key={item.decision_id} item={item} onDone={onDone} />)}
+  </section>;
 }
 
 // What the factory answered on its own this week (earned, nothing to weigh, silence past its deadline).
@@ -481,11 +506,12 @@ function FactoryPage() {
   });
   const byRun = Object.fromEntries(data.dispatches.map((d) => [d.run_id, d]));
   const answers = data.ticket_counts?.answer || 0;
-  const needs = decisions.length;
+  const deliveries = data.status.executor_deliveries || [];
+  const needs = decisions.length + deliveries.length;
   const needsOf = (runId) => open.filter((x) => x.run_id === runId && x.tier !== "auto").length;
   // A draft's plan questions and review are one deck card that opens the configurator; light ones (★ starts or
   // stops nothing, writes nothing) go to the Quick lane, ★ on all in one tap.
-  const light = (x) => x.tier !== "now" && x.kind !== "plan" && x.kind !== "review" && !x.options.find((o) => o.id === x.recommended)?.weighty;
+  const light = (x) => x.tier !== "now" && !["plan", "review", "ask"].includes(x.kind) && !x.options.find((o) => o.id === x.recommended)?.weighty;
   const grouped = new Set();
   const deck = decisions.filter((x) => !light(x)).flatMap((x) => {
     const d = byRun[x.run_id];
@@ -541,11 +567,19 @@ function FactoryPage() {
   };
 
   const why = { asks: data.asks || {}, reviews: reviewOf };  // why.jsx threads, in the plan and on every decision
+  const connection = <>
+    <button className="fx-link-btn" onClick={load} title="Refresh factory status">
+      <span className={`fx-live${live ? " on" : ""}`} />{live ? "live" : "reconnecting"} · {loadedAt ? ago(loadedAt) : ""} · Refresh
+    </button>
+    {error ? <div className="fx-err" role="alert">Last refresh failed: {error}. Showing last loaded decisions; refresh before acting.</div> : null}
+  </>;
   if (review) {
     return (
       <WhyContext.Provider value={why}>
       <div className="fx" ref={top}>
         <Toast toast={toast} />
+        <header className="fx-head">{connection}</header>
+        <ExecutorDeliveries items={deliveries.filter((item) => item.run_id === review)} onDone={done} />
         {byRun[review] ? <Plan key={review} d={byRun[review]} tickets={tix} onDone={done} onClose={() => openReview(null)} /> : (
           <div className="fx-row between"><span className="fx-empty">Dispatch {review} is not live any more.</span>
             <button className="fx-x" onClick={() => openReview(null)} aria-label="Close">✕</button></div>)}
@@ -561,12 +595,11 @@ function FactoryPage() {
         <div className={`fx-hello${needs ? " you" : ""}`}>{needs ? `${plural(needs, "thing")} need${needs === 1 ? "s" : ""} you` : "All clear"}</div>
         <div className="fx-row fx-hint">
           <Health jobs={data.jobs} /><span>·</span>
-          <button className="fx-link-btn" onClick={load} title="Updates the moment something changes">
-            <span className={`fx-live${live ? " on" : ""}`} />{live ? "live" : "reconnecting"} · {loadedAt ? ago(loadedAt) : ""}</button>
+          {connection}
           {answers ? <><span>·</span><span>{plural(answers, "ticket")} need answers in Linear</span></> : null}
         </div>
-        {error ? <div className="fx-err">Last refresh failed: {error}</div> : null}
       </header>
+      <ExecutorDeliveries items={deliveries} onDone={done} />
 
       <Deck decisions={deck} context={context} onDone={(r, d) => done(r, d)} onOpen={openNode} />
       <Quick items={decisions.filter(light)} context={context} onDone={done} />
@@ -617,4 +650,4 @@ function FactoryPage() {
 window.__HERMES_PLUGINS__.register("factory", FactoryPage);
 
 // For plan.jsx / railway.jsx (bundled together; used at render time only, so the import cycle is harmless).
-export { API, ActErr, CARD, CARD_TONE, DecisionBody, Ext, LANE_W, NoteBox, Notes, RAIL_X0, Rail, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose };
+export { API, ActErr, CARD, CARD_TONE, DecisionBody, Ext, LANE_W, NoteBox, Notes, Option, RAIL_X0, Rail, Silence, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose };
