@@ -338,6 +338,8 @@ def dispatch_status(cfg, conn, run_id):
             "SELECT from_state, to_state, actor, at FROM transition_log WHERE run_id=? ORDER BY id", (run_id,))],
         "decisions": decide.rows(conn, run_id, open_only=False),
         "executor_deliveries": decide.executor_deliveries(conn, run_id),
+        # Run tab: last real activity, blocker and next step, from the database alone (no pane check)
+        "runtime": dispatch.runtime(conn, d) if d["state"] in ("staged", "executing") else None,
         "writes": reconcile.show(conn, run_id)["writes"],  # what reconcile wrote (or holds) in Linear
         # what the executor reported per card: step progress ("FIN-1/2 done") and the done summary, for the outline
         "events": [dict(r) for r in conn.execute(

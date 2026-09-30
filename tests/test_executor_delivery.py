@@ -1,12 +1,19 @@
-"""Recorded executor answers survive delivery failure without reopening or changing the choice."""
+"""Recorded executor answers survive delivery failure without reopening or changing the choice. While the work waits
+on a person (an open question, an answer not yet delivered) the gone-quiet alert pauses; the executor-gone one never
+does."""
 import sqlite3
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from factory import db, decide, dispatch
+from factory import cli, db, decide, dispatch
+
+
+def ago(hours: float) -> str:
+    return decide._iso(datetime.now(UTC) - timedelta(hours=hours))
 
 
 class ExecutorDelivery(unittest.TestCase):
@@ -15,7 +22,7 @@ class ExecutorDelivery(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "factory.db"
         self.c = self.connect()
-        self.cfg = SimpleNamespace(raw={})
+        self.cfg = SimpleNamespace(raw={}, dispatches=Path(self.tmp.name))
         self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) "
                        "VALUES ('run','draft','[]','user',?)", (db.now(),))
         self.c.execute("UPDATE dispatch SET state='staged', approved_by='user', body_sha256='frozen'")
@@ -156,6 +163,54 @@ class ExecutorDelivery(unittest.TestCase):
             text = send.call_args.args[1][0]
         self.assertIn("Use the real engine. Note: original note (by user;", text)
         self.assertEqual(decide.executor_deliveries(conn), [])
+
+    def watch(self, *live_panes):
+        panes = {"result": {"panes": [{"pane_id": p, "agent": "omp"} for p in live_panes]}}
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            return [r["kind"] for r in dispatch.watch(self.cfg, self.c)]
+
+    def test_open_question_withdraws_the_quiet_alert_never_the_crash_alert(self):
+        self.c.execute("UPDATE dispatch SET executing_at=?", (ago(8),))
+        quiet = decide.executor(self.c, "run", "dispatch-stuck", "no card activity for 6.1h (limit 6h)", 6)
+        asked = self.question()
+        self.assertEqual(self.watch(), ["executor-gone"])  # pane-1 is gone; 8h quiet, but a question waits on a person
+        withdrawn = decide.one(self.c, quiet)
+        self.assertEqual((withdrawn["open"], withdrawn["chosen"]), (False, None))
+        self.assertTrue(decide.one(self.c, asked)["open"])
+
+    def test_quiet_clock_resumes_at_delivery_not_at_the_choice_or_a_failed_send(self):
+        self.c.execute("UPDATE dispatch SET executing_at=?", (ago(9),))
+        did = self.question()
+        with mock.patch.object(db, "now", return_value=ago(8)), \
+                mock.patch.object(dispatch, "_send", side_effect=dispatch.StageError("pane busy")):
+            decide.choose(self.cfg, self.c, did, "wait", "user")
+        self.assertEqual(self.watch("pane-1"), [])  # answered and failed 8h ago: still waits on a person
+        with mock.patch.object(dispatch, "_send"):
+            decide.resend(self.c, did)
+        self.assertEqual(self.watch("pane-1"), [])  # 9h since the start, but the answer just arrived
+        self.c.execute("UPDATE executor_delivery SET sent_at=?", (ago(7),))
+        self.assertEqual(self.watch("pane-1"), ["dispatch-stuck"])
+
+    def test_run_status_names_the_blocker_that_matters_most(self):
+        started = ago(1)
+        self.c.execute("UPDATE dispatch SET executing_at=?", (started,))
+        run = lambda: cli.dispatch_status(self.cfg, self.c, "run")["runtime"]
+        blocked_by = lambda: ((r := run())["decision_id"], r["blocker"] is not None)
+        idle = run()
+        self.assertEqual((idle["last_activity_at"], idle["blocker"], idle["decision_id"]), (started, None, None))
+        quiet = decide.executor(self.c, "run", "dispatch-stuck", "quiet", 6)
+        self.assertEqual(blocked_by(), (quiet, True))
+        older, newer = self.question(), self.question()
+        self.assertEqual(blocked_by(), (older, True))  # an open question outranks gone quiet
+        with mock.patch.object(dispatch, "_send", side_effect=dispatch.StageError("pane busy")):
+            decide.choose(self.cfg, self.c, newer, "wait", "user")
+        self.assertEqual(blocked_by(), (newer, True))  # an answer that never arrived outranks an open question
+        gone = decide.executor(self.c, "run", "executor-gone", "pane gone", 6)
+        self.assertEqual(blocked_by(), (gone, True))  # a crash outranks everything
+        with mock.patch.object(dispatch, "_send"):
+            decide.resend(self.c, newer)
+        sent = self.c.execute("SELECT sent_at FROM executor_delivery").fetchone()[0]
+        self.assertEqual(run()["last_activity_at"], sent)  # the delivered answer is the latest real activity
 
 
 if __name__ == "__main__":

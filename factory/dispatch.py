@@ -1025,10 +1025,33 @@ def propose(cfg: Config, conn) -> dict:
         {"action": "in-review", "run_id": d["run_id"]}
 
 
+def _last_activity(conn, run_id: str) -> tuple[str | None, str | None]:
+    """(when, what) of the latest real sign of work on a dispatch: a card event, its start, or an answer that reached
+    its executor. Never an ask, a choice or a failed send."""
+    return tuple(conn.execute(
+        "SELECT at, what FROM (SELECT e.at, t.identifier || ' ' || e.kind what FROM card_event e "
+        "JOIN dispatch_ticket t USING (run_id, issue_id) WHERE e.run_id=:r "
+        "UNION ALL SELECT x.sent_at, 'answer to #' || x.decision_id || ' delivered' FROM executor_delivery x "
+        "JOIN decision q ON q.id=x.decision_id WHERE q.run_id=:r AND x.state='sent' "
+        "UNION ALL SELECT executing_at, 'dispatch started' FROM dispatch WHERE run_id=:r AND executing_at IS NOT NULL) "
+        "ORDER BY at DESC LIMIT 1", {"r": run_id}).fetchone() or (None, None))
+
+
+def _waiting_on(conn, run_id: str) -> tuple[int, dict | None] | None:
+    """The decision an executing dispatch's work waits on a person for, with its undelivered answer if any: an answer
+    that has not reached the executor (only an explicit resend sends it) before the oldest open executor question."""
+    if undelivered := decide.executor_deliveries(conn, run_id):
+        return undelivered[0]["decision_id"], undelivered[0]
+    ask = conn.execute(f"SELECT min(id) FROM decision WHERE run_id=? AND kind='ask' AND {decide.OPEN}",
+                       (run_id,)).fetchone()[0]
+    return (ask, None) if ask else None
+
+
 def watch(cfg: Config, conn) -> list:
-    """Ask about an executing dispatch whose executor pane is gone, or with no card activity for
-    executor.stuck_hours (default 6): one open decision per dispatch and kind, not re-asked for stuck_hours after
-    "wait", withdrawn once the condition clears or the dispatch stops executing."""
+    """Ask about an executing dispatch whose executor pane is gone, or with no activity (`_last_activity`) for
+    executor.stuck_hours (default 6) while nothing waits on a person (`_waiting_on`; a wait never pauses the pane
+    check): one open decision per dispatch and kind, not re-asked for stuck_hours after "wait", withdrawn once the
+    condition clears or the dispatch stops executing."""
     stuck_h = cfg.raw.get("executor", {}).get("stuck_hours", 6)
     try:
         panes = {p["pane_id"]: p for p in _herdr("pane", "list")["result"]["panes"]}
@@ -1039,12 +1062,12 @@ def watch(cfg: Config, conn) -> list:
         decide.void(conn, "kind IN ('executor-gone','dispatch-stuck','ask') AND run_id NOT IN "
                           "(SELECT run_id FROM dispatch WHERE state='executing')", (), "the dispatch is no longer executing")
     for d in conn.execute("SELECT * FROM dispatch WHERE state='executing'").fetchall():
-        last = conn.execute("SELECT max(at) FROM card_event WHERE run_id=?", (d["run_id"],)).fetchone()[0]
-        idle_h = (datetime.now(UTC) - datetime.fromisoformat(max(filter(None, (last, d["executing_at"]))))
-                  ).total_seconds() / 3600
+        at, what = _last_activity(conn, d["run_id"])
+        idle_h = (datetime.now(UTC) - datetime.fromisoformat(at)).total_seconds() / 3600
+        waiting = _waiting_on(conn, d["run_id"])
         checks = {"executor-gone": None if panes is None else
                   (panes.get(d["executor_pane"]) or {}).get("agent") != "omp",
-                  "dispatch-stuck": idle_h > stuck_h}
+                  "dispatch-stuck": idle_h > stuck_h and waiting is None}
         for kind, bad in checks.items():
             if bad is None:
                 continue
@@ -1052,10 +1075,40 @@ def watch(cfg: Config, conn) -> list:
                                  (d["run_id"], kind)).fetchone()
             with db.tx(conn):
                 if not bad and asked:
-                    decide.void(conn, "run_id=? AND kind=?", (d["run_id"], kind), "no longer the case")
+                    decide.void(conn, "run_id=? AND kind=?", (d["run_id"], kind),
+                                f"it waits on a person: decision #{waiting[0]}" if kind == "dispatch-stuck" and waiting
+                                else "no longer the case")
                 elif bad and not asked and not decide.snoozed(conn, d["run_id"], kind, stuck_h):
                     reason = (f"executor pane {d['executor_pane']} no longer runs omp; the dispatch cannot finish"
-                              if kind == "executor-gone" else f"no card activity for {idle_h:.1f}h (limit {stuck_h}h)")
+                              if kind == "executor-gone" else
+                              f"no activity for {idle_h:.1f}h since {what} (limit {stuck_h}h)")
                     decide.executor(conn, d["run_id"], kind, reason, stuck_h)
                     raised.append({"run_id": d["run_id"], "kind": kind, "reason": reason})
     return raised
+
+
+def runtime(conn, d) -> dict:
+    """The Run tab's line on a staged or executing dispatch, from the database alone: no pane check, so a missing
+    alert is no proof of health. Blocker by priority: executor gone, an answer that never arrived, an open executor
+    question, gone quiet. `decision_id` names the decision it is about; nothing is answered for the user."""
+    at, what = _last_activity(conn, d["run_id"])
+    alert = {r["kind"]: r for r in conn.execute(
+        "SELECT kind, id, coalesce(json_extract(detail_json, '$.reason'), question) reason FROM decision "
+        f"WHERE run_id=? AND kind IN ('executor-gone', 'dispatch-stuck') AND {decide.OPEN}", (d["run_id"],))}
+    waiting = _waiting_on(conn, d["run_id"])
+    if gone := alert.get("executor-gone"):
+        did, blocker, step = gone["id"], gone["reason"], f"answer decision #{gone['id']}"
+    elif waiting and waiting[1]:
+        did, state = waiting[0], waiting[1]["state"]
+        blocker = f"your answer to #{did} has not reached the executor ({state})"
+        step = "wait for the send in progress" if state == "sending" else f"check the executor, then resend #{did}"
+    elif waiting:
+        did = waiting[0]
+        blocker, step = f"the executor's question #{did} waits for your answer", f"answer decision #{did}"
+    elif stuck := alert.get("dispatch-stuck"):
+        did, blocker, step = stuck["id"], stuck["reason"], f"answer decision #{stuck['id']}"
+    else:
+        did, blocker = None, None
+        step = "next card update from the executor" if d["state"] == "executing" else "the executor starts it"
+    return {"last_activity_at": at, "last_activity_kind": what, "blocker": blocker, "next_step": step,
+            "decision_id": did}
