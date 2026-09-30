@@ -389,3 +389,20 @@ CREATE TABLE cost_session (
   input      INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL,
   usd        REAL NOT NULL
 );
+
+-- "Why?" on a decision: the planner explains inline (factory ask). One pending ask per decision; follow-ups
+-- resume the Hermes session of the decision's last answer so the planner keeps context.
+CREATE TABLE ask (
+  id          INTEGER PRIMARY KEY,
+  decision_id INTEGER NOT NULL REFERENCES decision(id),
+  question    TEXT NOT NULL CHECK (length(trim(question)) > 0),
+  answer      TEXT,
+  status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'answered', 'failed')),
+  session_id  TEXT,
+  asked_by    TEXT NOT NULL,
+  asked_at    TEXT NOT NULL,
+  answered_at TEXT,
+  error       TEXT,
+  CHECK ((status = 'answered') = (answer IS NOT NULL) AND (status = 'failed') = (error IS NOT NULL))
+);
+CREATE UNIQUE INDEX ask_one_pending ON ask(decision_id) WHERE status = 'pending';

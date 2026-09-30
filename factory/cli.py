@@ -9,7 +9,7 @@ import statistics
 import sys
 from datetime import UTC, datetime, timedelta
 
-from . import config, costs, db, decide, dispatch, linear, prune, reconcile, repos, witness
+from . import ask, config, costs, db, decide, dispatch, linear, prune, reconcile, repos, witness
 
 
 def out(obj) -> None:
@@ -233,9 +233,11 @@ def cmd_overview(cfg, conn, a):
     runs = dict.fromkeys([d["run_id"] for d in st["dispatches"]] +
                          [x["run_id"] for x in st["decisions"] if x["run_id"] and x["kind"] == "blocked"] +
                          [x["run_id"] for x in st["archived"]])  # last closed ones, for the Learn tab
+    dispatches = [dispatch_status(cfg, conn, r) for r in runs
+                  if conn.execute("SELECT 1 FROM dispatch WHERE run_id=?", (r,)).fetchone()]
+    shown = [x["id"] for x in st["decisions"]] + [x["id"] for d in dispatches for x in d["decisions"]]
     out({"status": st, "tickets": tickets(cfg, conn), "candidates": dispatch.candidates(cfg, conn),
-         "dispatches": [dispatch_status(cfg, conn, r) for r in runs
-                        if conn.execute("SELECT 1 FROM dispatch WHERE run_id=?", (r,)).fetchone()]})
+         "dispatches": dispatches, "asks": ask.rows(conn, set(shown))})  # "why?" threads by decision id
 
 
 def status(cfg, conn) -> dict:
@@ -442,6 +444,23 @@ def main(argv=None):
     s.add_argument("ids", type=int, nargs="+")
     s.add_argument("--actor", default="user")
     sub.choices["decide"].set_defaults(fn=cmd_decide)
+    s = sub.add_parser("ask", help="\"why?\" on a decision: the planner explains inline").add_subparsers(
+        dest="acmd", required=True)
+    s2 = s.add_parser("new", help="ask; spawns the planner detached (one pending ask per decision)")
+    s2.add_argument("decision_id", type=int)
+    s2.add_argument("--text", required=True)
+    s2.add_argument("--actor", default="user")
+    s2 = s.add_parser("run", help="the detached wrapper: run the planner for a pending ask, store the result")
+    s2.add_argument("id", type=int)
+    s2 = s.add_parser("answer", help="store the answer of a pending ask")
+    s2.add_argument("id", type=int)
+    g = s2.add_mutually_exclusive_group(required=True)
+    g.add_argument("--text")
+    g.add_argument("--file")
+    s2.add_argument("--session", help="the Hermes session to resume for follow-ups")
+    s2 = s.add_parser("list", help="one decision's thread (JSON)")
+    s2.add_argument("decision_id", type=int)
+    sub.choices["ask"].set_defaults(fn=lambda cfg, conn, a: out(ask.cli(cfg, conn, a)))
     s = sub.add_parser("backup", help="consistent, integrity-checked copy of factory.db; keeps the newest N")
     s.add_argument("--keep", type=int, default=14)
     s.set_defaults(fn=cmd_backup)

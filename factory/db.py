@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 15
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -259,6 +259,14 @@ CREATE TRIGGER dispatch_frozen BEFORE UPDATE ON dispatch
 WHEN OLD.state <> 'draft' AND (NEW.body_sha256 IS NOT OLD.body_sha256 OR NEW.repos_json IS NOT OLD.repos_json
   OR NEW.run_id IS NOT OLD.run_id OR NEW.created_at IS NOT OLD.created_at OR NEW.route IS NOT OLD.route)
 BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;""",
+    # v15: "why?" threads on decisions (factory ask).
+    15: """CREATE TABLE ask (
+  id INTEGER PRIMARY KEY, decision_id INTEGER NOT NULL REFERENCES decision(id),
+  question TEXT NOT NULL CHECK (length(trim(question)) > 0), answer TEXT,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'answered', 'failed')),
+  session_id TEXT, asked_by TEXT NOT NULL, asked_at TEXT NOT NULL, answered_at TEXT, error TEXT,
+  CHECK ((status = 'answered') = (answer IS NOT NULL) AND (status = 'failed') = (error IS NOT NULL)));
+CREATE UNIQUE INDEX ask_one_pending ON ask(decision_id) WHERE status = 'pending';""",
 }
 
 

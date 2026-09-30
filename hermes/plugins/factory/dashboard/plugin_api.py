@@ -147,6 +147,17 @@ async def choose(decision_id: int, body: Choice):
                          timeout=300)
 
 
+class Ask(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/decisions/{decision_id}/asks")
+async def ask(decision_id: int, body: Ask):
+    # returns at once (pending); the planner's answer lands in factory.db and /stream refreshes the tab
+    return await factory("ask", "new", str(decision_id), f"--text={text_ok(body.text, 'question')}",
+                         "--actor", "user:dashboard")
+
+
 @router.get("/metrics")
 async def metrics(days: int = Query(28, ge=1, le=365)):
     return await factory("metrics", "--days", str(days))

@@ -68,6 +68,14 @@ One-time, by hand:
   planner questions (at most 2 per draft), executor questions mid-run (`decide ask`; the answer is typed into its
   pane), a blocked ticket (write back / retry with guidance), a missing or quiet executor (restart / wait / stop),
   a held Linear write (apply anyway / skip / do it yourself).
+- Why? (`factory ask new|run|answer|list`): `why?` under any decision in the tab asks the planner inline. `ask new`
+  records it (one pending ask per decision) and spawns a detached `factory ask run <id>`, which runs
+  `hermes -p planner chat --oneshot -Q -t file --run-budget 150 --query-file <prompt> [--resume <session>]` (the
+  decision, plan tree, tickets with verdict and mirror path; explain only, ≤5 lines, cite file:line) and stores
+  the answer, or `failed` with the error after 180s or a non-zero exit. Follow-ups resume the decision's last
+  session so the planner keeps context. Toolsets: `file` only — Hermes has no read-only terminal toolset, and
+  `file` can still write (the prompt forbids it). On an open draft review, "hold the draft with this" holds it
+  with the answer as the reason; the planner does not re-plan held drafts (its gate takes only unplanned ones).
 - Asking less (`decide.py`). Each decision gets a tier when asked. **Auto**: the factory takes ★ on its next pass
   and lists it under "Done for you": nothing to weigh (a code check held a Linear write), the executor's first
   crash in a dispatch (restarted once), or a kind where you took ★ the last 5 times (one override and it asks
@@ -93,7 +101,7 @@ One-time, by hand:
   Stop it with `hermes cron pause factory-propose`.
 - Backups: `factory-backup` (03:00) writes `~/.hermes/factory/backups/factory-YYYY-MM-DD.db` (newest 14), and every
   schema migration first writes `factory-pre-vN.db`. Same disk: protects against bad writes, not disk loss.
-- CLI: `factory status|overview|tickets|candidates|stage|draft|decide|handoff|propose|execute|card|reconcile|archive|metrics|backup`.
+- CLI: `factory status|overview|tickets|candidates|stage|draft|decide|ask|handoff|propose|execute|card|reconcile|archive|metrics|backup`.
   `stage` and approving refresh only the repos involved (parallel fetch); the cron keeps the rest fresh.
 
 ## Invariants (in code: `factory/schema.sql` triggers + CLI checks)
