@@ -305,8 +305,6 @@ CREATE TABLE linear_own_write (
 -- ---------------------------------------------------------------- decisions
 -- Every choice the factory needs from a person: >= 2 options, each saying what it leads to, one recommended
 -- with why. Answered once (chosen) or withdrawn once when the question stops applying (void); never edited.
--- detail_json holds guidance (Jev judgments, relation/group metadata) and is writable while open, frozen
--- with the rest once answered or withdrawn.
 -- node_id places it in its dispatch's graph (root, a ticket id, a step id); run_id may be a sweep-/followup- run.
 -- tier, fixed when asked: auto = the factory takes the recommendation on its next pass (nothing for a person to
 -- weigh, or the user took it the last EARNED_AFTER times); now = work is stopped until the user answers (pushed
@@ -357,9 +355,9 @@ WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
   OR NEW.run_id IS NOT OLD.run_id OR NEW.node_id IS NOT OLD.node_id OR NEW.issue_id IS NOT OLD.issue_id
   OR NEW.kind IS NOT OLD.kind OR NEW.ref IS NOT OLD.ref OR NEW.question IS NOT OLD.question
   OR NEW.options_json IS NOT OLD.options_json OR NEW.recommended IS NOT OLD.recommended OR NEW.why IS NOT OLD.why
-  OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.detail_json IS NOT OLD.detail_json OR NEW.created_at IS NOT OLD.created_at
   OR NEW.created_by IS NOT OLD.created_by OR NEW.tier IS NOT OLD.tier
-  OR (NEW.chosen IS NULL AND NEW.void_reason IS NULL AND NEW.detail_json IS OLD.detail_json)
+  OR (NEW.chosen IS NULL AND NEW.void_reason IS NULL)
   OR (NEW.chosen IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(OLD.options_json)
                                              WHERE json_extract(value, '$.id') = NEW.chosen))
   OR (NEW.chosen IS NOT NULL AND length(trim(coalesce(NEW.chosen_note, ''))) = 0
@@ -368,6 +366,13 @@ WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'a decision is answered (with one of its options, and the text it asks for) or withdrawn once'); END;
 CREATE TRIGGER decision_no_delete BEFORE DELETE ON decision
 BEGIN SELECT RAISE(ABORT, 'decisions are never deleted'); END;
+
+-- Jev judgment guidance (and the learning slice's relation/group metadata) per decision: derived, replaceable
+-- advice in its own row, never inside decision.detail_json (decision_answer_once keeps the decision immutable).
+CREATE TABLE jev_advice (
+  decision_id INTEGER PRIMARY KEY REFERENCES decision(id),
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
+);
 CREATE TRIGGER decision_clock BEFORE UPDATE OF notified_at, due_at ON decision
 WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
   OR (OLD.notified_at IS NOT NULL AND NEW.notified_at IS NOT OLD.notified_at)
@@ -416,7 +421,7 @@ CREATE TABLE cost_session (
 );
 
 -- Learnings: one- or two-line facts that save agents tokens, each with provenance (source), anchors (repo paths)
--- and expiry. codemap (what lives at a path) is harvested from verdict evidence and plan steps and is active at
+-- and expiry. codemap (what lives at a path) is harvested from verdict evidence and is active at
 -- once; pitfall (from blocks) and house_rule (from the user's plan answers) are proposed and become active when the
 -- user keeps them (decision kind 'learning', ref = id). Active ones expire when trunk changes an anchor. Derived by
 -- `learn.sync`; uses counts `L<id>` cited in verdict reasons, plans and card comments.

@@ -106,13 +106,11 @@ def review_options(held: bool) -> list:
     return opts
 
 
-def review(conn, run_id: str, recommend: str, why: str, created_by: str, held: bool = False,
-           detail: dict | None = None) -> int:
+def review(conn, run_id: str, recommend: str, why: str, created_by: str, held: bool = False) -> int:
     opts = review_options(held)
     if recommend not in {o["id"] for o in opts}:
         recommend = "approve"
-    return open_(conn, "review", "Start this dispatch?", opts, recommend, why, created_by, run_id=run_id,
-                 detail=detail)
+    return open_(conn, "review", "Start this dispatch?", opts, recommend, why, created_by, run_id=run_id)
 
 
 def blocked(conn, run_id: str, ident: str, issue_id: str, reason: str, actor: str) -> int:
@@ -200,6 +198,9 @@ def _deadline(conn, d) -> tuple[str | None, str]:
     """When ★ is taken without the user, and what happens if they stay silent."""
     if d["kind"] == "ask":
         return None, "it waits for your confirmed answer; that work is stopped until you answer"
+    if d["kind"] == "learning":
+        # Raw legacy rows may still carry tier='auto' and a due_at: a learning is never taken on its own.
+        return None, "it waits for your explicit approval; a learning becomes a rule only when you keep it"
     if d["tier"] == "auto":
         return d["due_at"], "the factory takes ★ on its next pass (a few minutes)"
     if d["due_at"]:
@@ -231,7 +232,7 @@ def _row(conn, r) -> dict:
         x = d["detail"]
         d.update(key=x.get("key"), now=x.get("now"), evidence=x.get("evidence", []), depends_on=x.get("depends_on"))
         d["options"] = [{"changes": [], "result": None, "cost": None, "risk": None, **o} for o in d["options"]]
-    d["jev"] = jev.served(d["detail"], conn, d["options"])
+    d["jev"] = jev.served(jev.stored(conn, d["id"]), conn, d["options"])
     d["deadline"], d["on_timeout"] = _deadline(conn, d) if d["open"] else (None, None)
     return d
 

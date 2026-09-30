@@ -2,6 +2,7 @@
 plan/ask/review decisions (fingerprint reuse, rule matching, stale-rule drop), the plan-time investigation gate,
 and learning decisions never earning rule approval."""
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -146,7 +147,9 @@ class Guidance(unittest.TestCase):
         self.assertEqual(d["jev"]["model"], "jev-1.13.0")
         self.assertEqual(d["jev"]["focus"], "none")  # the options carry no differing consequence text
         self.assertTrue(d["jev"]["fingerprint"])
-        self.assertEqual(d["jev"], d["detail"]["jev"])  # the same shape is persisted and served
+        self.assertEqual(jev.stored(self.c, did), d["jev"])  # the stored payload is what reads serve
+        detail = json.loads(self.c.execute("SELECT detail_json FROM decision WHERE id=?", (did,)).fetchone()[0])
+        self.assertNotIn("jev", detail)  # guidance never lives inside detail_json
         with mock.patch("factory.jev.evaluate", return_value=ok_result()) as ev2:
             self.assertEqual(jev.refresh(self.cfg, self.c), [])
         ev2.assert_not_called()  # unchanged success: no second call this tick
@@ -183,20 +186,19 @@ class Guidance(unittest.TestCase):
 
         with mock.patch("factory.jev.evaluate", side_effect=answer_it):
             jev.refresh(self.cfg, self.c)
-        raw = self.c.execute("SELECT detail_json FROM decision WHERE id=?", (did,)).fetchone()[0]
-        self.assertNotIn("jev", json.loads(raw))
+        self.assertIsNone(jev.stored(self.c, did))  # answered while judging: never stored
 
     def test_refresh_never_touches_learning_decisions(self):
         lid = self.seed_rule("You choose “Keep it” (2×)")
         ld = decide.open_(self.c, "learning", "keep it?", [decide.option("keep", "Keep", "x"),
                                                            decide.option("reject", "Drop", "y")],
-                          "keep", "why", "factory:learn", ref=str(lid),
-                          detail={"jev": {"relation": {"kind": "duplicate", "learning_id": 7}}})
+                          "keep", "why", "factory:learn", ref=str(lid))
+        advice = {"status": "ok", "relation": {"kind": "duplicate", "learning_id": 7}, "group": "learning:1"}
+        self.assertTrue(jev.store(self.c, ld, advice))
         with mock.patch("factory.jev.evaluate") as ev:
             jev.refresh(self.cfg, self.c)
         ev.assert_not_called()
-        raw = json.loads(self.c.execute("SELECT detail_json FROM decision WHERE id=?", (ld,)).fetchone()[0])
-        self.assertEqual(raw["jev"], {"relation": {"kind": "duplicate", "learning_id": 7}})
+        self.assertEqual(jev.stored(self.c, ld), advice)  # the learning slice's metadata is never overwritten
 
     def test_an_executor_ask_stays_open_regardless_of_category(self):
         did = decide.open_(self.c, "ask", "q?", [decide.option("a", "A", "x"), decide.option("b", "B", "y")],
@@ -244,6 +246,17 @@ class Guidance(unittest.TestCase):
         self.assertIsNone(d["jev"]["rule"])  # no stale approved-rule claim after it expires
         self.assertEqual(d["jev"]["status"], "ok")
 
+    def test_reads_drop_a_stale_relation(self):
+        did = self.plan_decision()
+        self.c.execute("INSERT INTO learning(kind,scope,body,anchors_json,source,status,created_at) "
+                       "VALUES ('house_rule','r','b','[]','decision:1','proposed',?)", (SNAP,))
+        lid = self.c.execute("SELECT max(id) FROM learning").fetchone()[0]
+        self.assertTrue(jev.store(self.c, did, {"status": "ok", "relation": {"kind": "duplicate",
+                                                                             "learning_id": lid, "body": "b"}}))
+        self.assertIsNotNone(decide.one(self.c, did)["jev"]["relation"])
+        self.c.execute("UPDATE learning SET status='expired' WHERE id=?", (lid,))
+        self.assertIsNone(decide.one(self.c, did)["jev"]["relation"])  # no relation to a gone learning
+
 
 class Focus(unittest.TestCase):
     def test_focus_is_the_first_aspect_where_options_differ(self):
@@ -257,7 +270,9 @@ class Focus(unittest.TestCase):
         self.assertEqual(jev.focus({"kind": "plan", "options": opts}), "changes")
         opts[1]["changes"] = opts[0]["changes"]
         self.assertEqual(jev.focus({"kind": "plan", "options": opts}), "none")
-        self.assertEqual(jev.focus({"kind": "ask", "options": opts}), "none")
+        # executor (ask) options carry their consequence only as leads_to: that is the result to highlight
+        legacy = [{"id": "a", "label": "A", "leads_to": "x"}, {"id": "b", "label": "B", "leads_to": "y"}]
+        self.assertEqual(jev.focus({"kind": "ask", "options": legacy}), "result")
 
 
 class PlanGate(unittest.TestCase):
@@ -313,6 +328,9 @@ class PlanGate(unittest.TestCase):
         by_kind = {d["kind"]: d for d in decide.rows(self.c, "d1")}
         self.assertEqual(by_kind["plan"]["jev"]["status"], "ok")
         self.assertEqual(by_kind["review"]["jev"]["status"], "ok")
+        for k in ("plan", "review"):  # advice for the new decision ids, in jev_advice, never in detail_json
+            self.assertEqual(jev.stored(self.c, by_kind[k]["id"])["status"], "ok")
+            self.assertNotIn("jev", by_kind[k]["detail"])
 
     def test_plan_commits_normally_when_jev_is_unavailable(self):
         with mock.patch("factory.jev.evaluate",
@@ -322,6 +340,7 @@ class PlanGate(unittest.TestCase):
         by_kind = {d["kind"]: d for d in decide.rows(self.c, "d1")}
         self.assertEqual(by_kind["plan"]["jev"]["status"], "unavailable")
         self.assertEqual(by_kind["review"]["jev"]["status"], "unavailable")
+        self.assertEqual(jev.stored(self.c, by_kind["plan"]["id"])["error"], "typesafe api: HTTP 500")
 
     def test_plan_with_jev_disabled_has_no_guidance_and_no_gate(self):
         cfg = SimpleNamespace(repos={}, raw={})
@@ -351,8 +370,60 @@ class LearningTier(unittest.TestCase):
         self.assertEqual(d["tier"], "digest")
         self.assertIsNone(d["due_at"])
         self.assertIsNone(d["deadline"])  # waits for the user, not "the factory takes ★"
+        # _deadline itself handles the raw row (tier='auto', due_at set): no reliance on _row's normalization
+        raw = self.c.execute("SELECT * FROM decision WHERE id=?", (legacy,)).fetchone()
+        deadline, on_timeout = decide._deadline(self.c, dict(raw))
+        self.assertIsNone(deadline)
+        self.assertIn("explicit approval", on_timeout)
         self.assertEqual(decide.sweep(self.cfg, self.c), [])
         self.assertTrue(decide.one(self.c, legacy)["open"])
+
+
+class Storage(unittest.TestCase):
+    """jev_advice helpers: upsert only while open, never into detail_json; decision_answer_once is untouched."""
+    def setUp(self):
+        self.c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
+        self.cfg = SimpleNamespace(raw={})
+
+    def open_plan(self):
+        self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) "
+                       "VALUES ('d1','draft','[]','t',?)", (SNAP,))
+        return decide.open_(self.c, "plan", "q?", [decide.option("a", "A", "x"), decide.option("b", "B", "y")],
+                            "a", "why", "t", run_id="d1")
+
+    def test_store_upserts_while_open_and_stored_reads_it_back(self):
+        did = self.open_plan()
+        advice = {"status": "ok", "model": "jev-1.13.0", "fingerprint": "f1", "assessed_at": SNAP}
+        self.assertTrue(jev.store(self.c, did, advice))
+        self.assertEqual(jev.stored(self.c, did), advice)
+        advice["model"] = "jev-2.0.0"
+        self.assertTrue(jev.store(self.c, did, advice))  # upsert, never a second row
+        self.assertEqual(self.c.execute("SELECT count(*) FROM jev_advice WHERE decision_id=?", (did,)).fetchone()[0],
+                         1)
+        self.assertEqual(jev.stored(self.c, did)["model"], "jev-2.0.0")
+
+    def test_store_refuses_after_an_answer_or_a_void(self):
+        did = self.open_plan()
+        decide.choose(self.cfg, self.c, did, "a", "user")
+        self.assertFalse(jev.store(self.c, did, {"status": "ok"}))
+        self.assertIsNone(jev.stored(self.c, did))
+        did2 = self.open_plan()
+        decide.void(self.c, "id=?", (did2,), "gone")
+        self.assertFalse(jev.store(self.c, did2, {"status": "ok"}))
+
+    def test_stored_is_none_without_advice_or_a_decision(self):
+        self.assertIsNone(jev.stored(self.c, 12345))
+        did = self.open_plan()
+        self.assertIsNone(jev.stored(self.c, did))
+
+    def test_an_open_decision_row_is_still_immutable(self):
+        # decision_answer_once, exactly as before v19: no column of an open decision may change, detail_json
+        # included — guidance goes to jev_advice instead.
+        did = self.open_plan()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.c.execute("UPDATE decision SET detail_json='{\"jev\":{\"status\":\"ok\"}}' WHERE id=?", (did,))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.c.execute("UPDATE decision SET tier='now' WHERE id=?", (did,))
 
 
 if __name__ == "__main__":

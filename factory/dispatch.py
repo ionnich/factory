@@ -434,8 +434,9 @@ def plan(cfg: Config, conn, run_id: str, nodes: list) -> dict:
     `under` nests a ticket under another (a tree); depends_on is ordering (a DAG). Both must be acyclic.
     Paths (files, evidence) must exist at the dispatch trunk of the node's repo, except files marked new.
     Questions the reviewer leaves open take their recommendation at approval. When Jev is enabled, each question
-    and the review get judgment guidance in their details, and a question Jev is sure (>= 0.85) asks for pure
-    missing investigation is refused here — check the code and decide it in the plan instead."""
+    and the review get judgment guidance (persisted in the jev_advice table, never in detail_json), and a question
+    Jev is sure (>= 0.85) asks for pure missing investigation is refused here — check the code and decide it in
+    the plan instead."""
     d = _draft(conn, run_id)
     if d["planned_at"]:
         raise StageError(f"{run_id} already has a plan")
@@ -540,14 +541,15 @@ def plan(cfg: Config, conn, run_id: str, nodes: list) -> dict:
                 [r for r in json.loads(d["repos_json"]) if r["repo"] in {repo_of[t] for t in kept}]), run_id))
         conn.execute("UPDATE dispatch SET planned_at=? WHERE run_id=?", (db.now(), run_id))
         learn.cite(conn, *(f"{n.get('title', '')} {n.get('detail', '')} {n.get('why', '')}" for n in nodes))
-        decide.review(conn, run_id, recommend, review_why, "agent:factory-plan",
-                      detail={"jev": guidance["review"]} if guidance and guidance["review"] else None)
+        rdid = decide.review(conn, run_id, recommend, review_why, "agent:factory-plan")
+        if guidance and guidance["review"]:
+            jev.store(conn, rdid, guidance["review"])
         for q, g in zip(qs, guidance["questions"] if guidance else (None,) * len(qs)):
-            detail = {k: q[k] for k in ("key", "now", "evidence", "depends_on")}
+            did = decide.open_(conn, "plan", q["question"], q["options"], q["recommend"], q["why"],
+                               "agent:factory-plan", run_id=run_id, node_id=q["on"],
+                               detail={k: q[k] for k in ("key", "now", "evidence", "depends_on")})
             if g:
-                detail["jev"] = g
-            decide.open_(conn, "plan", q["question"], q["options"], q["recommend"], q["why"], "agent:factory-plan",
-                         run_id=run_id, node_id=q["on"], detail=detail)
+                jev.store(conn, did, g)
     return {"run_id": run_id, "tickets": kept, "excluded": excluded, "steps": len(steps), "questions": len(qs),
             "recommend": recommend}
 

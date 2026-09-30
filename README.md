@@ -145,7 +145,8 @@ One-time, by hand:
   verdict evidence touches at most 3 files; ★ is taken at once and you get a push. It also hands off approved
   dispatches, takes ★ where it is due, and prints the push / digest (cron stdout goes to the Bot Chat).
   Stop it with `hermes cron pause factory-propose`.
-- Jev (`factory/jev.py`): TypeSafe judgment guidance for open decisions, persisted in `detail_json.jev` and served
+- Jev (`factory/jev.py`): TypeSafe judgment guidance for open decisions, persisted in the `jev_advice` table (one
+  replaceable payload per decision, never inside `detail_json` — `decision_answer_once` is untouched) and served
   top-level as `decision.jev`. It classifies each open plan/ask/review decision (`investigate` / `policy` / `human`
   / `unclear` with a confidence), matches an active house rule a person kept (rule id, body and the matching
   option label — never a preselection), and picks a focus (`result`/`changes`/`cost`/`risk`/`none`) from the
@@ -155,8 +156,8 @@ One-time, by hand:
   missing investigation is refused at plan time with a StageError telling the planner to check the code and
   decide it in the plan, before anything is written; authority/consent questions are never treated as mere
   investigation. Judgments are fingerprinted over the actual input plus the current eligible rules: an unchanged
-  success is reused across propose ticks, changed inputs re-judge, failed calls retry on the next tick, and a rule
-  claim whose rule expired or was rejected is dropped on read. `factory jev sync` refreshes on demand; the
+  success is reused across propose ticks, changed inputs re-judge, failed calls retry on the next tick, and a
+  rule claim whose rule expired or was rejected (or a relation to a learning that is gone) is dropped on read. `factory jev sync` refreshes on demand; the
   propose tick refreshes before notify. Reads (status/overview/`decide list`) never call the network. Endpoint
   `https://api.typesafe.ai/v1/systemone`, model `jev-1.13.0` (pinned), key `TYPESAFE_API_KEY` in
   `~/.config/secrets/factory-jev.env` (listed in `secrets.env_files`; `[jev]` in factory.toml). Learnings never
@@ -189,9 +190,8 @@ One-time, by hand:
   flag; a held write is re-applied only by a person (`approved_by`), and then the agent cannot hold it again.
 - A decision has >= 2 distinct options (id, label, leads_to) and recommends one; it is answered once (with the
   text the option asks for) or withdrawn once, never edited or deleted; its tier is fixed when asked and its clock
-  (`notified_at`, `due_at`) is set once while open (triggers). Only `detail_json` (Jev guidance) is writable while
-  a decision is open; it freezes with the answer. Silence also requires a confirmed notice receipt; executor
-  questions always wait for an explicit answer. A person's draft, or one they held, never starts without them.
+  (`notified_at`, `due_at`) is set once while open (triggers). Silence also requires a confirmed notice receipt;
+  executor questions always wait for an explicit answer. A person's draft, or one they held, never starts without them.
 - `stage` skips tickets named in nix-fleet backlogs or nix-fleet herdr workspace labels.
 - A verdict is dispatched at most once (a blocked card needs the ticket to change first, or your "retry" on
   the block, whose guidance becomes a note on the next draft); `valid` verdicts expire

@@ -228,8 +228,11 @@ def rule_for(conn, d) -> dict | None:
 
 # ---- focus --------------------------------------------------------------------------------------------------------
 def focus(d) -> str:
-    """The existing per-option consequence worth highlighting: the first aspect where the options differ."""
-    if d["kind"] not in ("plan", "ask"):
+    """The existing per-option consequence worth highlighting: the first aspect where the options differ.
+    Executor (ask) options carry their consequence only as leads_to, so their focus is `result` or nothing."""
+    if d["kind"] == "ask":
+        return "result" if any(str(o.get("leads_to") or "").strip() for o in d["options"]) else "none"
+    if d["kind"] != "plan":
         return "none"
     for aspect in ("risk", "cost", "changes", "result"):
         keys = {json.dumps(o.get(aspect), sort_keys=True) if aspect == "changes" else str(o.get(aspect) or "").strip()
@@ -251,7 +254,7 @@ def assess(cfg, conn, d) -> dict | None:
         return None
     state, rules = _state(conn, d)
     fp = fingerprint(state, [r["id"] for r in rules])
-    prev = d.get("detail").get("jev") if isinstance(d.get("detail"), dict) else None
+    prev = stored(conn, d["id"]) if d.get("id") is not None else None
     if isinstance(prev, dict) and prev.get("status") == "ok" and prev.get("fingerprint") == fp:
         return None
     res = evaluate(cfg, state, _questions())
@@ -295,20 +298,34 @@ def assess_plan(cfg, conn, run_id, qs, recommend, review_why) -> dict | None:
 
 
 # ---- storing and refreshing ---------------------------------------------------------------------------------------
-def _store(conn, did: int, guidance: dict) -> bool:
-    with db.tx(conn):  # re-read: answered or withdrawn while we were on the network is never overwritten
-        row = conn.execute("SELECT chosen, void_reason, detail_json FROM decision WHERE id=?", (did,)).fetchone()
+def stored(conn, decision_id: int) -> dict | None:
+    """The persisted advice for a decision, or None. A pure read: never the network."""
+    r = conn.execute("SELECT payload_json FROM jev_advice WHERE decision_id=?", (decision_id,)).fetchone()
+    if r is None:
+        return None
+    try:
+        j = json.loads(r["payload_json"])
+    except json.JSONDecodeError:
+        return None
+    return j if isinstance(j, dict) else None
+
+
+def store(conn, decision_id: int, advice: dict) -> bool:
+    """Upsert advice only while its decision is still open. The recheck happens inside one short transaction,
+    with no network. False: the decision is gone, or was answered/withdrawn while the judgment was made."""
+    with db.tx(conn):
+        row = conn.execute("SELECT chosen, void_reason FROM decision WHERE id=?", (decision_id,)).fetchone()
         if row is None or row["chosen"] is not None or row["void_reason"] is not None:
             return False
-        detail = json.loads(row["detail_json"])
-        detail["jev"] = guidance
-        conn.execute("UPDATE decision SET detail_json=? WHERE id=?", (json.dumps(detail), did))
+        conn.execute("INSERT INTO jev_advice(decision_id, payload_json) VALUES (?, ?) "
+                     "ON CONFLICT(decision_id) DO UPDATE SET payload_json=excluded.payload_json",
+                     (decision_id, json.dumps(advice)))
     return True
 
 
 def refresh(cfg, conn) -> list[dict]:
     """Re-judge open plan/ask/review decisions (factory jev sync, propose tick). Learning decisions are never
-    touched: their jev holds the learning slice's relation/group metadata."""
+    touched: their advice holds the learning slice's relation/group metadata."""
     from . import decide
     if not enabled(cfg):
         return []
@@ -322,7 +339,7 @@ def refresh(cfg, conn) -> list[dict]:
         guidance = assess(cfg, conn, d)
         if guidance is None:
             continue  # unchanged success: keep the stored judgment
-        if _store(conn, did, guidance):
+        if store(conn, did, guidance):
             out.append({"decision": did, **{k: guidance[k] for k in ("status", "category", "confidence")
                                            if k in guidance}})
     return out
@@ -334,12 +351,21 @@ def _rule_current(conn, lid: int, options, option_id) -> bool:
     return bool(r and _human_keep(conn, lid) and option_id in {o["id"] for o in options})
 
 
-def served(detail: dict, conn, options) -> dict | None:
-    """The top-level jev a read may show: absent when there is none, never a stale approved-rule claim."""
-    j = detail.get("jev") if isinstance(detail, dict) else None
-    if not isinstance(j, dict) or j.get("status") not in ("ok", "unavailable", "disabled"):
+def _learning_eligible(conn, lid: int) -> bool:
+    return bool(conn.execute("SELECT 1 FROM learning WHERE id=? AND status IN ('active', 'proposed')",
+                             (lid,)).fetchone())
+
+
+def served(payload, conn, options) -> dict | None:
+    """The top-level jev a read may show: absent when there is none, and never a stale approved-rule claim or a
+    relation to a learning that no longer exists as active/proposed."""
+    if not isinstance(payload, dict) or payload.get("status") not in ("ok", "unavailable", "disabled"):
         return None
+    j = dict(payload)
     rule = j.get("rule")
     if isinstance(rule, dict) and rule.get("id") and not _rule_current(conn, rule["id"], options, rule.get("option_id")):
-        j = {**j, "rule": None}
+        j["rule"] = None
+    rel = j.get("relation")
+    if isinstance(rel, dict) and rel.get("learning_id") and not _learning_eligible(conn, rel["learning_id"]):
+        j["relation"] = None
     return j
