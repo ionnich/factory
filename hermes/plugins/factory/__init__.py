@@ -3,9 +3,9 @@
 Reads are free. `stage` makes a draft dispatch (a planner adds a plan and a review decision; nothing runs yet).
 `note` only touches drafts. `decide` answers a decision (every choice the factory needs from the user: review a
 draft, a planner or executor question, a blocked ticket, a stuck executor, a held Linear write); `ok` takes the
-recommendation on several (the user's "ok" to a digest). Choices that start or stop real work or write Linear ask
-the human through Hermes's approval prompt (once per call); with no human channel they are refused and the command
-to paste is returned instead.
+recommendation on several (the user's "ok" to a digest). Choices that start or stop real work, write Linear or
+direct an executor ask the human through Hermes's approval prompt (once per call); with no human channel they are
+refused and the command to paste is returned instead. `resend` sends only an already recorded executor answer.
 """
 import json
 import os
@@ -28,20 +28,22 @@ SCHEMA = {
         "like `root` (whole dispatch), `FIN-3788` (a ticket), `FIN-3788/2` (a step); the executor reads it "
         "verbatim); decisions [run_id] (what waits on the user: each has options with what they lead to, a "
         "recommended option and why); decide <decision_id> <option> [note] (answer one with the user's choice; "
-        "some options need a note, e.g. a reason to hold or reject); ok <decision_ids> (the user said ok / yes to "
+        "some options need a note, e.g. a reason to hold or reject); resend <decision_id> (send only the recorded "
+        "executor answer after a delivery failure; status.executor_deliveries shows failures; uncertain delivery "
+        "may duplicate, so always confirm with the user); ok <decision_ids> (the user said ok / yes to "
         "a digest or push: take the recommended option on each of those decisions); followup <identifier> <title> "
         "<body> [repo] (queue a new ticket split out of an owned one; reconcile creates it in Linear)."),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["status", "tickets", "candidates", "ticket", "stage", "draft",
-                                                  "note", "decisions", "decide", "ok", "followup"]},
+                                                  "note", "decisions", "decide", "resend", "ok", "followup"]},
             "run_id": {"type": "string", "description": "dispatch run id for status/draft/note/decisions"},
             "identifier": {"type": "string", "description": "ticket id for `ticket`, e.g. FIN-3481"},
             "identifiers": {"type": "array", "items": {"type": "string"}, "description": "tickets for `stage`"},
             "node": {"type": "string", "description": "plan node id for `note`, from the `draft` tree: `root` (whole "
                                                      "dispatch), `FIN-3788` (a ticket), `FIN-3788/2` or `FIN-3788/2.1` (a step)"},
-            "decision_id": {"type": "integer", "description": "decision id for `decide`"},
+            "decision_id": {"type": "integer", "description": "decision id for `decide` or `resend`"},
             "decision_ids": {"type": "array", "items": {"type": "integer"},
                              "description": "for `ok`: the #ids of the digest or push the user said ok to"},
             "option": {"type": "string", "description": "the option id the user chose, for `decide`"},
@@ -106,6 +108,8 @@ def handle(params: dict, **_) -> str:
         return _run("decide", "list", *([run_id, "--all"] if run_id else []))
     if action == "decide":
         return _decide(params)
+    if action == "resend":
+        return _resend(params)
     if action == "ok":
         return _ok(params)
     if action == "followup":
@@ -161,13 +165,32 @@ def _decide(params: dict) -> str:
     if opt is None:
         return json.dumps({"ok": False, "error": f"choose one of {[o['id'] for o in d['options']]}"})
     args = ["decide", "choose", str(int(did)), choice, *([f"--note={note}"] if note else [])]
-    if opt.get("weighty"):  # starts/stops real work or writes Linear: a human confirms this one operation
+    if opt.get("weighty"):  # real work, Linear writes and executor instructions need a human confirmation
         command = "factory " + " ".join(args)
-        why = _approve(command, f"{d['question']} {opt['label']}: {opt['leads_to']}.")
+        why = _approve(command, f"{d['question']} {opt['label']}: {opt['leads_to']}."
+                       + (f" Note: {note}" if note else ""))
         if why:
             return _refused(why, command)
         return _run(*args, "--actor", "user:factory-chat")
     return _run(*args, "--actor", "agent:factory-chat (for the user)")
+
+
+def _resend(params: dict) -> str:
+    did = params.get("decision_id")
+    if not did:
+        return '{"ok": false, "error": "decision_id required"}'
+    did = int(did)
+    status = json.loads(_run("status"))
+    delivery = next((d for d in status.get("executor_deliveries", []) if d["decision_id"] == did), None)
+    if delivery is None:
+        return json.dumps({"ok": False, "error": f"no unsent executor answer for decision {did}; check status"})
+    if delivery["state"] == "sending":
+        return json.dumps({"ok": False, "error": f"decision {did} is being sent; concurrent resend refused"})
+    command = f"factory decide resend {did}"
+    why = _approve(command, f"Resend recorded answer for {delivery['run_id']}: {delivery['question']} "
+                   f"{delivery['answer']}. {delivery['error'] or ''} "
+                   "The choice will not change. Check the executor first: resending may duplicate delivery.")
+    return _refused(why, command) if why else _run("decide", "resend", str(did))
 
 
 def register(ctx):
