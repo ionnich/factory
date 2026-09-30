@@ -2,6 +2,8 @@
 // ({decision id: [{id, question, answer, status: pending|answered|failed, error, asked_at, answered_at}]}) via
 // WhyContext, with the open review decision per run (a planned draft still in review can be replanned with an
 // answer); the answer lands in factory.db, /stream fires and the tab reloads, so there is no polling here.
+// A thread starts folded behind "why? (n)": answers already given wait there, while asks after the last answer (the
+// planner still thinking, a failure) stay in view. Follow-up, retry and replan are in the unfolded thread.
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect, useContext } = SDK.hooks;
@@ -38,23 +40,27 @@ export function Why({ d }) {
   };
   const ask = (q) => q.trim() && send({ path: `/decisions/${d.id}/asks`, body: { text: q.trim() } }, () => setText(""));
   if (!open && !thread.length) return <button className="fx-link-btn" onClick={(e) => { e.stopPropagation(); setOpen(true); }}>why?</button>;
+  const last = thread[thread.length - 1];
+  const shown = open ? thread : thread.slice(thread.map((a) => a.status).lastIndexOf("answered") + 1);
   return (
     <div className="fx-stack-v" onClick={(e) => e.stopPropagation()}>
-      {thread.map((a, i) => (
+      {thread.length ? <button className="fx-link-btn" aria-expanded={open} onClick={() => setOpen(!open)}>
+        {open ? "hide why" : `why? (${thread.length})`}</button> : null}
+      {shown.map((a) => (
         <div key={a.id} className="fx-note">
           <div><b>{a.question}</b></div>
           {a.status === "pending" ? <Thinking since={a.asked_at} />
             : a.status === "failed" ? <div className="fx-err">{a.error}{" "}
-              {!pending ? <button className="fx-link-btn" disabled={busy} onClick={() => ask(a.question)}>retry</button> : null}</div>
+              {open && !pending ? <button className="fx-link-btn" disabled={busy} onClick={() => ask(a.question)}>retry</button> : null}</div>
             : <div className="fx-pre">{a.answer}</div>}
-          {a.status === "answered" && i === thread.length - 1 && canReplan ? (
+          {a.status === "answered" && a === last && canReplan ? (
             <button className="fx-link-btn" disabled={busy}
                     onClick={() => send({ path: `/drafts/${d.run_id}/replan`,
                                           body: { reason: `${a.question}\n${a.answer}`.slice(0, 3900) } })}>
               replan with this</button>) : null}
         </div>
       ))}
-      {!pending ? (
+      {open && !pending ? (
         <div className="fx-row">
           <Input value={text} maxLength={2000} disabled={busy} placeholder={thread.length ? "Follow-up" : "Why…?"}
                  onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") ask(text); }} />
