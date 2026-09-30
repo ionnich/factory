@@ -6,11 +6,15 @@
 // saw and did, oldest first.
 //
 // <TicketsTab data mode active view onViewChange onDone onNavigate />: data is the overview; mode tickets|verify|draft;
-//   active false = no fetch and no sheet (default true). view {q, filter, picked, open} is the parent's, one per mode, so
-//   a workspace keeps it while unmounted (missing keys: "", "all", [], null); onViewChange(nextView) gets the whole next
-//   view. onDone(stageResult, null, toast) after a draft. onNavigate({stage, run?, ticket?}): the parent owns history
-//   and the pane. A row opens with {stage: mode, ticket}, the sheet closes with {stage: mode, ticket: null}, a new
-//   draft goes to {stage: "draft", run}.
+//   active false = no fetch and no sheet (default true). view {q, filter, picked, open, busy, err} is the parent's, one
+//   per mode, so a workspace keeps it while unmounted, a pending or failed draft included (missing keys: "", "all", [],
+//   null, false, null). onViewChange is that mode's React-style setter; this file only passes updaters (latest view) =>
+//   next view, so a draft that lands after its workspace moved on or unmounted patches only busy, err and picked. A late
+//   call must still reach the view of the mode it was rendered for. busy and err are live state, not location: restoring
+//   a view from the URL or history keeps them. onDone(stageResult, null, toast) after a draft, mounted or not.
+//   onNavigate({stage, run?, ticket?}): the parent owns history and the pane. A row opens with {stage: mode, ticket},
+//   the sheet closes with {stage: mode, ticket: null}, a new draft goes to {stage: "draft", run} unless Draft was left
+//   while it was pending.
 //
 // ticket row: {identifier, title, url, phase (tickets|verify|draft, or its live dispatch's phase), group: ready|answer|
 //   stale|dispatch|done|not, domain?, assignee?, linear_state, state_type, in_scope?, in_review?, owned?, context?,
@@ -82,7 +86,7 @@ function Row({ t, why, phase, pick, onOpen }) {
   const v = t.verdict, d = t.dispatch;
   return (
     <div className={`fx-trow${pick?.checked ? " picked" : ""}`} onClick={onOpen} role="button" tabIndex={0}
-         onKeyDown={(e) => e.key === "Enter" && onOpen()}>
+         onKeyDown={(e) => e.key === "Enter" && e.target === e.currentTarget && onOpen()}>
       {pick ? <input type="checkbox" className="fx-pick" checked={pick.checked} disabled={pick.disabled} onClick={stop}
                      onChange={pick.toggle} aria-label={`Select ${t.identifier}`} /> : null}
       <div className="fx-grow">
@@ -178,14 +182,16 @@ export function TicketsTab({ data, mode, active = true, view, onViewChange, onDo
   const filters = FILTERS[mode];
   const q = view?.q || "", picked = view?.picked || [], open = view?.open || null;
   const filter = filters.some(([k]) => k === view?.filter) ? view.filter : "all";
-  const latest = useRef(view);  // a draft that lands later edits the view as it is then, not as it was on the click
-  latest.current = view;
-  const update = (patch) => onViewChange({ ...latest.current, ...patch });
-  const inDraft = useRef(false);  // mounted, active and in Draft: only then may a draft that lands later move the page
-  inDraft.current = active && mode === "draft";
-  useEffect(() => () => { inDraft.current = false; }, []);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState(null);
+  const busy = !!view?.busy, err = view?.err || null;
+  const update = (patch) => onViewChange((v) => ({ ...v, ...patch }));  // lands on the view as it is by then
+  // One token per stay in Draft (mounted, active, mode draft): leaving or unmounting ends it, coming back starts a new
+  // one. A draft that lands later may move the page only while the stay it was clicked in goes on.
+  const inDraft = useRef(null);
+  useEffect(() => {
+    if (!active || mode !== "draft") return;
+    inDraft.current = {};
+    return () => { inDraft.current = null; };
+  }, [active, mode]);
   const [all, setAll] = useState(null);
   const [loadErr, setLoadErr] = useState(null);
   useEffect(() => {  // while active: now and on each overview refresh (`data` is a new object every time)
@@ -210,15 +216,17 @@ export function TicketsTab({ data, mode, active = true, view, onViewChange, onDo
   const needle = q.trim().toLowerCase();
   // A search looks through this whole workspace, whatever the filter, and never past it.
   const list = needle ? rows.filter(({ t }) => `${t.identifier} ${t.title || ""}`.toLowerCase().includes(needle)) : within(filter);
+  const suggest = mode === "draft" && !needle && filter !== "dispatch" && suggested.length > 0;  // Next dispatch card
   const draft = (ids) => {
-    setBusy(true); setErr(null);
+    const stay = inDraft.current;
+    update({ busy: true, err: null });
     SDK.fetchJSON(`${API}/stage`, { method: "POST", headers: { "Content-Type": "application/json" },
                                     body: JSON.stringify({ identifiers: ids }) })
       .then((r) => {  // {run_id, state: "draft", tickets}: a draft row; the plan gate offers it to a planner later
-        setBusy(false);
+        update({ busy: false, picked: [] });  // mounted or not, so no drafted ticket stays picked
         onDone(r, null, `Drafted ${r.run_id}; it waits in Draft until the plan gate offers it to a planner`);
-        if (inDraft.current) { update({ picked: [] }); onNavigate({ stage: "draft", run: r.run_id }); }
-      }, (e) => { setBusy(false); setErr(errText(e)); });
+        if (stay && inDraft.current === stay) onNavigate({ stage: "draft", run: r.run_id });
+      }, (e) => update({ busy: false, err: errText(e) }));
   };
   // History first, then the view: the entry the sheet opened from keeps its own URL.
   const setOpen = (id) => { onNavigate({ stage: mode, ticket: id }); update({ open: id }); };
@@ -233,7 +241,7 @@ export function TicketsTab({ data, mode, active = true, view, onViewChange, onDo
         ))}
       </div>
       {mode === "draft" ? <div className="fx-hint">{plural(stageable.length, "ticket")} ready to draft · up to {max} per dispatch</div> : null}
-      {mode === "draft" && !needle && filter !== "dispatch" && suggested.length ? (
+      {suggest ? (
         <Card className="fx-card fx-suggest"><CardContent className="fx-stack-v">
           <div className="fx-row between"><span className="fx-k">Next dispatch</span><span className="fx-hint">★ recommended</span></div>
           <div>{suggested.map((i) => <div key={i} className="fx-ttitle clamp"><span className="fx-id">{i}</span> {titles[i]}</div>)}</div>
@@ -264,7 +272,7 @@ export function TicketsTab({ data, mode, active = true, view, onViewChange, onDo
           <Button size="sm" disabled={busy} onClick={() => draft(sel)}>{busy ? "Drafting…" : "Draft dispatch"}</Button>
         </div>
       ) : null}
-      {mode === "draft" && sel.length && err ? <div className="fx-err" role="alert">{err}</div> : null}
+      {mode === "draft" && err && (sel.length || !suggest) ? <div className="fx-err" role="alert">{err}</div> : null}
       {active && current ? <Sheet key={current.identifier} t={current} onClose={() => setOpen(null)} /> : null}
     </>
   );
