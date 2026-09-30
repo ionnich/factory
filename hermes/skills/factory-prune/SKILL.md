@@ -27,6 +27,9 @@ evidence-changed | aged), `context`, `repo`, `mirror` (a checkout of trunk),
 A re-check (`why` evidence-changed or aged) also carries `prior` (the current
 verdict: kind, target, reason, evidence, its trunk_sha) and `cited_diff` (the
 git diff of only the files that verdict cited, prior trunk → current trunk).
+Each ticket also has `learnings`: lines `L<id> <kind>: …` (house rules, pitfalls,
+and what lives at paths this ticket touches). Read them first; they spare you
+re-reading code. When one saved you work, cite `L<id>` in the verdict reason.
 
 ## Re-check first (when `prior` is present)
 

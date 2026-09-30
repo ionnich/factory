@@ -28,6 +28,9 @@ again, so no ticket gets two owners.
 Read `dispatch.md` in full. Each `## FIN-…` section is one card: repo, trunk
 SHA, the verdict and its evidence, operator notes, the reviewed **Plan** (steps
 `FIN-…/n` with `after …` dependencies), then the ticket body (a claim, not truth).
+**Known pitfalls** (`L<id>`, when present) come from earlier blocks in these
+repos: pass them on with the card, and cite `L<id>` in a card comment when one
+saved work.
 
 The dispatch was reviewed by the captain before approval. **Operator notes and
 answered questions are binding**: the dispatch-level notes, each ticket's and

@@ -3,7 +3,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 
-from . import db, repos, witness
+from . import db, learn, repos, witness
 from .config import Config, Context
 
 KINDS = ("valid", "already-done", "stale", "duplicate-of", "invalid-references", "needs-clarification")
@@ -141,10 +141,15 @@ def gate(cfg: Config, conn) -> dict:
             auto += 1
         elif len(todo) < batch:
             trunk = conn.execute("SELECT sha FROM repo_trunk WHERE repo=?", (ctx.repo,)).fetchone()
-            todo.append({"identifier": s["identifier"], "title": json.loads(s["raw_json"])["title"],
+            raw = json.loads(s["raw_json"])
+            v = conn.execute("SELECT evidence_paths_json FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
+                             (s["issue_id"],)).fetchone()
+            todo.append({"identifier": s["identifier"], "title": raw["title"],
                          "why": reason, "context": ctx.name, "repo": ctx.repo,
                          "mirror": str(cfg.mirror_path(ctx.repo)), "trunk_sha": trunk["sha"] if trunk else None,
-                         "witnesses": ctx.witnesses, **_recheck(cfg, conn, s, ctx, reason, trunk)})
+                         "witnesses": ctx.witnesses, **_recheck(cfg, conn, s, ctx, reason, trunk),
+                         "learnings": learn.relevant(conn, {ctx.repo}, json.loads(v[0]) if v else (),
+                                                     f"{raw['title']}\n{raw.get('description') or ''}")})
     return {"wakeAgent": bool(todo), "context": {"tickets": todo, "auto_needs_clarification": auto}}
 
 
@@ -252,4 +257,5 @@ def put(cfg: Config, conn, identifier: str, kind: str, reason: str, evidence: li
             "evidence_json, evidence_paths_json, created_at, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (s["issue_id"], s["updated_at"], ctx.name if ctx else None, ctx.repo if ctx else None, trunk,
              kind, target, reason.strip(), json.dumps(evidence), json.dumps(sorted(set(paths))), now, actor))
+        learn.cite(conn, reason)
         return cur.lastrowid

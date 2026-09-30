@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -263,6 +263,91 @@ BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;""",
     # older plans).
     13: """ALTER TABLE dispatch_step ADD COLUMN result TEXT;
 ALTER TABLE dispatch_step ADD COLUMN files_json TEXT CHECK (files_json IS NULL OR json_valid(files_json));""",
+    # v14: learnings (learn.py), and decision kind 'learning' (keep/drop a proposed one). SQLite can't alter a
+    # CHECK: the decision table is rebuilt as-is with the new kind, its index and triggers recreated.
+    14: """CREATE TABLE learning (
+  id             INTEGER PRIMARY KEY,
+  kind           TEXT NOT NULL CHECK (kind IN ('codemap', 'pitfall', 'house_rule')),
+  scope          TEXT NOT NULL,
+  body           TEXT NOT NULL CHECK (length(trim(body)) > 0 AND length(body) <= 300),
+  anchors_json   TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(anchors_json)),
+  trunk_sha      TEXT,
+  source         TEXT NOT NULL,
+  status         TEXT NOT NULL CHECK (status IN ('active', 'proposed', 'expired', 'rejected')),
+  created_at     TEXT NOT NULL,
+  expired_reason TEXT,
+  uses           INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (kind, scope, source, anchors_json)
+);
+CREATE UNIQUE INDEX learning_codemap ON learning(scope, anchors_json) WHERE kind = 'codemap' AND status = 'active';
+CREATE TABLE decision_v14 (
+  id           INTEGER PRIMARY KEY,
+  run_id       TEXT,
+  node_id      TEXT NOT NULL DEFAULT 'root',
+  issue_id     TEXT,
+  kind         TEXT NOT NULL CHECK (kind IN
+    ('review', 'plan', 'blocked', 'executor-gone', 'dispatch-stuck', 'writeback', 'ask', 'learning')),
+  ref          TEXT,
+  question     TEXT NOT NULL CHECK (length(trim(question)) > 0),
+  options_json TEXT NOT NULL CHECK (json_valid(options_json) AND json_array_length(options_json) >= 2),
+  recommended  TEXT NOT NULL,
+  why          TEXT NOT NULL CHECK (length(trim(why)) > 0),
+  detail_json  TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(detail_json)),
+  created_at   TEXT NOT NULL,
+  created_by   TEXT NOT NULL,
+  chosen       TEXT,
+  chosen_by    TEXT,
+  chosen_at    TEXT,
+  chosen_note  TEXT,
+  void_reason  TEXT,
+  void_at      TEXT,
+  tier         TEXT NOT NULL DEFAULT 'digest' CHECK (tier IN ('auto', 'digest', 'now')),
+  notified_at  TEXT,
+  due_at       TEXT,
+  CHECK ((chosen IS NULL) = (chosen_by IS NULL) AND (chosen IS NULL) = (chosen_at IS NULL)),
+  CHECK ((void_reason IS NULL) = (void_at IS NULL) AND (chosen IS NULL OR void_reason IS NULL))
+);
+INSERT INTO decision_v14(id, run_id, node_id, issue_id, kind, ref, question, options_json, recommended, why,
+  detail_json, created_at, created_by, chosen, chosen_by, chosen_at, chosen_note, void_reason, void_at, tier,
+  notified_at, due_at)
+SELECT id, run_id, node_id, issue_id, kind, ref, question, options_json, recommended, why, detail_json, created_at,
+  created_by, chosen, chosen_by, chosen_at, chosen_note, void_reason, void_at, tier, notified_at, due_at FROM decision;
+DROP TABLE decision;
+ALTER TABLE decision_v14 RENAME TO decision;
+CREATE INDEX decision_open ON decision(run_id) WHERE chosen IS NULL AND void_reason IS NULL;
+CREATE TRIGGER decision_valid BEFORE INSERT ON decision
+WHEN NEW.chosen IS NOT NULL OR NEW.void_reason IS NOT NULL
+  OR EXISTS (SELECT 1 FROM json_each(NEW.options_json) WHERE json_type(value) <> 'object'
+             OR length(trim(coalesce(json_extract(value, '$.id'), ''))) = 0
+             OR length(trim(coalesce(json_extract(value, '$.label'), ''))) = 0
+             OR length(trim(coalesce(json_extract(value, '$.leads_to'), ''))) = 0)
+  OR (SELECT count(DISTINCT json_extract(value, '$.id')) FROM json_each(NEW.options_json))
+     <> json_array_length(NEW.options_json)
+  OR NOT EXISTS (SELECT 1 FROM json_each(NEW.options_json) WHERE json_extract(value, '$.id') = NEW.recommended)
+BEGIN SELECT RAISE(ABORT, 'a decision needs >= 2 distinct options (id, label, leads_to) and recommends one of them'); END;
+CREATE TRIGGER decision_answer_once BEFORE UPDATE OF run_id, node_id, issue_id, kind, ref, question, options_json,
+  recommended, why, detail_json, created_at, created_by, tier, chosen, chosen_by, chosen_at, chosen_note, void_reason,
+  void_at ON decision
+WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
+  OR NEW.run_id IS NOT OLD.run_id OR NEW.node_id IS NOT OLD.node_id OR NEW.issue_id IS NOT OLD.issue_id
+  OR NEW.kind IS NOT OLD.kind OR NEW.ref IS NOT OLD.ref OR NEW.question IS NOT OLD.question
+  OR NEW.options_json IS NOT OLD.options_json OR NEW.recommended IS NOT OLD.recommended OR NEW.why IS NOT OLD.why
+  OR NEW.detail_json IS NOT OLD.detail_json OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.created_by IS NOT OLD.created_by OR NEW.tier IS NOT OLD.tier
+  OR (NEW.chosen IS NULL AND NEW.void_reason IS NULL)
+  OR (NEW.chosen IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(OLD.options_json)
+                                             WHERE json_extract(value, '$.id') = NEW.chosen))
+  OR (NEW.chosen IS NOT NULL AND length(trim(coalesce(NEW.chosen_note, ''))) = 0
+      AND EXISTS (SELECT 1 FROM json_each(OLD.options_json)
+                  WHERE json_extract(value, '$.id') = NEW.chosen AND json_extract(value, '$.note') IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'a decision is answered (with one of its options, and the text it asks for) or withdrawn once'); END;
+CREATE TRIGGER decision_no_delete BEFORE DELETE ON decision
+BEGIN SELECT RAISE(ABORT, 'decisions are never deleted'); END;
+CREATE TRIGGER decision_clock BEFORE UPDATE OF notified_at, due_at ON decision
+WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
+  OR (OLD.notified_at IS NOT NULL AND NEW.notified_at IS NOT OLD.notified_at)
+  OR (OLD.due_at IS NOT NULL AND NEW.due_at IS NOT OLD.due_at)
+BEGIN SELECT RAISE(ABORT, 'a decision''s clock (notified_at, due_at) is set once, while it is open'); END;""",
 }
 
 

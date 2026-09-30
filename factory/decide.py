@@ -310,8 +310,14 @@ def _ask(cfg, conn, d, choice, note, actor):
     return {}, lambda: {"sent_to_executor": dispatch.tell_executor(conn, d["run_id"], text)}
 
 
+def _learning(cfg, conn, d, choice, note, actor):
+    conn.execute("UPDATE learning SET status=? WHERE id=? AND status='proposed'",
+                 ("active" if choice == "keep" else "rejected", int(d["ref"])))
+    return {}, None
+
+
 EFFECTS = {"review": _review, "plan": _plan, "blocked": _blocked, "executor-gone": _executor,
-           "dispatch-stuck": _executor, "writeback": _writeback, "ask": _ask}
+           "dispatch-stuck": _executor, "writeback": _writeback, "ask": _ask, "learning": _learning}
 
 
 def choose(cfg, conn, did: int, choice: str, actor: str, note: str | None = None) -> dict:

@@ -31,6 +31,8 @@ repo, trunk SHA, the verdict and its evidence, operator notes, the reviewed **Pl
 and answered questions are binding**: they override the plan and the ticket body. Carry the plan,
 every note and every answer into each crew brief verbatim; one that cannot be followed is a block,
 not a judgement call.
+**Known pitfalls** (`L<id>`, when present) come from earlier blocks in these repos: put them in
+each crew brief, and cite `L<id>` in a card comment when one saved work.
 
 ## 2. Run every card
 

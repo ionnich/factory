@@ -78,7 +78,7 @@ One-time, by hand:
   options, what each leads to, and one recommended with why. Kinds: a draft's review (approve / hold / reject),
   planner questions (at most 2 per draft), executor questions mid-run (`decide ask`; the answer is typed into its
   pane), a blocked ticket (write back / retry with guidance), a missing or quiet executor (restart / wait / stop),
-  a held Linear write (apply anyway / skip / do it yourself).
+  a held Linear write (apply anyway / skip / do it yourself), a proposed learning (keep / drop).
 - Asking less (`decide.py`). Each decision gets a tier when asked. **Auto**: the factory takes ★ on its next pass
   and lists it under "Done for you": nothing to weigh (a code check held a Linear write), the executor's first
   crash in a dispatch (restarted once), or a kind where you took ★ the last 5 times (one override and it asks
@@ -109,6 +109,15 @@ One-time, by hand:
   verdict evidence touches at most 3 files; ★ is taken at once and you get a push. It also hands off approved
   dispatches, takes ★ where it is due, and prints the push / digest (cron stdout goes to the Bot Chat).
   Stop it with `hermes cron pause factory-propose`.
+- Learnings (`learn.py`, synced each `factory-propose` tick): one- or two-line facts that save agents tokens, each
+  with its source, anchors (repo paths) and expiry. **Code map** (what lives at a path) is harvested from verdict
+  evidence notes and file names in plan steps, one per repo+path, active at once. **Pitfalls** (a blocked card's
+  reason) and **house rules** (a plan option label you chose twice, or a non-★ answer with a note) are proposed as
+  decisions and reach agents only once you keep them. An active learning expires when trunk changes or deletes an
+  anchor. The prune and planner gates hand agents `learnings` (house rules and pitfalls for the repo, code map
+  lines for the ticket's cited paths or named files; at most 12), dispatch.md gets **Known pitfalls**, and agents
+  cite `L<id>` in verdict reasons, plans and card comments, which counts a use. The Learn tab lists them with their
+  uses next to the cost per verdict and per plan.
 - Backups: `factory-backup` (03:00) writes `~/.hermes/factory/backups/factory-YYYY-MM-DD.db` (newest 14), and every
   schema migration first writes `factory-pre-vN.db`. Same disk: protects against bad writes, not disk loss.
 - CLI: `factory status|overview|tickets|candidates|stage|draft|decide|handoff|propose|execute|card|reconcile|archive|metrics|backup`.
