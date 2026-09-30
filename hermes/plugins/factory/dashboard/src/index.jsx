@@ -1,9 +1,12 @@
 // Factory tab, mobile first: a stack of cards.
 //   Needs you: a deck of decisions. Each is a question with options, what each leads to, and the factory's
-//     recommendation. Tap an option, or swipe right to take the recommendation, left for later.
-//   Lifecycle: one tab per factory stage — Tickets (every ticket and its audit trail; pick drafts), Draft (the plan:
-//     plan.jsx, the configurator, with notes while draft), Run (staged, executing, done; the plan read-only), Learn
-//     (reconciled, archived: predicted vs landed, learnings, throughput). Dispatches are rows in an engineering table.
+//     recommendation; long explanations start folded. Tap an option, or swipe right to take the recommendation, left
+//     for later.
+//   Lifecycle: one tab per factory stage, the strip right under the header, the stage itself after the deck —
+//     Tickets (every ticket and its audit trail; pick drafts), Draft (the plan: plan.jsx, the configurator, with notes
+//     while draft), Run (staged, executing, done; the server's runtime read — last activity, blocker, next step —
+//     then the plan read-only), Learn (reconciled, archived: predicted vs landed, learnings, throughput). Dispatches
+//     are rows in an engineering table.
 //     Quick lane: light decisions, ★ on all in one tap.
 // Every action goes through the plugin API to the factory CLI, which enforces the invariants.
 // Built by install.sh (`bun build`, classic JSX via tsconfig.json) to dist/index.js; React and the shadcn-style
@@ -139,12 +142,25 @@ function Silence({ d }) {
   return <div className="fx-hint">If you stay silent{when}: {d.on_timeout}.</div>;
 }
 
+// An explanation longer than ~3 lines starts folded to its opening words (native details: a tap or Enter opens it);
+// open, the preview gives way to the whole text.
+function Fold({ head, text, className }) {
+  if (!text) return null;
+  if (text.length <= 140) return <div className={className}>{head}{text}</div>;
+  return (
+    <details className={`fx-more ${className}`}>
+      <summary>{head}<span className="fx-pv">{clip(text, 80)}</span></summary>
+      {text}
+    </details>
+  );
+}
+
 function DecisionBody({ d, onChoose, busy, err, compact, hideHold }) {
   if (!d.open) return <><Answered d={d} /><Why d={d} /></>;
   return (
     <>
       <Jev d={d} />
-      <div className="fx-why"><span className="star">★</span> {d.options.find((o) => o.id === d.recommended)?.label}: {d.why}</div>
+      <Fold className="fx-why" head={<><span className="star">★</span> {d.options.find((o) => o.id === d.recommended)?.label}: </>} text={d.why} />
       <div className="fx-opts">{sortOptions(d).filter((o) => !hideHold || o.id !== "hold").map((o) => <Option key={o.id} d={d} o={o} busy={busy} onChoose={onChoose} />)}</div>
       <ActErr err={err} />
       {!compact ? <Silence d={d} /> : null}
@@ -227,7 +243,7 @@ function TopCard({ d, ctx, err, onChoose, onLater, onOpen, pos, canLater }) {
   const drag = useRef(null);
   const rec = d.options.find((o) => o.id === d.recommended);
   const down = (e) => {
-    if (e.target.closest("button, input, a")) return;
+    if (e.target.closest("button, input, a, summary")) return;  // a summary folds and unfolds; it never drags
     drag.current = { x: e.clientX, id: e.pointerId };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
@@ -253,7 +269,7 @@ function TopCard({ d, ctx, err, onChoose, onLater, onOpen, pos, canLater }) {
         </div>
         {ctx ? <button className="fx-ctx" onClick={() => onOpen(d)}>{ctx} ›</button> : null}
         <div className="fx-q">{d.question}</div>
-        {d.detail?.reason && d.kind !== "writeback" ? <div className="fx-hint">{d.detail.reason}</div> : null}
+        {d.kind !== "writeback" ? <Fold className="fx-hint" text={d.detail?.reason} /> : null}
         {d.group ? (<>  {/* a draft's plan questions + review: one card that opens the configurator */}
           {d.result ? <div className="fx-hint">→ {d.result}</div> : null}
           <Button onClick={() => onOpen(d)}>Open the plan ›</Button>
@@ -399,6 +415,22 @@ function StageTable({ dispatches, titles, needsOf, selected, onSelect }) {
                      selected={selected?.run_id === d.run_id} onClick={() => onSelect(d.run_id)} />
       ))}
     </div>
+  );
+}
+
+// Run, beside the selected dispatch: the server's runtime read (dispatch_status.runtime, from recorded activity, open
+// decisions and executor deliveries). None (an older server, or not staged/executing): nothing shown, nothing guessed.
+// decision_id only names the decision; it is answered in Needs you.
+function Runtime({ r }) {
+  if (!r) return null;
+  return (
+    <dl className="fx-rt">
+      <dt>Last activity</dt>
+      <dd>{r.last_activity_at ? `${r.last_activity_kind || "activity"} · ${ago(r.last_activity_at)}` : "none recorded"}</dd>
+      {r.blocker ? <><dt>Blocker</dt><dd className="blk">{r.blocker}</dd></> : null}
+      <dt>Next</dt>
+      <dd>{r.next_step}{r.decision_id != null ? <> <span className="fx-id">#{r.decision_id}</span></> : null}</dd>
+    </dl>
   );
 }
 
@@ -602,11 +634,6 @@ function FactoryPage() {
           {answers ? <><span>·</span><span>{plural(answers, "ticket")} need answers in Linear</span></> : null}
         </div>
       </header>
-      <ExecutorDeliveries items={deliveries} onDone={done} />
-
-      <Deck decisions={deck} context={context} onDone={(r, d) => done(r, d)} onOpen={openNode} />
-      <Quick items={decisions.filter(light)} context={context} onDone={done} />
-
       <div className="fx-stage-tabs" role="tablist" aria-label="Factory lifecycle" ref={strip}>
         {STAGES.map(([id, label]) => (
           <button key={id} role="tab" aria-selected={active === id} className={`fx-stage-tab${active === id ? " on" : ""}`}
@@ -615,19 +642,18 @@ function FactoryPage() {
           </button>
         ))}
       </div>
+      <ExecutorDeliveries items={deliveries} onDone={done} />
 
-      {active === "tickets" ? (
-        <section className="fx-sec">
-          <TicketsTab data={data} onDone={done} />
-        </section>
-      ) : (
-        <section className="fx-sec">
-          {list.length ? (<>
-            <StageTable dispatches={list} titles={titles} needsOf={needsOf} selected={current} onSelect={setSel} />
-            {current ? <Plan key={current.run_id} d={current} tickets={tix} onDone={done} /> : null}
-          </>) : <div className="fx-empty">{EMPTY[active]}</div>}
-        </section>
-      )}
+      <Deck decisions={deck} context={context} onDone={(r, d) => done(r, d)} onOpen={openNode} />
+      <Quick items={decisions.filter(light)} context={context} onDone={done} />
+
+      <section className="fx-sec">
+        <h2>{STAGES.find(([id]) => id === active)[1]}</h2>{/* the tabs sit above the deck: name the stage shown here */}
+        {active === "tickets" ? <TicketsTab data={data} onDone={done} /> : list.length ? (<>
+          <StageTable dispatches={list} titles={titles} needsOf={needsOf} selected={current} onSelect={setSel} />
+          {current ? <><Runtime r={current.runtime} /><Plan key={current.run_id} d={current} tickets={tix} onDone={done} /></> : null}
+        </>) : <div className="fx-empty">{EMPTY[active]}</div>}
+      </section>
 
       {active === "learn" ? (<>
         <details className="fx-sec fx-fold" open>
@@ -653,4 +679,4 @@ function FactoryPage() {
 window.__HERMES_PLUGINS__.register("factory", FactoryPage);
 
 // For plan.jsx / railway.jsx (bundled together; used at render time only, so the import cycle is harmless).
-export { API, ActErr, CARD, CARD_TONE, DecisionBody, Ext, LANE_W, NoteBox, Notes, Option, RAIL_X0, Rail, Silence, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose };
+export { API, ActErr, CARD, CARD_TONE, DecisionBody, Ext, Fold, LANE_W, NoteBox, Notes, Option, RAIL_X0, Rail, Silence, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose };

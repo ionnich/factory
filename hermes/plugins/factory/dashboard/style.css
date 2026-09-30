@@ -67,6 +67,10 @@
 .fx-q.small { font-size: .98rem; margin: .2rem 0 .35rem; }
 .fx-why { font-size: .86rem; padding: .45rem .6rem; border-radius: 10px;
           background: color-mix(in srgb, var(--a) 11%, transparent); overflow-wrap: anywhere; }
+/* a long explanation (Fold in index.jsx): folded to a preview; open, the whole text takes the preview's place */
+.fx-more { overflow-wrap: anywhere; }
+.fx-more > summary { cursor: pointer; }
+.fx-more[open] .fx-pv { display: none; }
 .fx-opts { display: grid; gap: .45rem; margin: .5rem 0 .3rem; }
 .fx-opt-btn { width: 100%; text-align: left; display: grid; gap: .15rem; padding: .6rem .75rem; border-radius: 12px; cursor: pointer;
               font: inherit; color: inherit; background: transparent; border: 1px solid var(--color-border);
@@ -131,6 +135,12 @@
 .fx-bar { display: flex; gap: 3px; }
 .fx-bar i { flex: 1; height: 5px; border-radius: 3px; background: var(--color-border); }
 .fx-bar i.t-green { background: var(--g); } .fx-bar i.t-blue { background: var(--b); } .fx-bar i.t-amber { background: var(--a); }
+/* Run: the selected dispatch's runtime, as the server derives it */
+.fx-rt { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; gap: .25rem .75rem; margin: .75rem 0;
+         padding: .55rem .75rem; border: 1px solid var(--color-border); border-radius: 12px; background: var(--color-card); font-size: .86rem; }
+.fx-rt dt { color: var(--color-muted-foreground); font-size: .7rem; text-transform: uppercase; letter-spacing: .09em; }
+.fx-rt dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.fx-rt .blk { color: var(--a); font-weight: 600; }
 
 /* the rail (railway.jsx map): dots and wires beside rows */
 .fx-flow { position: relative; margin-top: .4rem; }
@@ -204,6 +214,8 @@
   .fx-hello { font-size: 1.35rem; }
   .fx-q { font-size: 1.08rem; }
   .fx-carousel { margin: 0 -.6rem; padding-left: .6rem; padding-right: .6rem; }
+  .fx-stage-tabs { gap: .3rem; }
+  .fx-stage-tab { padding: .45rem .55rem; }  /* the strip heads the page: tighter, so a phone rarely scrolls it sideways */
 }
 .fx-cost { list-style: none; margin: 0; padding: 0; display: grid; gap: .35rem; font-size: .82rem; }
 .fx-cost li { display: grid; grid-template-columns: 10.5rem 1fr 3.8rem; align-items: center; gap: .5rem; }

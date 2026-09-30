@@ -4,7 +4,7 @@
 // outline and its `result` rewrites the header. "Lock in path" answers the open questions (POST /decisions/{id}, one by
 // one), then the review decision shows. While draft, `+ note` on the root, each ticket and each step. Read-only in Run
 // (the chosen path, steps ✓ from card comments) and Learn (predicted next to landed; untaken paths flip as ghosts).
-import { API, ActErr, CARD, CARD_TONE, DecisionBody, Ext, NoteBox, Notes, Option, Silence, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose } from "./index.jsx";
+import { API, ActErr, CARD, CARD_TONE, DecisionBody, Ext, Fold, NoteBox, Notes, Option, Silence, Tone, Writes, clip, errText, plural, post, sortOptions, useChoose } from "./index.jsx";
 import { Jev, REL, jevFocus } from "./jev.jsx";
 import { Railway } from "./railway.jsx";
 import { Why } from "./why.jsx";
@@ -137,7 +137,7 @@ function Switch({ q, pick, onPick, locked, diff }) {
             </button>))}
         </div>
       )}
-      {q.why ? <div className="fx-hint"><span className="star">★</span>{q.why}</div> : null}
+      <Fold className="fx-hint" head={<span className="star">★</span>} text={q.why} />
       <Why d={q} />
     </div>
   );
