@@ -1,17 +1,19 @@
 // Factory tab, mobile first: a stack of cards.
 //   Needs you: a deck of decisions. Each is a question with options, what each leads to, and the factory's
 //     recommendation. Tap an option, or swipe right to take the recommendation, left for later.
-//   Lifecycle: one tab per factory stage — Ingest (tickets), Draft (assemble + revise/edit), Run (staged, executing,
-//     done), Learn (reconciled, archived, throughput). Dispatches are rows in an engineering table; open one to see
-//     its DAG as folded cards down a rail (dispatch → review → tickets → steps → results), decisions hanging off
-//     the node they're about.
+//   Lifecycle: one tab per factory stage — Tickets (every ticket and its audit trail; pick drafts), Draft (revise/edit),
+//     Run (staged, executing, done), Learn (reconciled, archived, throughput). Dispatches are rows in an engineering
+//     table; open one to see its DAG as folded cards down a rail (dispatch → review → tickets → steps → results),
+//     decisions hanging off the node they're about.
 // Every action goes through the plugin API to the factory CLI, which enforces the invariants.
 // Built by install.sh (`bun build`, classic JSX via tsconfig.json) to dist/index.js; React and the shadcn-style
-// components come from the dashboard SDK.
+// components come from the dashboard SDK. The Tickets tab lives in tickets.jsx.
+import { TicketsTab, groupOf } from "./tickets.jsx";
+
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect, useCallback, useRef, useMemo } = SDK.hooks;
-const { Button, Badge, Card, CardContent, Input, Tabs, TabsList, TabsTrigger, Toast } = SDK.components;
+const { Button, Badge, Card, CardContent, Input, Toast } = SDK.components;
 const h = React.createElement;
 const Fragment = React.Fragment;  // for <>…</>
 const API = "/api/plugins/factory";
@@ -51,8 +53,6 @@ const KIND = { review: "Review", plan: "Planner asks", ask: "Executor asks", blo
 const KIND_ORDER = ["review", "ask", "executor-gone", "dispatch-stuck", "blocked", "writeback", "plan"];
 const CARD = { ready: "not started", running: "in progress", done: "done", blocked: "blocked" };
 const CARD_TONE = { ready: "gray", running: "blue", done: "green", blocked: "amber" };
-const RECHECK = { new: "Not verified yet", "ticket-changed": "Changed in Linear since it was verified",
-                  "evidence-changed": "The code it was verified against changed", "context-changed": "Repo mapping changed" };
 
 function dispatchStatus(d) {
   const cards = d.tickets || [];
@@ -77,17 +77,6 @@ function dispatchTitle(d, titles) {
   const ids = (d.tickets || []).map((c) => c.identifier);
   if (ids.length === 1) return titles[ids[0]] || ids[0];
   return ids.length ? `${ids.length} tickets: ${ids.join(", ")}` : d.run_id;
-}
-
-function ticketGroup(t, skipped) {
-  const v = t.verdict;
-  if (t.dispatch) return { group: "dispatch" };
-  if (!t.context) return { group: "not", why: "No repo is mapped for this domain" };
-  if (!v || t.freshness !== "fresh") return { group: "checking", why: RECHECK[t.freshness] || "Queued for verification" };
-  if (v.kind === "valid") return skipped[t.identifier] ? { group: "not", why: skipped[t.identifier] } : { group: "ready", why: v.reason };
-  if (v.kind === "needs-clarification") return { group: "answer", why: v.reason };
-  if (v.kind === "invalid-references") return { group: "answer", why: `${v.target}: ${v.reason}` };
-  return { group: "not", why: `${v.kind === "duplicate-of" ? `Duplicate of ${v.target}` : v.kind.replace("-", " ")}: ${v.reason}` };
 }
 
 // ---- decisions -------------------------------------------------------------------------------------------------
@@ -610,7 +599,7 @@ function Flow({ d, titles, onDone, focusNode }) {
 }
 
 // ---- lifecycle: dispatches as rows in an engineering table, one tab per stage ------------------------------
-const STAGES = [["ingest", "Ingest"], ["draft", "Draft"], ["run", "Run"], ["learn", "Learn"]];
+const STAGES = [["tickets", "Tickets"], ["draft", "Draft"], ["run", "Run"], ["learn", "Learn"]];
 const stageOf = (d) => d.state === "draft" ? "draft" : ["staged", "executing", "done"].includes(d.state) ? "run" : "learn";
 
 function DispatchRow({ d, title, needs, selected, onClick }) {
@@ -644,71 +633,6 @@ function StageTable({ dispatches, titles, needsOf, selected, onSelect }) {
                      selected={selected?.run_id === d.run_id} onClick={() => onSelect(d.run_id)} />
       ))}
     </div>
-  );
-}
-
-// ---- tickets (not in a dispatch): a list -----------------------------------------------------------------------
-function TicketRow({ t, why, pick }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className={`fx-trow${pick?.checked ? " picked" : ""}`} onClick={() => setOpen(!open)}>
-      {pick ? <input type="checkbox" className="fx-pick" checked={pick.checked} disabled={pick.disabled} onClick={stop}
-                     onChange={pick.toggle} aria-label={`Select ${t.identifier}`} /> : null}
-      <div className="fx-grow">
-        <div className="fx-row"><Ext href={t.url}>{t.identifier}</Ext><span className="fx-hint">{t.domain}</span></div>
-        <div className="fx-ttitle">{t.title}</div>
-        {why ? <div className={`fx-hint${open ? "" : " clamp"}`}>{why}</div> : null}
-      </div>
-    </div>
-  );
-}
-
-function Tickets({ data, onDone }) {
-  const [picked, setPicked] = useState([]);
-  const max = data.candidates?.max_tickets || 0;
-  const stageable = (data.candidates?.candidates || []).map((c) => c.identifier);
-  const suggested = (data.candidates?.suggested || []).filter((i) => stageable.includes(i));
-  const sel = picked.filter((i) => stageable.includes(i));
-  const skipped = Object.fromEntries((data.candidates?.skipped || []).map((x) => [x.identifier, x.reason]));
-  const groups = { ready: [], answer: [], checking: [], not: [] };
-  data.tickets.forEach((t) => { const g = ticketGroup(t, skipped); if (groups[g.group]) groups[g.group].push({ t, why: g.why }); });
-  const a = useAction(() => { setPicked([]); onDone({}, null, "Drafted; a planner is writing the plan"); });
-  const draft = (ids) => a.run("/stage", { identifiers: ids });
-  const titles = Object.fromEntries(data.tickets.map((t) => [t.identifier, t.title]));
-  const TABS = [["ready", "Ready"], ["answer", "Needs answer"], ["checking", "Checking"], ["not", "Not for us"]];
-  return (
-    <Tabs defaultValue={groups.answer.length && !groups.ready.length ? "answer" : "ready"}>
-      {(tab, setTab) => (<>
-        <TabsList className="fx-tabs">
-          {TABS.map(([k, label]) => <TabsTrigger key={k} active={tab === k} value={k} onClick={() => setTab(k)}>{label} {groups[k].length}</TabsTrigger>)}
-        </TabsList>
-        {tab === "ready" && suggested.length ? (
-          <Card className="fx-card fx-suggest"><CardContent className="fx-stack-v">
-            <div className="fx-row between"><span className="fx-k">Next dispatch</span><span className="fx-hint">★ recommended</span></div>
-            <div>{suggested.map((i) => <div key={i} className="fx-ttitle"><span className="fx-id">{i}</span> {clip(titles[i], 70)}</div>)}</div>
-            <div className="fx-hint">The factory would group these next: same Domain, then same repo. A planner shapes them into one plan; you review it before anything runs.</div>
-            <div className="fx-row"><Button size="sm" disabled={a.busy} onClick={() => draft(suggested)}>{a.busy ? "Drafting…" : `★ Draft these ${suggested.length}`}</Button>
-              <span className="fx-hint">or tick your own below</span></div>
-            <ActErr err={a.err} />
-          </CardContent></Card>
-        ) : null}
-        <div className="fx-list">
-          {groups[tab].length ? groups[tab].map(({ t, why }) => (
-            <TicketRow key={t.identifier} t={t} why={why} pick={tab === "ready" && stageable.includes(t.identifier) ? {
-              checked: sel.includes(t.identifier), disabled: !sel.includes(t.identifier) && sel.length >= max,
-              toggle: () => setPicked(sel.includes(t.identifier) ? sel.filter((i) => i !== t.identifier) : [...sel, t.identifier]),
-            } : null} />
-          )) : <div className="fx-empty">{{ ready: "Nothing verified and free right now.", answer: "No questions from verification.", checking: "Nothing being verified.", not: "Nothing set aside." }[tab]}</div>}
-        </div>
-        {sel.length ? (
-          <div className="fx-draftbar">
-            <span><b>{sel.length}</b> picked</span><span className="fx-grow" />
-            <Button size="sm" ghost onClick={() => setPicked([])}>Clear</Button>
-            <Button size="sm" disabled={a.busy} onClick={() => draft(sel)}>{a.busy ? "Drafting…" : "Draft dispatch"}</Button>
-          </div>
-        ) : null}
-      </>)}
-    </Tabs>
   );
 }
 
@@ -807,18 +731,18 @@ function FactoryPage() {
   });
   const byRun = Object.fromEntries(data.dispatches.map((d) => [d.run_id, d]));
   const skipped = Object.fromEntries((data.candidates?.skipped || []).map((x) => [x.identifier, x.reason]));
-  const answers = data.tickets.filter((t) => ticketGroup(t, skipped).group === "answer").length;
+  const answers = (data.all_tickets || []).filter((t) => groupOf(t, skipped).group === "answer").length;
   const needs = decisions.length;
   const needsOf = (runId) => open.filter((x) => x.run_id === runId && x.tier !== "auto").length;
-  const rows = { ingest: [], draft: [], run: [], learn: [] };
+  const rows = { tickets: [], draft: [], run: [], learn: [] };
   data.dispatches.forEach((d) => rows[stageOf(d)].push(d));
-  const inIngest = data.tickets.filter((t) => !t.dispatch).length;
-  const count = (stage) => stage === "ingest" ? inIngest : rows[stage].length;
+  const ready = (data.all_tickets || []).filter((t) => groupOf(t, skipped).group === "ready").length;
+  const count = (stage) => stage === "tickets" ? ready : rows[stage].length;
   // Default stage: what needs you, else where the dispatches are. A dispatch belongs to one stage for its whole
   // life there, so a row only ever moves forward.
   const active = tab && STAGES.some(([id]) => id === tab) ? tab
     : (decisions[0] && byRun[decisions[0].run_id] ? stageOf(byRun[decisions[0].run_id]) : null)
-      || (rows.draft.length ? "draft" : rows.run.length ? "run" : "ingest");
+      || (rows.draft.length ? "draft" : rows.run.length ? "run" : "tickets");
   const list = rows[active];
   const current = (byRun[sel] && list.some((d) => d.run_id === sel) ? byRun[sel] : list[0]) || null;
   const context = (x) => {
@@ -844,7 +768,7 @@ function FactoryPage() {
   const pick = (runId) => { setSel(runId); setFocus(null); };
   const switchTab = (stage) => { setTab(stage); setSel(null); setFocus(null); };
   const EMPTY = {
-    draft: "No draft right now. The factory proposes one when verified tickets accumulate, or draft your own in Ingest.",
+    draft: "No draft right now. The factory proposes one when verified tickets accumulate, or draft your own in Tickets.",
     run: "Nothing staged or executing right now.",
     learn: "Nothing learned yet. Dispatches land here after they run and write back to Linear.",
   };
@@ -874,10 +798,9 @@ function FactoryPage() {
         ))}
       </div>
 
-      {active === "ingest" ? (
+      {active === "tickets" ? (
         <section className="fx-sec">
-          <h2>Tickets <span className="fx-hint">verified, not in a dispatch</span></h2>
-          <Tickets data={data} onDone={done} />
+          <TicketsTab data={data} onDone={done} />
         </section>
       ) : (
         <section className="fx-sec">

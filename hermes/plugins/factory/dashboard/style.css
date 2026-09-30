@@ -168,7 +168,14 @@
 .fx-writes .w-held .mark { color: var(--a); } .fx-writes .w-planned .mark { color: var(--b); }
 
 /* tickets */
-.fx-tabs { overflow-x: auto; max-width: 100%; margin-bottom: .6rem; }
+.fx-search { width: 100%; margin-bottom: .5rem; }
+.fx-chips { display: flex; flex-wrap: wrap; gap: .35rem; margin-bottom: .7rem; }
+.fx-chip { display: inline-flex; gap: .3rem; align-items: center; padding: .3rem .7rem; border-radius: 999px; cursor: pointer;
+           border: 1px solid var(--color-border); background: var(--color-card); color: var(--color-muted-foreground);
+           font: inherit; font-size: .8rem; font-weight: 600; }
+.fx-chip.on { border-color: var(--b); color: var(--b); }
+.fx-tmeta { gap: .35rem; margin: .15rem 0; }
+.fx-trow .fx-ttitle, .fx-trow .fx-hint { overflow-wrap: anywhere; }
 .fx-suggest { margin-bottom: .7rem; border: 2px solid var(--a) !important; }
 .fx-list { display: grid; gap: .4rem; }
 .fx-trow { display: flex; gap: .6rem; align-items: flex-start; padding: .6rem .75rem; border-radius: 12px; cursor: pointer;
@@ -180,6 +187,20 @@
 .fx-draftbar { position: sticky; bottom: .8rem; z-index: 5; display: flex; gap: .5rem; align-items: center; margin-top: .6rem;
                padding: .55rem .75rem; border-radius: 14px; background: var(--color-card); border: 2px solid var(--b);
                box-shadow: 0 8px 26px rgb(0 0 0 / .3); animation: fx-rise .35s var(--spring) both; }
+/* ticket sheet: slides up over the page, the timeline scrolls inside it */
+.fx-sheet-bg { position: fixed; inset: 0; z-index: 50; background: rgb(0 0 0 / .45); display: flex; align-items: flex-end;
+               justify-content: center; }
+.fx-sheet { width: min(760px, 100%); max-height: 88vh; overflow-y: auto; overscroll-behavior: contain; display: grid; gap: .6rem;
+            align-content: start; padding: 1rem .9rem 2rem; border-radius: 18px 18px 0 0; background: var(--color-card, var(--bg));
+            border: 1px solid var(--color-border); box-shadow: 0 -10px 40px rgb(0 0 0 / .35); animation: fx-rise .35s var(--spring) both; }
+.fx-verdict { padding: .6rem .7rem; border-radius: 12px; border: 1px solid var(--color-border); }
+.fx-evidence { list-style: none; margin: 0; padding: 0; display: grid; gap: .4rem; font-size: .82rem; }
+.fx-evidence code, .fx-ev-body { overflow-wrap: anywhere; }
+.fx-evidence code { font-size: .78rem; }
+.fx-timeline { list-style: none; margin: 0; padding: 0 0 0 .8rem; border-left: 2px solid var(--e); display: grid; gap: .55rem; }
+.fx-ev { position: relative; display: grid; gap: .2rem; cursor: pointer; font-size: .85rem; }
+.fx-ev::before { content: ""; position: absolute; left: calc(-.8rem - 5px); top: .45rem; width: 8px; height: 8px;
+                 border-radius: 999px; background: var(--n); }
 
 /* throughput */
 .fx-fold > summary { cursor: pointer; font-weight: 700; margin-bottom: .6rem; }

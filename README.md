@@ -45,9 +45,13 @@ One-time, by hand:
   in the flow says how many are still open, so you answer the plan before approving it (approval takes ★ on any
   left). A tap answers at once: the card flies off while the server confirms, and comes back on top with the
   reason if it refuses.
-  Below the deck the factory is one tab per lifecycle stage: **Ingest** (tickets: ready / needs answer /
-  checking / not for us, with the factory's recommended next group one tap away), **Draft** (assemble and
-  revise/edit: rows are drafts, open one to see the plan's DAG — cards down a rail: dispatch → review → tickets →
+  Below the deck the factory is one tab per lifecycle stage: **Tickets** (every ticket in scope or ever touched,
+  newest activity first, filtered ready / needs answer / stale / in dispatch / done / not ours, plus a search; ready
+  ones are ticked into a draft, with the factory's recommended next group one tap away; a row opens a sheet with the
+  Linear header, the current verdict with its evidence, and the ticket's timeline: Linear updates, every verdict
+  (superseded ones too), dispatch transitions, notes, decisions asked and answered, card events, write-backs and our
+  own Linear writes, oldest first — `factory ticket-timeline <ID>`), **Draft** (revise/edit: rows are drafts, open
+  one to see the plan's DAG — cards down a rail: dispatch → review → tickets →
   steps (branching where the plan branches) → results (PR, Linear writes), each decision hanging off the node
   it's about; a ticket's steps stay folded under it ("▸ 5 steps · 1 open question") until tapped, except where a
   question waits — and `+ note` on draft nodes), **Run** (staged, executing, done),
@@ -93,7 +97,7 @@ One-time, by hand:
   Stop it with `hermes cron pause factory-propose`.
 - Backups: `factory-backup` (03:00) writes `~/.hermes/factory/backups/factory-YYYY-MM-DD.db` (newest 14), and every
   schema migration first writes `factory-pre-vN.db`. Same disk: protects against bad writes, not disk loss.
-- CLI: `factory status|overview|tickets|candidates|stage|draft|decide|handoff|propose|execute|card|reconcile|archive|metrics|backup`.
+- CLI: `factory status|overview|tickets|ticket-timeline|candidates|stage|draft|decide|handoff|propose|execute|card|reconcile|archive|metrics|backup`.
   `stage` and approving refresh only the repos involved (parallel fetch); the cron keeps the rest fresh.
 
 ## Invariants (in code: `factory/schema.sql` triggers + CLI checks)
