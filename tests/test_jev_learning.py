@@ -15,19 +15,26 @@ from factory import cli, db, decide, jev, learn, repos
 SNAP = "2026-09-01T00:00:00Z"
 
 
-def ok(choice, confidence=0.9):
-    return {"status": "ok", "model": "jev-1.13.0",
-            "answers": {"relation": {"type": "choice", "choice": choice, "confidence": confidence}},
+def ok(questions, verdicts=None, confidence=0.9):
+    """A successful evaluate() result for the questions asked. Like the model, it reads each question's candidate
+    from its structured instructions (question ids never reach the model) and answers the relationship `verdicts`
+    names for that candidate's id — a kind, or a (kind, confidence) pair — and none otherwise."""
+    answers = {}
+    for qid, q in questions.items():
+        v = (verdicts or {}).get(q["instructions"]["candidate"]["id"], "none")
+        kind, conf = v if isinstance(v, tuple) else (v, confidence)
+        answers[qid] = {"type": "choice", "choice": kind, "confidence": conf}
+    return {"status": "ok", "model": "jev-1.13.0", "answers": answers,
             "usage": {"input_tokens": 10, "output_tokens": 5}}
 
 
-def answering(choice, confidence=0.9, seen=None):
+def answering(verdicts=None, confidence=0.9, seen=None):
     """An evaluate() stub with the real signature (a pass hands each call what is left of its budget as `timeout`);
-    `seen` collects the state each call was given."""
+    `seen` collects the candidates each call compared, in question order."""
     def stub(cfg, state, questions, timeout=None):
         if seen is not None:
-            seen.append(state)
-        return ok(choice, confidence)
+            seen.append([q["instructions"]["candidate"] for q in questions.values()])
+        return ok(questions, verdicts, confidence)
     return stub
 
 
@@ -107,7 +114,7 @@ class JevLearning(unittest.TestCase):
     def test_duplicate_guidance_lands_on_the_open_decision_and_reuses_unchanged_inputs(self):
         cid = self.candidate("other.py: x lives here")
         lid, did = self.propose("the parser lives in other.py")
-        with mock.patch.object(jev, "evaluate", side_effect=answering(f"duplicate:{cid}")) as ev:
+        with mock.patch.object(jev, "evaluate", side_effect=answering({cid: "duplicate"})) as ev:
             learn.sync(self.cfg, self.c)
             learn.sync(self.cfg, self.c)
             self.assertEqual(ev.call_count, 1)  # unchanged successful judgment reused
@@ -124,7 +131,7 @@ class JevLearning(unittest.TestCase):
     def test_candidate_status_or_body_change_reassesses(self):
         cid = self.candidate("other.py: x lives here")
         self.propose("the parser lives in other.py")
-        with mock.patch.object(jev, "evaluate", side_effect=answering(f"duplicate:{cid}")) as ev:
+        with mock.patch.object(jev, "evaluate", side_effect=answering({cid: "duplicate"})) as ev:
             learn.sync(self.cfg, self.c)
             self.c.execute("UPDATE learning SET body=? WHERE id=?", ("other.py: y lives here", cid))
             learn.sync(self.cfg, self.c)
@@ -135,7 +142,7 @@ class JevLearning(unittest.TestCase):
     def test_a_model_question_or_threshold_change_reassesses(self):
         cid = self.candidate("other.py: x lives here")
         self.propose("the parser lives in other.py")
-        with mock.patch.object(jev, "evaluate", side_effect=answering(f"duplicate:{cid}")) as ev:
+        with mock.patch.object(jev, "evaluate", side_effect=answering({cid: "duplicate"})) as ev:
             learn.sync(self.cfg, self.c)
             learn.sync(self.cfg, self.c)  # unchanged: reused
             self.cfg.raw["jev"] = {"model": "jev-2.0.0"}  # another model
@@ -200,19 +207,10 @@ class JevLearning(unittest.TestCase):
             learn.sync(SimpleNamespace(raw={}), self.c)
         self.assertEqual(self.advice(did)["status"], "disabled")
 
-    def test_relation_to_an_unknown_candidate_is_not_trusted(self):
-        self.candidate("other.py: x lives here")
-        _, did = self.propose("the parser lives in other.py")
-        with mock.patch.object(jev, "evaluate", side_effect=answering("duplicate:999")):
-            learn.sync(self.cfg, self.c)
-        j = self.advice(did)
-        self.assertEqual(j["status"], "ok")
-        self.assertNotIn("relation", j)
-
     def test_low_confidence_relationship_is_recorded_but_never_surfaced_as_definitive(self):
         cid = self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        with mock.patch.object(jev, "evaluate", side_effect=answering(f"duplicate:{cid}", confidence=0.5)):
+        with mock.patch.object(jev, "evaluate", side_effect=answering({cid: "duplicate"}, confidence=0.5)):
             learn.sync(self.cfg, self.c)
         j = self.advice(did)
         self.assertEqual(j["status"], "ok")
@@ -222,11 +220,32 @@ class JevLearning(unittest.TestCase):
     def test_conflicts_is_surfaced_without_a_group(self):
         cid = self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        with mock.patch.object(jev, "evaluate", side_effect=answering(f"conflicts:{cid}")):
+        with mock.patch.object(jev, "evaluate", side_effect=answering({cid: "conflicts"})):
             learn.sync(self.cfg, self.c)
         j = self.advice(did)
         self.assertEqual(j["relation"], {"kind": "conflicts", "learning_id": cid,
                                          "body": "other.py: x lives here"})
+        self.assertNotIn("group", j)
+
+    def test_several_agreeing_candidates_never_dilute_an_obvious_conflict(self):
+        # Three candidates stating one fact each contradict the proposal. One joint Choice over every (relationship,
+        # candidate) pair split that conflict three ways below the bar; each candidate is now its own Choice.
+        c1 = self.candidate("split-factor checks guard every split-adjusted price series")
+        c2 = self.candidate("keep the shared split-factor checks on after a price series rebuild")
+        c3 = self.candidate("rebuilt split-adjusted series must still pass the shared split-factor checks")
+        backs = self.candidate("rebuilds regenerate split-adjusted price series from raw prices")
+        _, did = self.propose("Disable shared split-factor checks after rebuilding split-adjusted price series")
+        verdicts = {c1: ("conflicts", 0.9), c2: ("conflicts", 0.96), c3: ("conflicts", 0.96),
+                    backs: ("supports", 0.99)}
+        with mock.patch.object(jev, "evaluate", side_effect=answering(verdicts)) as ev:
+            learn.sync(self.cfg, self.c)
+            self.assertEqual(ev.call_count, 1)  # every candidate judged in the same single call
+        j = self.advice(did)
+        # A confident conflict outranks the surer supports grouping; equally sure conflicts fall to shortlist order
+        # (newest first), and the confidence kept is that one answer's own, never a sum over agreeing candidates.
+        self.assertEqual(j["relation"], {"kind": "conflicts", "learning_id": c3, "body": "rebuilt split-adjusted "
+                                         "series must still pass the shared split-factor checks"})
+        self.assertEqual(j["confidence"], 0.96)
         self.assertNotIn("group", j)
 
     def test_same_tick_group_chain_adopts_the_root_stored_earlier(self):
@@ -236,7 +255,7 @@ class JevLearning(unittest.TestCase):
 
         def respond(cfg, state, questions, timeout=None):
             body = state["proposal"]["body"]
-            return ok(f"duplicate:{c0 if body.startswith('b.py') else lid1}")
+            return ok(questions, {(c0 if body.startswith("b.py") else lid1): "duplicate"})
 
         with mock.patch.object(jev, "evaluate", side_effect=respond):
             learn.sync(self.cfg, self.c)  # one tick: the second proposal sees the first's stored group root
@@ -258,7 +277,7 @@ class JevLearning(unittest.TestCase):
             calls.append(body)
             if body in down:
                 return {"status": "unavailable", "error": "typesafe api: TimeoutError"}
-            return ok(f"duplicate:{target[body]}")
+            return ok(questions, {target[body]: "duplicate"})
 
         group = lambda did: self.advice(did).get("group")
         with mock.patch.object(jev, "evaluate", side_effect=respond):
@@ -282,7 +301,7 @@ class JevLearning(unittest.TestCase):
     def test_unrelated_repo_candidate_is_never_compared(self):
         other = self.candidate("other.py: x lives here", scope="elsewhere")
         _, did = self.propose("the parser lives in other.py")
-        with mock.patch.object(jev, "evaluate", side_effect=answering(f"duplicate:{other}")) as ev:
+        with mock.patch.object(jev, "evaluate", side_effect=answering({other: "duplicate"})) as ev:
             learn.sync(self.cfg, self.c)
             self.assertEqual(ev.call_count, 0)  # different repo: never compared
         self.assertNotIn("relation", self.advice(did) or {})
@@ -290,7 +309,7 @@ class JevLearning(unittest.TestCase):
     def test_a_vanished_candidate_clears_the_stale_relationship(self):
         cid = self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        with mock.patch.object(jev, "evaluate", side_effect=answering(f"duplicate:{cid}")):
+        with mock.patch.object(jev, "evaluate", side_effect=answering({cid: "duplicate"})):
             learn.sync(self.cfg, self.c)
         self.assertIn("relation", self.advice(did))
         self.c.execute("UPDATE learning SET status='expired' WHERE id=?", (cid,))
@@ -304,7 +323,7 @@ class JevLearning(unittest.TestCase):
     def test_rows_expose_guidance_on_the_learn_surface(self):
         cid = self.candidate("other.py: x lives here")
         lid, _ = self.propose("the parser lives in other.py")
-        with mock.patch.object(jev, "evaluate", side_effect=answering(f"duplicate:{cid}")):
+        with mock.patch.object(jev, "evaluate", side_effect=answering({cid: "duplicate"})):
             learn.sync(self.cfg, self.c)
         row = next(r for r in learn.rows(self.c) if r["id"] == lid)
         self.assertEqual(row["jev"]["relation"], {"kind": "duplicate", "learning_id": cid,
@@ -313,7 +332,7 @@ class JevLearning(unittest.TestCase):
     def test_rows_never_show_a_stale_relation_or_group_once_the_target_rejects_or_expires(self):
         cid = self.candidate("other.py: x lives here")
         lid, did = self.propose("the parser lives in other.py")
-        with mock.patch.object(jev, "evaluate", side_effect=answering(f"duplicate:{cid}")):
+        with mock.patch.object(jev, "evaluate", side_effect=answering({cid: "duplicate"})):
             learn.sync(self.cfg, self.c)
         self.assertIn("relation", jev.stored(self.c, did))  # raw storage keeps the record
         for status in ("rejected", "expired"):
@@ -331,7 +350,7 @@ class JevLearning(unittest.TestCase):
     def test_rows_drop_a_relation_and_its_group_once_the_target_moves_to_another_repo(self):
         cid = self.candidate("other.py: x lives here")
         lid, did = self.propose("the parser lives in other.py")
-        with mock.patch.object(jev, "evaluate", side_effect=answering(f"duplicate:{cid}")):
+        with mock.patch.object(jev, "evaluate", side_effect=answering({cid: "duplicate"})):
             learn.sync(self.cfg, self.c)
         self.assertEqual(next(r for r in learn.rows(self.c) if r["id"] == lid)["jev"]["group"], f"learning:{cid}")
         self.c.execute("UPDATE learning SET scope='elsewhere' WHERE id=?", (cid,))  # same body and status
@@ -349,7 +368,7 @@ class JevLearning(unittest.TestCase):
 
         def answer_then_ok(cfg, state, questions, timeout=None):
             decide.choose(self.cfg, self.c, did, "reject", "user")
-            return ok(f"duplicate:{cid}")
+            return ok(questions, {cid: "duplicate"})
 
         with mock.patch.object(jev, "evaluate", side_effect=answer_then_ok):
             learn.sync(self.cfg, self.c)
@@ -360,7 +379,7 @@ class JevLearning(unittest.TestCase):
     def test_persisted_advice_survives_reopen(self):
         cid = self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        with mock.patch.object(jev, "evaluate", side_effect=answering(f"duplicate:{cid}")):
+        with mock.patch.object(jev, "evaluate", side_effect=answering({cid: "duplicate"})):
             learn.sync(self.cfg, self.c)
         before = jev.stored(self.c, did)
         self.c.close()
@@ -378,10 +397,10 @@ class JevLearning(unittest.TestCase):
         elsewhere = self.candidate("z.py: elsewhere fact", scope="elsewhere", kind="pitfall")
         self.propose("q.py: new pitfall", kind="pitfall")
         seen = []
-        with mock.patch.object(jev, "evaluate", side_effect=answering("none", seen=seen)):
+        with mock.patch.object(jev, "evaluate", side_effect=answering(seen=seen)):
             learn.sync(self.cfg, self.c)
-        cands = seen[0]["candidates"]
-        self.assertEqual(len(cands), 40)  # capped well inside the 255-choice ceiling
+        cands = seen[0]
+        self.assertEqual(len(cands), 40)  # capped: 40 of the 55 same-repo candidates, one Choice each
         self.assertTrue(all(c["kind"] == "pitfall" for c in cands[:5]))  # same kind leads
         self.assertNotIn(elsewhere, [c["id"] for c in cands])  # same repo is mandatory
 
@@ -392,9 +411,9 @@ class JevLearning(unittest.TestCase):
         self.assertGreater(newer_proposed, lid)
         self.assertGreater(newer_active, lid)
         seen = []
-        with mock.patch.object(jev, "evaluate", side_effect=answering("none", seen=seen)):
+        with mock.patch.object(jev, "evaluate", side_effect=answering(seen=seen)):
             learn.sync(self.cfg, self.c)
-        ids = [c["id"] for c in seen[0]["candidates"]]
+        ids = [c["id"] for c in seen[0]]
         self.assertNotIn(newer_proposed, ids)  # no forward pointers to younger proposals
         self.assertIn(newer_active, ids)
 
