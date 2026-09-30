@@ -78,12 +78,19 @@ One-time, by hand:
   last answer of that kind overrode ★; then it waits for you. A person's draft always waits.
 - Review: `factory stage` makes a **draft**. The planner bot's routine (every 10m) writes its plan tree: a theme,
   tickets nested under the ones they build on (misfits dropped with a reason), steps per ticket (`FIN-1/2`,
-  nested `FIN-1/2.1`) with `depends_on` edges, questions, and a review recommendation. You add notes to the
-  dispatch (`root`), a ticket or a step, and answer questions; approving the review decision renders plan, notes
-  and answers into the immutable `dispatch.md`, where they bind the executor (open questions take their
-  recommendation). Hold stops the auto-start clock; reject archives the draft as a record, and its tickets are
-  not drafted again until their verdict changes. Approval re-checks every ticket: one that changed during review
-  voids the draft.
+  nested `FIN-1/2.1`) with `depends_on` edges, questions, and a review recommendation. For the phone
+  configurator it also predicts outcomes: `result` (one line: what you notice once it lands) on the dispatch and
+  each ticket, `files` per step (paths checked at the dispatch trunk in the mirror, like verdict evidence; new
+  files `{"path", "new": true}`), and per question a stable `key`, `now` (what the code does today), `evidence`
+  (`path:line`), optional `depends_on` (`{question: key, option: id}`: it only matters under that answer), and
+  per option the plan `changes` it makes (`{step, becomes: title|null}`, `{add: step}`), its `result`, `cost`,
+  `risk`. `factory overview` returns these on tree nodes and plan decisions (plans written before schema v13 have
+  them empty). You add notes to the dispatch (`root`), a ticket or a step, and answer questions; approving the
+  review decision renders plan, notes and answers (with the chosen option's result and plan changes) into the
+  immutable `dispatch.md`, where they bind the executor (open questions take their recommendation; one whose
+  `depends_on` answer was not chosen is marked as not applying). Hold stops the auto-start clock; reject archives
+  the draft as a record, and its tickets are not drafted again until their verdict changes. Approval re-checks
+  every ticket: one that changed during review voids the draft.
 - Autonomous: `factory-propose` (every 10m) drafts a cohort in `auto = true` repos: the top candidate plus those
   sharing its Linear Domain, then its repo (up to `stage.max_tickets`); the planner shapes it into a tree and may
   drop misfits; its review goes in the next digest and follows the rules above.

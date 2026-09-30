@@ -142,7 +142,8 @@ BEGIN SELECT RAISE(ABORT, 'dispatches are never deleted; a draft leaves approved
 
 -- Plan tree of a draft, written once by the planner agent, only while draft. Rows: `root` (the dispatch's theme),
 -- a ticket id (its role; `parent` = the ticket it is nested under, NULL = root), or a step (`FIN-1/2`, nested
--- `FIN-1/2.1`; parent derived from the id). depends_on = DAG edges across the dispatch.
+-- `FIN-1/2.1`; parent derived from the id). depends_on = DAG edges across the dispatch. result = what a user or
+-- system notices once the node lands; files_json = [{path, new}] a step touches (both NULL on pre-v13 plans).
 CREATE TABLE dispatch_step (
   run_id          TEXT NOT NULL REFERENCES dispatch(run_id),
   step_id         TEXT NOT NULL,
@@ -150,6 +151,8 @@ CREATE TABLE dispatch_step (
   title           TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 200),
   detail          TEXT NOT NULL DEFAULT '',
   depends_on_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(depends_on_json)),
+  result          TEXT,
+  files_json      TEXT CHECK (files_json IS NULL OR json_valid(files_json)),
   PRIMARY KEY (run_id, step_id)
 );
 CREATE TRIGGER dispatch_step_draft_only BEFORE INSERT ON dispatch_step

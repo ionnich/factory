@@ -93,7 +93,7 @@ def cmd_draft(cfg, conn, a):
             steps = json.loads(a.steps)
         except json.JSONDecodeError as e:
             raise dispatch.StageError(f"--steps is not JSON: {e}")
-        return out(dispatch.plan(conn, a.run_id, steps))
+        return out(dispatch.plan(cfg, conn, a.run_id, steps))
     return out(dispatch.note(conn, a.run_id, a.node, a.body, a.actor))
 
 
@@ -412,7 +412,8 @@ def main(argv=None):
         dest="dcmd", required=True)
     s = dr.add_parser("plan", help="planner agent: write the plan tree once")
     s.add_argument("run_id")
-    s.add_argument("--steps", required=True, help='JSON list: [{"id":"FIN-1/1","title":..,"detail":..,"depends_on":[]}]')
+    s.add_argument("--steps", required=True, help='JSON list: [{"id":"FIN-1/1","title":..,"detail":..,"depends_on":[],'
+                   '"files":[..]}, ...] (full shape: factory-plan skill, dispatch.plan)')
     s = dr.add_parser("note", help="add a note to a node (root, a ticket id, or a step id); binds the executor")
     s.add_argument("run_id")
     s.add_argument("--node", default="root")

@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -259,6 +259,10 @@ CREATE TRIGGER dispatch_frozen BEFORE UPDATE ON dispatch
 WHEN OLD.state <> 'draft' AND (NEW.body_sha256 IS NOT OLD.body_sha256 OR NEW.repos_json IS NOT OLD.repos_json
   OR NEW.run_id IS NOT OLD.run_id OR NEW.created_at IS NOT OLD.created_at OR NEW.route IS NOT OLD.route)
 BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;""",
+    # v13: what the configurator shows per choice: a node's predicted result, the files a step touches (NULL on
+    # older plans).
+    13: """ALTER TABLE dispatch_step ADD COLUMN result TEXT;
+ALTER TABLE dispatch_step ADD COLUMN files_json TEXT CHECK (files_json IS NULL OR json_valid(files_json));""",
 }
 
 

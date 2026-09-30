@@ -11,7 +11,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import db, decide, prune
+from . import db, decide, prune, repos
 from .config import Config, secret
 
 HERMES = str(Path.home() / ".local/bin/hermes")
@@ -95,6 +95,7 @@ def max_tickets(cfg: Config) -> int:
 def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tree: list, rejected: str | None,
             answers: list, route: str | None = None) -> str:
     notes = lambda node: [f"- {n['author']} ({n['at'][:16]}Z): {n['body'].strip()}" for n in node["notes"]]
+    paths = lambda fs: ", ".join(f"`{f['path']}`" + (" (new)" if f["new"] else "") for f in fs)
     root = tree[0]
     lines = [f"# Dispatch {run_id}", ""]
     lines += ([f"**REJECTED in review** by {actor} at {when}: {rejected}", ""] if rejected else
@@ -115,14 +116,30 @@ def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tre
               "`factory card block` with the evidence instead of forcing a change.", ""]
     if root["title"] != run_id or root["detail"]:
         lines += [f"## Theme: {root['title']}", "", root["detail"], ""]
+    if root["result"]:
+        lines += [f"Result: {root['result']}", ""]
     if root["notes"]:
         lines += ["## Operator notes (whole dispatch)", "", *notes(root), ""]
     if answers:
-        label = lambda a: next(o for o in a["options"] if o["id"] == a["chosen"])
+        chosen = {a["key"]: a["chosen"] for a in answers if a["key"]}
         lines += ["## Answered questions (binding)", ""]
-        lines += [f"- On {a['node_id']}: {a['question']} **{label(a)['label']}**: {label(a)['leads_to']}"
-                  + (f" Note: {a['chosen_note']}" if a["chosen_note"] else "") + f" ({a['chosen_by']})"
-                  for a in answers]
+        for a in answers:
+            o, dep = next(o for o in a["options"] if o["id"] == a["chosen"]), a["depends_on"]
+            if dep and chosen.get(dep["question"]) != dep["option"]:  # only mattered under another answer
+                lines.append(f"- On {a['node_id']}: {a['question']} Does not apply ({dep['question']} is not "
+                             f"{dep['option']}).")
+                continue
+            lines.append(f"- On {a['node_id']}: {a['question']} **{o['label']}**: {o['leads_to']}"
+                         + (f" — result: {o['result']}" if o["result"] else "")
+                         + (f" Note: {a['chosen_note']}" if a["chosen_note"] else "") + f" ({a['chosen_by']})")
+            for c in o["changes"]:
+                if "add" in c:
+                    s = c["add"]
+                    lines.append(f"  - add {s['id']}: {s['title']}"
+                                 + (f" (after {', '.join(s['depends_on'])})" if s["depends_on"] else "")
+                                 + (f"; files {paths(s['files'])}" if s["files"] else ""))
+                else:
+                    lines.append(f"  - {c['step']}: " + (f"now \"{c['becomes']}\"" if c["becomes"] else "dropped"))
         lines.append("")
     by_parent = {}
     for node in tree[1:]:
@@ -139,6 +156,8 @@ def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tre
             out.append(f"{pad}- **{s['id']}** {s['title']}{after}")
             if s["detail"].strip():
                 out.append(f"{pad}  {s['detail'].strip()}")
+            if s["files"]:
+                out.append(f"{pad}  Files: {paths(s['files'])}")
             out += [f"{pad}  - note {line[2:]}" for line in notes(s)]
             out += plan(s["id"], depth + 1)
         return out
@@ -153,6 +172,8 @@ def _render(run_id: str, when: str, actor: str, trunks: dict, tickets: list, tre
             lines.append(f"- After: {', '.join(node['depends_on'])}")
         if node["detail"]:
             lines.append(f"- In this dispatch: {node['detail']}")
+        if node["result"]:
+            lines.append(f"- Result: {node['result']}")
         lines += [f"- Linear: {t['url']} ({t['state']}, assignee {t['assignee'] or 'none'})",
                   f"- Repo: {t['repo']} (context {t['context']}), trunk `{trunks[t['repo']]}`",
                   f"- Verdict: valid — {t['reason']}",
@@ -189,7 +210,8 @@ def tree(conn, run_id: str) -> list:
     steps = sorted((r for k, r in rows.items() if "/" in k), key=lambda r: _step_key(r["step_id"]))
     node = lambda i, parent, kind, title, r: {
         "id": i, "parent": parent, "kind": kind, "title": title, "detail": r["detail"] if r else "",
-        "depends_on": json.loads(r["depends_on_json"]) if r else [], "notes": notes.get(i, [])}
+        "depends_on": json.loads(r["depends_on_json"]) if r else [], "notes": notes.get(i, []),
+        "result": r["result"] if r else None, "files": json.loads(r["files_json"]) if r and r["files_json"] else []}
     root = rows.get("root")
     out = [node("root", None, "dispatch", root["title"] if root else run_id, root)]
     tickets = conn.execute("SELECT t.identifier, json_extract(s.raw_json, '$.title') title FROM dispatch_ticket t "
@@ -265,10 +287,92 @@ def stage(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool
 
 
 PLAN_QUESTIONS_MAX = 2  # each is a decision someone has to read; decide the rest in the plan
+QUESTION_KEY = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 
 
-def _plan_questions(qs: list, node_ids: set) -> list:
-    """Planner questions: each a real choice with consequences and a recommendation, like every decision."""
+def _line(where: str, v, n: int = 300) -> str:
+    """A required short text field."""
+    if not isinstance(v, str) or not 1 <= len(v.strip()) <= n:
+        raise StageError(f"{where}: 1-{n} chars of text")
+    return v.strip()
+
+
+def _rel(where: str, path) -> str:
+    if not isinstance(path, str) or not path.strip() or path.startswith("/") or ".." in path.split("/"):
+        raise StageError(f"{where}: {path!r} is not a repo-relative path")
+    return path
+
+
+def _at_trunk(cfg: Config, where: str, path, at: list) -> str:
+    """A repo-relative path that exists at the dispatch trunk of one of `at` [(repo, sha)] (as verdict evidence)."""
+    _rel(where, path)
+    if not any(repos.path_exists(cfg.mirror_path(r), sha, path) for r, sha in at):
+        raise StageError(f"{where}: {path!r} does not exist at trunk ({', '.join(f'{r}@{s[:12]}' for r, s in at)})")
+    return path
+
+
+def _files(cfg: Config, where: str, files, at: list) -> list:
+    """Files a step touches: "path" (exists at trunk) or {"path", "new": true} for one it creates."""
+    if not isinstance(files, list):
+        raise StageError(f"{where}: files must be a list")
+    return [{"path": _rel(where, f["path"]), "new": True}
+            if isinstance(f, dict) and f.get("new") is True and set(f) == {"path", "new"}
+            else {"path": _at_trunk(cfg, where, f if isinstance(f, str) else None, at), "new": False} for f in files]
+
+
+def _evidence(cfg: Config, where: str, ev, at: list) -> list:
+    """Question evidence: "path:line" or {"path", "line", "note"?}; the path exists at trunk."""
+    if not isinstance(ev, list):
+        raise StageError(f"{where}: evidence must be a list")
+    out = []
+    for e in ev:
+        if isinstance(e, str) and ":" in e:
+            p, _, line = e.rpartition(":")
+            e = {"path": p, "line": int(line) if line.isdigit() else None}
+        if not isinstance(e, dict) or not set(e) <= {"path", "line", "note"} or not isinstance(e.get("line"), int) \
+                or e["line"] < 1 or not isinstance(e.get("note", ""), str):
+            raise StageError(f"{where}: evidence is \"path:line\" or {{path, line, note}}")
+        out.append({"path": _at_trunk(cfg, where, e.get("path"), at), "line": e["line"],
+                    **({"note": e["note"].strip()} if e.get("note", "").strip() else {})})
+    return out
+
+
+def _changes(cfg: Config, where: str, changes, steps: set, ids: set, kept: list, at) -> list:
+    """What an option does to the plan: {"step", "becomes": new title | null (removed)} or {"add": step}."""
+    if not isinstance(changes, list):
+        raise StageError(f"{where}: changes must be a list (empty: the plan as written)")
+    out, added = [], set()
+    for c in changes:
+        if isinstance(c, dict) and set(c) == {"step", "becomes"}:
+            if c["step"] not in steps:
+                raise StageError(f"{where}: changes names unknown step {c['step']!r}")
+            out.append({"step": c["step"],
+                        "becomes": None if c["becomes"] is None else _line(f"{where} {c['step']} becomes", c["becomes"], 200)})
+        elif isinstance(c, dict) and set(c) == {"add"} and isinstance(c["add"], dict):
+            a, i = c["add"], str(c["add"].get("id", ""))
+            m = STEP_ID.match(i)
+            if not m or m[1] not in kept or i in steps or i in added:
+                raise StageError(f"{where}: add needs a new step id <TICKET>/<n> of a kept ticket, got {i!r}")
+            deps = a.get("depends_on") or []
+            if not isinstance(deps, list) or any(d not in ids | added for d in deps):
+                raise StageError(f"{where}: add {i}: depends_on must list node ids of this dispatch")
+            if not set(a) <= {"id", "title", "detail", "depends_on", "files"} or len(str(a.get("detail", ""))) > 2000:
+                raise StageError(f"{where}: add {i}: {{id, title, detail, depends_on, files}}, detail <= 2000")
+            added.add(i)
+            out.append({"add": {"id": i, "title": _line(f"{where} add {i} title", a.get("title"), 200),
+                                "detail": str(a.get("detail", "")).strip(), "depends_on": deps,
+                                "files": _files(cfg, f"{where} add {i}", a.get("files") or [], at(i))}})
+        else:
+            raise StageError(f"{where}: each change is {{step, becomes}} or {{add: {{id, title, ...}}}}")
+    return out
+
+
+OPTION_KEYS = {"id", "label", "leads_to", "changes", "result"}
+
+
+def _plan_questions(cfg: Config, qs: list, node_ids: set, steps: set, kept: list, at) -> list:
+    """Planner questions: each a real choice with consequences and a recommendation, like every decision, plus what
+    the configurator shows: what is true today (now, evidence) and per option the plan changes, result, cost, risk."""
     if len(qs) > PLAN_QUESTIONS_MAX:
         raise StageError(f"{len(qs)} questions; at most {PLAN_QUESTIONS_MAX}. Decide the rest in the plan")
     out = []
@@ -278,33 +382,65 @@ def _plan_questions(qs: list, node_ids: set) -> list:
             raise StageError(f"question {text[:40]!r}: on must be root, a kept ticket or a step id")
         if not 1 <= len(text) <= 300 or not str(q.get("why", "")).strip():
             raise StageError("a question needs question (1-300 chars) and why (your reason for the recommendation)")
+        where = f"question {text[:40]!r}"
+        key = q.get("key")
+        if not isinstance(key, str) or not QUESTION_KEY.match(key) or key in {x["key"] for x in out}:
+            raise StageError(f"{where}: key must be a unique slug (a-z, 0-9, -)")
         if (not isinstance(opts, list) or not 2 <= len(opts) <= 5
-                or not all(isinstance(o, dict) and set(o) == {"id", "label", "leads_to"}
-                           and all(str(o[k]).strip() for k in o) for o in opts)):
-            raise StageError(f"question {text[:40]!r}: 2-5 options, each exactly {{id, label, leads_to}}")
+                or not all(isinstance(o, dict) and OPTION_KEYS <= set(o) <= OPTION_KEYS | {"cost", "risk"}
+                           and all(str(o[k]).strip() for k in ("id", "label", "leads_to")) for o in opts)):
+            raise StageError(f"{where}: 2-5 options, each {{id, label, leads_to, changes, result}} (+ cost, risk)")
         if q.get("recommend") not in {o["id"] for o in opts}:
-            raise StageError(f"question {text[:40]!r}: recommend must be one of its option ids")
-        out.append({"on": on, "question": text, "why": str(q["why"]).strip(), "recommend": q["recommend"],
-                    "options": [decide.option(str(o["id"]), str(o["label"]), str(o["leads_to"])) for o in opts]})
+            raise StageError(f"{where}: recommend must be one of its option ids")
+        extra = set(q) - {"question", "on", "key", "now", "evidence", "depends_on", "options", "recommend", "why"}
+        if extra:
+            raise StageError(f"{where}: unknown fields {sorted(extra)}")
+        at_q = at(on)
+        out.append({"on": on, "question": text, "why": str(q["why"]).strip(), "recommend": q["recommend"], "key": key,
+                    "now": _line(f"{where} now", q.get("now"), 400),
+                    "evidence": _evidence(cfg, where, q.get("evidence") or [], at_q),
+                    "depends_on": q.get("depends_on"),
+                    "options": [{**decide.option(str(o["id"]), str(o["label"]), str(o["leads_to"])),
+                                 "changes": _changes(cfg, f"{where} option {o['id']}", o["changes"], steps,
+                                                     steps | set(kept), kept, at),
+                                 "result": _line(f"{where} option {o['id']} result", o["result"]),
+                                 **{k: _line(f"{where} option {o['id']} {k}", o[k], 120) for k in ("cost", "risk")
+                                    if k in o}} for o in opts]})
+    options = {x["key"]: {o["id"] for o in x["options"]} for x in out}
+    for x in out:  # "only matters under that answer" of another question in this plan
+        dep = x["depends_on"]
+        if dep is not None and not (isinstance(dep, dict) and set(dep) == {"question", "option"}
+                                    and dep["question"] != x["key"] and dep["option"] in options.get(dep["question"], ())):
+            raise StageError(f"question {x['key']}: depends_on is {{question: <another question's key>, "
+                             "option: <one of its option ids>}")
     return out
 
 
-def plan(conn, run_id: str, nodes: list) -> dict:
+def plan(cfg: Config, conn, run_id: str, nodes: list) -> dict:
     """Planner agent: write the draft's plan tree once. Entries (JSON list):
-      {"id": "root", "title": theme, "detail": why these tickets belong in one dispatch,
-       "recommend": "approve"|"hold"|"reject", "why": your review recommendation}             optional
-      {"id": "FIN-1", "detail": its role, "under": "FIN-2", "depends_on": ["FIN-3"]}        optional per ticket
+      {"id": "root", "title": theme, "detail": why these tickets belong in one dispatch, "result": what lands,
+       "recommend": "approve"|"hold"|"reject", "why": your review recommendation}             result required
+      {"id": "FIN-1", "detail": its role, "under": "FIN-2", "depends_on": ["FIN-3"], "result"} per kept ticket
       {"id": "FIN-1", "exclude": "why it does not fit this dispatch"}                         drops the ticket
-      {"id": "FIN-1/2" or "FIN-1/2.1", "title", "detail", "depends_on": [node ids]}           steps, 1-12 per ticket
-      {"question": text, "on": node id, "options": [{"id", "label", "leads_to"}, ...], "recommend": option id,
-       "why": reason}                                                                        a choice for the reviewer
+      {"id": "FIN-1/2" or "FIN-1/2.1", "title", "detail", "depends_on": [node ids],
+       "files": ["path" | {"path", "new": true}], "result"?}                                  steps, 1-12 per ticket
+      {"question": text, "key": slug, "on": node id, "now": what is true today, "evidence": ["path:line" |
+       {"path", "line", "note"}], "depends_on"?: {"question": key, "option": id}, "options": [{"id", "label",
+       "leads_to", "changes": [{"step", "becomes": title|null} | {"add": step}], "result", "cost"?, "risk"?}],
+       "recommend": option id, "why": reason}                                              a choice for the reviewer
     `under` nests a ticket under another (a tree); depends_on is ordering (a DAG). Both must be acyclic.
+    Paths (files, evidence) must exist at the dispatch trunk of the node's repo, except files marked new.
     Questions the reviewer leaves open take their recommendation at approval."""
     d = _draft(conn, run_id)
     if d["planned_at"]:
         raise StageError(f"{run_id} already has a plan")
-    tickets = [r[0] for r in conn.execute("SELECT identifier FROM dispatch_ticket WHERE run_id=? ORDER BY rowid",
-                                          (run_id,))]
+    repo_of = dict(conn.execute("SELECT t.identifier, v.repo FROM dispatch_ticket t JOIN verdict v ON v.id=t.verdict_id "
+                                "WHERE t.run_id=? ORDER BY t.rowid", (run_id,)).fetchall())
+    tickets = list(repo_of)
+    trunk = {x["repo"]: x["trunk_sha"] for x in json.loads(d["repos_json"])}
+    # (repo, trunk) a node's paths live in: its ticket's repo; root and its questions: any of the dispatch's
+    at = lambda i: [(r, trunk[r]) for r in sorted({repo_of[i.split("/")[0]]} if i.split("/")[0] in repo_of
+                                                   else set(repo_of.values())) if r in trunk]
     if not isinstance(nodes, list) or not nodes or not all(isinstance(n, dict) for n in nodes):
         raise StageError("the plan must be a non-empty JSON list of objects")
     questions = [n for n in nodes if "question" in n]
@@ -339,6 +475,11 @@ def plan(conn, run_id: str, nodes: list) -> dict:
         if not 1 <= c <= 12:
             raise StageError(f"{t}: {c} steps; want 1-12")
     ids = step_ids | set(kept)
+    by_id = {n["id"]: n for n in nodes}
+    results = {i: _line(f"{i} result (one line: what a user or system notices once it lands)",
+                        by_id.get(i, {}).get("result")) for i in ["root", *kept]}
+    results |= {n["id"]: _line(f"{n['id']} result", n["result"]) for n in steps if n.get("result") is not None}
+    files = {n["id"]: _files(cfg, n["id"], n["files"], at(n["id"])) for n in steps if "files" in n}
     under = {n["id"]: n.get("under") for n in nodes if n["id"] in kept and n.get("under")}
     for t, u in under.items():
         if u not in kept or u == t:
@@ -347,7 +488,10 @@ def plan(conn, run_id: str, nodes: list) -> dict:
     for i, deps in edges.items():
         if not isinstance(deps, list) or any(d not in ids or d == i for d in deps):
             raise StageError(f"{i}: depends_on must list other node ids of this dispatch (not excluded ones)")
-    for graph, what in ((edges, "dependency cycle"), ({k: [v] for k, v in under.items()}, "tickets nested in a loop")):
+    qs = _plan_questions(cfg, questions, ids | {"root"}, step_ids, kept, at)
+    for graph, what in ((edges, "dependency cycle"), ({k: [v] for k, v in under.items()}, "tickets nested in a loop"),
+                        ({q["key"]: [q["depends_on"]["question"]] for q in qs if q["depends_on"]},
+                         "questions depending on each other")):
         state = {}
 
         def visit(x):
@@ -360,7 +504,6 @@ def plan(conn, run_id: str, nodes: list) -> dict:
                 state[x] = 2
         for x in graph:
             visit(x)
-    qs = _plan_questions(questions, ids | {"root"})
     root = next((n for n in nodes if n["id"] == "root"), {})
     recommend = root.get("recommend", "approve")
     if recommend not in ("approve", "hold", "reject"):
@@ -374,21 +517,21 @@ def plan(conn, run_id: str, nodes: list) -> dict:
             conn.execute("INSERT INTO dispatch_note(run_id, node_id, author, body, at) VALUES (?,?,?,?,?)",
                          (run_id, "root", "agent:factory-plan", f"Dropped {t} from this dispatch: {why}", db.now()))
         conn.executemany(
-            "INSERT INTO dispatch_step(run_id, step_id, title, detail, depends_on_json, parent) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO dispatch_step(run_id, step_id, title, detail, depends_on_json, parent, result, files_json) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             [(run_id, n["id"], str(n.get("title") or "").strip() or n["id"], str(n.get("detail", "")).strip(),
-              json.dumps(edges.get(n["id"], [])), under.get(n["id"]))
+              json.dumps(edges.get(n["id"], [])), under.get(n["id"]), results.get(n["id"]),
+              json.dumps(files[n["id"]]) if n["id"] in files else None)
              for n in nodes if n["id"] == "root" or n["id"] in ids])
         if excluded:  # repos_json follows the kept tickets
-            repos = {r[0] for r in conn.execute("SELECT v.repo FROM dispatch_ticket t JOIN verdict v ON v.id=t.verdict_id "
-                                                "WHERE t.run_id=?", (run_id,))}
-            old = json.loads(conn.execute("SELECT repos_json FROM dispatch WHERE run_id=?", (run_id,)).fetchone()[0])
-            conn.execute("UPDATE dispatch SET repos_json=? WHERE run_id=?",
-                         (json.dumps([r for r in old if r["repo"] in repos]), run_id))
+            conn.execute("UPDATE dispatch SET repos_json=? WHERE run_id=?", (json.dumps(
+                [r for r in json.loads(d["repos_json"]) if r["repo"] in {repo_of[t] for t in kept}]), run_id))
         conn.execute("UPDATE dispatch SET planned_at=? WHERE run_id=?", (db.now(), run_id))
         decide.review(conn, run_id, recommend, review_why, "agent:factory-plan")
         for q in qs:
             decide.open_(conn, "plan", q["question"], q["options"], q["recommend"], q["why"], "agent:factory-plan",
-                         run_id=run_id, node_id=q["on"])
+                         run_id=run_id, node_id=q["on"],
+                         detail={k: q[k] for k in ("key", "now", "evidence", "depends_on")})
     return {"run_id": run_id, "tickets": kept, "excluded": excluded, "steps": len(steps), "questions": len(qs),
             "recommend": recommend}
 

@@ -11,6 +11,7 @@ from unittest import mock
 from factory import db, decide, dispatch
 
 SNAP = "2026-09-01T00:00:00Z"
+R = [{"id": "root", "result": "r"}, {"id": "FIN-1", "result": "r"}]  # results a plan needs on root + kept tickets
 
 
 class Review(unittest.TestCase):
@@ -96,9 +97,9 @@ class Review(unittest.TestCase):
                 {"id": "FIN-1/2", "title": "b", "depends_on": ["FIN-1/1"]}])          # cycle
         for steps in bad:
             with self.subTest(steps=steps), self.assertRaises(dispatch.StageError):
-                dispatch.plan(self.c, "d1", steps)
-        dispatch.plan(self.c, "d1", [{"id": "FIN-1/1", "title": "a"}, {"id": "FIN-1/1.1", "title": "a1"},
-                                     {"id": "FIN-1/2", "title": "b", "depends_on": ["FIN-1/1"]}])
+                dispatch.plan(self.cfg, self.c, "d1", [*R, *steps])
+        dispatch.plan(self.cfg, self.c, "d1", [*R, {"id": "FIN-1/1", "title": "a"}, {"id": "FIN-1/1.1", "title": "a1"},
+                                               {"id": "FIN-1/2", "title": "b", "depends_on": ["FIN-1/1"]}])
         self.assertEqual([(n["id"], n["parent"]) for n in dispatch.tree(self.c, "d1")],
                          [("root", None), ("FIN-1", "root"), ("FIN-1/1", "FIN-1"), ("FIN-1/1.1", "FIN-1/1"),
                           ("FIN-1/2", "FIN-1")])
@@ -113,14 +114,15 @@ class Review(unittest.TestCase):
                            "created_by) VALUES (?,?,?,'valid','r','[1]',?,'t')", (f"i{i}", SNAP, repo, SNAP))
             self.c.execute("INSERT INTO dispatch_ticket(run_id,issue_id,identifier,snapshot_updated_at,verdict_id) "
                            "VALUES ('d1',?,?,?,?)", (f"i{i}", f"FIN-{i}", SNAP, i))
-        with self.assertRaises(dispatch.StageError):  # tickets nested in a loop
-            dispatch.plan(self.c, "d1", [{"id": "FIN-1", "under": "FIN-2"}, {"id": "FIN-2", "under": "FIN-1"},
-                                         {"id": "FIN-1/1", "title": "a"}, {"id": "FIN-2/1", "title": "b"},
-                                         {"id": "FIN-3/1", "title": "c"}])
-        res = dispatch.plan(self.c, "d1", [
-            {"id": "root", "title": "CORS hardening", "detail": "same surface"},
-            {"id": "FIN-2", "under": "FIN-1", "depends_on": ["FIN-1"]}, {"id": "FIN-3", "exclude": "other domain"},
-            {"id": "FIN-1/1", "title": "a"}, {"id": "FIN-2/1", "title": "b"}])
+        with self.assertRaisesRegex(dispatch.StageError, "nested in a loop"):
+            dispatch.plan(self.cfg, self.c, "d1", [
+                R[0], {"id": "FIN-1", "under": "FIN-2", "result": "r"}, {"id": "FIN-2", "under": "FIN-1", "result": "r"},
+                {"id": "FIN-3", "result": "r"},
+                {"id": "FIN-1/1", "title": "a"}, {"id": "FIN-2/1", "title": "b"}, {"id": "FIN-3/1", "title": "c"}])
+        res = dispatch.plan(self.cfg, self.c, "d1", [
+            {"id": "root", "title": "CORS hardening", "detail": "same surface", "result": "r"},
+            {"id": "FIN-1", "result": "r"}, {"id": "FIN-2", "under": "FIN-1", "depends_on": ["FIN-1"], "result": "r"},
+            {"id": "FIN-3", "exclude": "other domain"}, {"id": "FIN-1/1", "title": "a"}, {"id": "FIN-2/1", "title": "b"}])
         self.assertEqual(res["tickets"], ["FIN-1", "FIN-2"])
         t = dispatch.tree(self.c, "d1")
         self.assertEqual([(n["id"], n["parent"]) for n in t],
