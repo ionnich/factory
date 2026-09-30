@@ -248,6 +248,15 @@ def review(d, due: str | None = None) -> str | None:
     return "in-review" if due else "waiting-approval"
 
 
+# A dispatch's lifecycle stage from its own record (SQL over dispatch columns): draft until the plan gate offered it to
+# the planner (or a replan asked), plan until a plan is written, review until it leaves draft (held too), run while
+# staged or executing, reconcile while done or reconciled, archive once archived (rejected drafts too).
+PHASE = ("CASE WHEN state = 'draft' AND planned_at IS NOT NULL THEN 'review' "
+         "WHEN state = 'draft' AND planning_requested_at IS NOT NULL THEN 'plan' WHEN state = 'draft' THEN 'draft' "
+         "WHEN state IN ('staged', 'executing') THEN 'run' WHEN state IN ('done', 'reconciled') THEN 'reconcile' "
+         "ELSE 'archive' END")
+
+
 def stage(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool = False) -> dict:
     """Draft a dispatch for review. Nothing is frozen or started until it is approved. Caller runs ingest first."""
     if not identifiers:
@@ -539,7 +548,7 @@ def plan(cfg: Config, conn, run_id: str, nodes: list) -> dict:
         if excluded:  # repos_json follows the kept tickets
             conn.execute("UPDATE dispatch SET repos_json=? WHERE run_id=?", (json.dumps(
                 [r for r in json.loads(d["repos_json"]) if r["repo"] in {repo_of[t] for t in kept}]), run_id))
-        conn.execute("UPDATE dispatch SET planned_at=? WHERE run_id=?", (db.now(), run_id))
+        conn.execute("UPDATE dispatch SET planned_at=?, planning_error=NULL WHERE run_id=?", (db.now(), run_id))
         learn.cite(conn, *(f"{n.get('title', '')} {n.get('detail', '')} {n.get('why', '')}" for n in nodes))
         rdid = decide.review(conn, run_id, recommend, review_why, "agent:factory-plan")
         if guidance and guidance["review"]:
@@ -578,7 +587,8 @@ def hold(conn, run_id: str, reason: str, actor: str) -> dict:
 
 def replan(conn, run_id: str, reason: str, actor: str) -> dict:
     """Send a planned draft back to the planner: the reason becomes a binding root note, the plan and its open
-    review/plan decisions go, and the plan gate picks the draft up again. Answered questions and notes stay."""
+    review/plan decisions go, and planning is requested again (the Plan stage) until the plan gate picks the draft up.
+    Answered questions and notes stay."""
     d = _draft(conn, run_id)
     if not d["planned_at"]:
         raise StageError(f"{run_id} has no plan yet")
@@ -593,8 +603,8 @@ def replan(conn, run_id: str, reason: str, actor: str) -> dict:
                      "decision_id IN (SELECT id FROM decision WHERE run_id=? AND kind IN ('review','plan') "
                      f"AND {decide.OPEN})", (db.now(), run_id))
         voided = decide.void(conn, "run_id=? AND kind IN ('review','plan')", (run_id,), "replanned")
-        conn.execute("UPDATE dispatch SET planned_at=NULL, held_reason=NULL, last_actor=? WHERE run_id=?",
-                     (actor, run_id))
+        conn.execute("UPDATE dispatch SET planned_at=NULL, held_reason=NULL, planning_requested_at=?, last_actor=? "
+                     "WHERE run_id=?", (db.now(), actor, run_id))
     return {"run_id": run_id, "review": "planning", "steps_cleared": steps, "decisions_voided": voided}
 
 

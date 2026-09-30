@@ -22,6 +22,11 @@ EARNED_AFTER = 5  # straight answers taking ★ before the factory takes it with
 # Kinds where silence takes ★, and how long after the user was told. Every other kind waits for the user.
 SILENT = {"review": timedelta(hours=2), "blocked": timedelta(hours=24), "writeback": timedelta(hours=24),
           "dispatch-stuck": timedelta(hours=24)}
+# The lifecycle stage that owns each kind (where the dashboard asks it), derived when read, never stored: executor
+# questions and alerts in Run, plan questions with the review in Review, held Linear writes in Reconcile, a blocked
+# ticket's retry in Draft, learnings in the Learn view.
+PHASE = {"ask": "run", "executor-gone": "run", "dispatch-stuck": "run", "plan": "review", "review": "review",
+         "writeback": "reconcile", "blocked": "draft", "learning": "learn"}
 
 
 def _iso(t: datetime) -> str:
@@ -223,6 +228,7 @@ def _row(conn, r) -> dict:
                     for o in json.loads(d.pop("options_json"))]
     d["detail"] = json.loads(d.pop("detail_json"))
     d["open"] = d["chosen"] is None and d["void_reason"] is None
+    d["phase"] = PHASE[d["kind"]]
     if d["open"] and d["kind"] == "ask":
         d["tier"] = "now"  # Legacy earned-auto questions still need a visible, explicit human answer.
     if d["open"] and d["kind"] == "learning" and d["tier"] == "auto":

@@ -108,13 +108,22 @@ def cmd_draft(cfg, conn, a):
             ctx["earlier_notes"] = [dict(r) for r in conn.execute(
                 "SELECT node_id, author, body, at FROM dispatch_note WHERE run_id=? ORDER BY id", (d["run_id"],))
                 if r["node_id"] not in ids]
+            with db.tx(conn):  # the Plan stage: offered to the planner now (an offer, not proof a planner runs)
+                conn.execute("UPDATE dispatch SET planning_requested_at=? WHERE run_id=? AND state='draft' AND "
+                             "planned_at IS NULL", (db.now(), d["run_id"]))
         return print(json.dumps({"wakeAgent": bool(ctx), "context": {"draft": ctx}}, default=str))
     if a.dcmd == "plan":
         try:
-            steps = json.loads(a.steps)
-        except json.JSONDecodeError as e:
-            raise dispatch.StageError(f"--steps is not JSON: {e}")
-        return out(dispatch.plan(cfg, conn, a.run_id, steps))
+            try:
+                steps = json.loads(a.steps)
+            except json.JSONDecodeError as e:
+                raise dispatch.StageError(f"--steps is not JSON: {e}")
+            return out(dispatch.plan(cfg, conn, a.run_id, steps))
+        except dispatch.StageError as e:  # the Plan stage shows why it was refused; a written plan clears it
+            with db.tx(conn):
+                conn.execute("UPDATE dispatch SET planning_error=? WHERE run_id=? AND state='draft' AND "
+                             "planned_at IS NULL", (str(e), a.run_id))
+            raise
     if a.dcmd == "replan":
         return out(dispatch.replan(conn, a.run_id, a.reason, a.actor))
     return out(dispatch.note(conn, a.run_id, a.node, a.body, a.actor))
@@ -259,12 +268,16 @@ def cmd_sync(cfg, conn, a):
 
 
 def cmd_status(cfg, conn, a):
+    if a.archived:  # the Archive stage: every archived dispatch (rejected drafts too), newest first
+        return out([dispatch_status(cfg, conn, r) for (r,) in conn.execute(
+            "SELECT run_id FROM dispatch WHERE state='archived' ORDER BY archived_at DESC, run_id DESC").fetchall()])
     out(dispatch_status(cfg, conn, a.run_id) if a.run_id else status(cfg, conn))
 
 
 def cmd_overview(cfg, conn, a):
-    """Everything the Factory tab shows, in one call: board, tickets, candidates, and each live dispatch (plus
-    finished ones something still waits on the user for, e.g. a blocked ticket)."""
+    """Everything the Factory tab shows, in one call: board, tickets, candidates, lifecycle counts, unsettled
+    write-backs, and each live dispatch (plus finished ones something still waits on the user for, e.g. a blocked
+    ticket). Every archived dispatch: `status --archived`."""
     st = status(cfg, conn)
     runs = dict.fromkeys([d["run_id"] for d in st["dispatches"]] +
                          [x["run_id"] for x in st["decisions"] if x["run_id"] and x["kind"] == "blocked"] +
@@ -273,8 +286,16 @@ def cmd_overview(cfg, conn, a):
                   if conn.execute("SELECT 1 FROM dispatch WHERE run_id=?", (r,)).fetchone()]
     shown = [x["id"] for x in st["decisions"]] + [x["id"] for d in dispatches for x in d["decisions"]]
     tk, cands = tickets(cfg, conn), dispatch.candidates(cfg, conn)
-    counts = collections.Counter(t["group"] for t in ledger(cfg, conn, tk, cands["skipped"]))  # list: `tickets --all`
-    out({"status": st, "tickets": tk, "ticket_counts": counts, "candidates": cands, "learnings": learn.rows(conn),
+    rows = ledger(cfg, conn, tk, cands["skipped"])  # the list itself: `tickets --all`
+    # Each lifecycle tab counts the unit it holds: tickets before they are grouped (the whole ledger; Verify: its rows
+    # in that phase), dispatches after (every one in the DB, all of Archive). The Draft builder's ready tickets are
+    # ticket_counts["ready"].
+    stages = dict.fromkeys(("draft", "plan", "review", "run", "reconcile", "archive"), 0) | dict(conn.execute(
+        f"SELECT {dispatch.PHASE} phase, count(*) FROM dispatch GROUP BY phase").fetchall())
+    out({"status": st, "tickets": tk, "ticket_counts": collections.Counter(t["group"] for t in rows),
+         "lifecycle": {"counts": {"tickets": len(rows), "verify": sum(t["phase"] == "verify" for t in rows), **stages}},
+         "writebacks": reconcile.unresolved(conn),  # every unsettled Linear write, sweeps and follow-ups too
+         "candidates": cands, "learnings": learn.rows(conn),
          "dispatches": dispatches, "asks": ask.rows(conn, set(shown))})  # "why?" threads by decision id
 
 
@@ -316,7 +337,7 @@ def status(cfg, conn) -> dict:
 
 
 def dispatch_status(cfg, conn, run_id):
-    d = conn.execute("SELECT * FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+    d = conn.execute(f"SELECT *, {dispatch.PHASE} phase FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
     if d is None:
         raise SystemExit(f"unknown dispatch {run_id}")
     base = cfg.dispatches / ("_archived" if d["state"] == "archived" else "") / run_id / "dispatch.md"
@@ -404,15 +425,17 @@ def group(t: dict, skipped) -> str:
 def ledger(cfg, conn, owned_rows, skipped) -> list:
     """Every ticket in scope or ever touched (verdict, dispatch): one small row each, for the Tickets tab. Owned
     in-scope ones reuse `tickets()` (mapping, freshness); the rest are read straight off linear_latest. `skipped`:
-    candidates()' skipped list (a valid ticket someone else holds is not ready)."""
+    candidates()' skipped list (a valid ticket someone else holds is not ready). `phase`: its lifecycle stage, its live
+    dispatch's, else verify (unverified, stale, or its verdict needs an answer), draft (ready: a stageable candidate)
+    or tickets."""
     mine = {t["identifier"]: t for t in owned_rows}
     skipped = {x["identifier"] for x in skipped}
     review = {k: t.get("review_state") for k, t in cfg.linear.get("team", {}).items()}
     verdicts = {r["issue_id"]: {"kind": r["kind"], "target": r["target"], "reason": r["reason"]} for r in conn.execute(
         "SELECT issue_id, kind, target, reason FROM verdict WHERE superseded_at IS NULL")}
     runs = {r["issue_id"]: dict(r) for r in conn.execute(  # latest membership wins (rows come oldest first)
-        "SELECT t.issue_id, t.run_id, d.state, t.card_status, t.pr_url FROM dispatch_ticket t JOIN dispatch d "
-        "USING (run_id) ORDER BY d.created_at")}
+        f"SELECT t.issue_id, t.run_id, d.state, {dispatch.PHASE} phase, t.card_status, t.pr_url FROM dispatch_ticket t "
+        "JOIN dispatch d USING (run_id) ORDER BY d.created_at")}
     last = dict(conn.execute(
         "SELECT issue_id, max(at) FROM (SELECT issue_id, updated_at at FROM linear_latest "
         "UNION ALL SELECT issue_id, created_at FROM verdict UNION ALL SELECT issue_id, at FROM card_event "
@@ -437,7 +460,9 @@ def ledger(cfg, conn, owned_rows, skipped) -> list:
             "last_at": last.get(s["issue_id"]),
         }
         row = {k: v for k, v in row.items() if v}  # absent = null/false, keeps the list small
-        rows.append({**row, "group": group(row, skipped)})
+        g = group(row, skipped)
+        rows.append({**row, "group": g, "phase": run["phase"] if g == "dispatch" else
+                     {"stale": "verify", "answer": "verify", "ready": "draft"}.get(g, "tickets")})
     return rows
 
 
@@ -505,7 +530,8 @@ def ticket_timeline(conn, issue_id: str) -> list[dict]:
         add(n["at"], "note", n["author"], n["body"], {"run_id": n["run_id"], "node": n["node_id"]})
     for x in conn.execute(f"SELECT * FROM decision WHERE issue_id=? OR (run_id IN ({q}) AND (node_id=? OR node_id LIKE ?)) "
                           "ORDER BY id", (issue_id, *run_ids, ident, ident + "/%")):
-        base = {"id": x["id"], "decision": x["kind"], "run_id": x["run_id"], "node": x["node_id"]}
+        base = {"id": x["id"], "decision": x["kind"], "phase": decide.PHASE[x["kind"]], "run_id": x["run_id"],
+                "node": x["node_id"]}
         add(x["created_at"], "decision", x["created_by"], f"asked: {x['question']}", base)
         if x["chosen"]:
             label = next((o["label"] for o in json.loads(x["options_json"]) if o["id"] == x["chosen"]), x["chosen"])
@@ -581,8 +607,11 @@ def main(argv=None):
     s.add_argument("--full", action="store_true", help="re-pull all active tickets, ignoring the cursor")
     s.set_defaults(fn=cmd_ingest)
     sub.add_parser("sync", help="sync trunk mirrors only").set_defaults(fn=cmd_sync)
-    s = sub.add_parser("status", help="board summary, or one dispatch")
-    s.add_argument("run_id", nargs="?")
+    s = sub.add_parser("status", help="board summary, one dispatch, or every archived one")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("run_id", nargs="?")
+    g.add_argument("--archived", action="store_true", help="every archived dispatch (rejected drafts too), newest "
+                   "first, each as `status <run_id>` shows it (JSON)")
     s.set_defaults(fn=cmd_status)
     s = sub.add_parser("ticket", help="latest snapshot + mapping + current verdict")
     s.add_argument("identifier")

@@ -111,6 +111,9 @@ CREATE TABLE dispatch (
   -- review decision carries the clock (decision.due_at); a factory:propose draft may start without a person.
   drafted_by    TEXT,
   planned_at    TEXT, held_reason TEXT,
+  -- plan step (draft only): when the plan gate last offered it to the planner, or a replan asked for a new plan (an
+  -- offer, not proof a planner runs); why the planner's last plan was refused, cleared once a plan is written.
+  planning_requested_at TEXT, planning_error TEXT,
   approved_by   TEXT, rejected_reason TEXT,
   emergency     INTEGER NOT NULL DEFAULT 0, -- 1 = no review window (urgent, one ticket, tiny evidence footprint)
   CHECK (state = 'draft' OR body_sha256 IS NOT NULL)  -- rejected drafts are rendered too, as the record

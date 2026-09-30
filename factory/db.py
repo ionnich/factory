@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -404,6 +404,11 @@ BEGIN SELECT RAISE(ABORT, 'a decision''s clock (notified_at, due_at) is set once
   decision_id INTEGER PRIMARY KEY REFERENCES decision(id),
   payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
 );""",
+    # v20: the Plan stage from the record: when the plan gate offered a draft to the planner (or a replan asked for a
+    # new plan), and why its last plan was refused. Nothing is backfilled: an old unplanned draft carries no offer and
+    # stays in Draft until the gate's next tick.
+    20: """ALTER TABLE dispatch ADD COLUMN planning_requested_at TEXT;
+ALTER TABLE dispatch ADD COLUMN planning_error TEXT;""",
 }
 
 
