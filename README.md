@@ -170,14 +170,23 @@ One-time, by hand:
   become rules by earned automation: `learning` decisions are excluded from the earned-auto tier and from sweep,
   and legacy open auto learnings read as digest.
 - Learnings (`learn.py`, synced each `factory-propose` tick): one- or two-line facts that save agents tokens, each
-  with its source, anchors (repo paths) and expiry. **Code map** (what lives at a path) is harvested from verdict
-  evidence notes and file names in plan steps, one per repo+path, active at once. **Pitfalls** (a blocked card's
-  reason) and **house rules** (a plan option label you chose twice, or a non-★ answer with a note) are proposed as
-  decisions and reach agents only once you keep them. An active learning expires when trunk changes or deletes an
-  anchor. The prune and planner gates hand agents `learnings` (house rules and pitfalls for the repo, code map
-  lines for the ticket's cited paths or named files; at most 12), dispatch.md gets **Known pitfalls**, and agents
-  cite `L<id>` in verdict reasons, plans and card comments, which counts a use. The Learn tab lists them with their
-  uses next to the cost per verdict and per plan.
+  with its source, anchors (repo paths) and expiry. **Code map** (what lives at a path) comes only from observed
+  verdict evidence (a cited file with its note), one per repo+path, active at once. Plan step text is never a code
+  fact: legacy `step:` code map rows are retired (expired with a reason, kept as audit). **Pitfalls** (a blocked
+  card's reason) and **house rules** (a plan option label you chose twice, or a non-★ answer with a note) are
+  proposed as decisions and reach agents only once you keep them. An active learning expires when trunk changes or
+  deletes an anchor. After harvesting commits, Jev compares each open proposal with at most 40 learnings of its
+  repo (same kind first, then newest; a proposed one only if older), quoted as data to judge: `duplicate` and
+  `supports` share a `learning:<root>` group, folded together as Related learnings in the Quick lane; `conflicts`
+  is never grouped and stays a visible warning. Grouping never merges answers: each proposal is still kept or
+  dropped as its own decision, and Jev never changes a learning's status. A tick gives this 15 s, least recently
+  attempted first, each call capped to the time left (`factory jev sync` runs it unbounded); a failure stays
+  visible and retries later; an unchanged success is reused until the input, a candidate's status, source or
+  scope, the question, the model or the 0.85 bar changes. The prune and planner gates hand agents `learnings`
+  (house rules and pitfalls for the repo, code map lines for the ticket's cited paths or named files; at most 12),
+  dispatch.md gets **Known pitfalls**, and agents cite `L<id>` in verdict reasons, plans and card comments, which
+  counts a use. The Learn tab lists them with their provenance (observed evidence, kept by you, or proposed and
+  awaiting you, each with its source), relations and uses, next to the cost per verdict and per plan.
 - Backups: `factory-backup` (03:00) writes `~/.hermes/factory/backups/factory-YYYY-MM-DD.db` (newest 14), and every
   schema migration first writes `factory-pre-vN.db`. Same disk: protects against bad writes, not disk loss.
 - CLI: `factory status|overview|tickets|ticket-timeline|candidates|stage|draft|decide|ask|handoff|propose|execute|card|reconcile|archive|metrics|backup`.

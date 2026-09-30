@@ -149,7 +149,7 @@ def cmd_jev(cfg, conn, a):
     """Explicit sync, and nothing else (no ingest, handoff or answer): the whole open plan/ask/review queue without
     the tick budget, then the learning slice's relations on open learning decisions."""
     res = {"decisions": jev.refresh(cfg, conn, budget=None)}
-    learn._jev_refresh(cfg, conn)  # reports nothing itself: show what each open learning decision now carries
+    learn._jev_refresh(cfg, conn, budget=None)  # reports nothing itself: show what each open learning decision carries
     res["learnings"] = [{"decision": d["id"], **{k: v for k, v in d["jev"].items()
                                                  if k in ("status", "confidence", "relation", "group", "error")}}
                         for d in decide.rows(conn) if d["kind"] == "learning" and d["jev"]]
