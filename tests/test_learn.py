@@ -21,7 +21,7 @@ class Learnings(unittest.TestCase):
         self.git("add", "."); self.git("commit", "-qm", "one")
         self.sha = self.git("rev-parse", "HEAD")
         self.c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
-        self.cfg = SimpleNamespace(mirror_path=lambda _: self.repo)
+        self.cfg = SimpleNamespace(mirror_path=lambda _: self.repo, raw={})
         self.trunk(self.sha)
         ev = [{"type": "file", "path": "cited.py", "note": "x lives here", "sha": self.sha}]
         self.c.execute("INSERT INTO linear_snapshot VALUES ('i1','FIN-1',?,?,'unstarted',1,'{}')", (SNAP, SNAP))

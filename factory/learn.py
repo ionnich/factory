@@ -13,12 +13,7 @@ import hashlib
 import json
 import re
 
-from . import db, decide, repos
-
-try:
-    from . import jev  # core slice; until the parent merges it, learnings just stay unannotated
-except ImportError:
-    jev = None
+from . import db, decide, jev, repos
 
 CAP = 12  # lines per gate context
 CITE = re.compile(r"\bL(\d+)\b")
@@ -159,18 +154,28 @@ def pitfalls(conn, repos_) -> list[str]:
 
 # ---- jev: relationship guidance on proposed learnings ----------------------------------------------------------
 # After the harvesting transaction commits, each open learning decision is compared through core's factory.jev with
-# up to JEV_CANDIDATES same-scope learnings; the judgment is persisted via jev.store and read back via jev.stored
-# (core owns the separate jev_advice table — decision.detail_json and its trigger stay untouched). Unchanged inputs
-# reuse the last successful judgment; failed or disabled calls stay visible and are retried next tick. Guidance
-# never answers the decision and never changes a learning's status.
-JEV_CANDIDATES = 5
+# a bounded same-repo candidate shortlist (same kind preferred, newest first; a proposed candidate must be older
+# than the proposal so a judgment never points forward). Each judgment is persisted immediately through jev.store
+# and read back through jev.stored (core owns the separate jev_advice table — decision.detail_json and its trigger
+# stay untouched), so a later proposal in the same sync sees the group root its target just stored. Unchanged
+# inputs reuse the last successful judgment; failed or disabled calls stay visible and are retried next tick; a
+# vanished candidate set clears any stale relationship. Guidance never answers the decision and never changes a
+# learning's status.
+# ponytail: 40 candidates → 121 choice options with "none", well inside the 255-choice ceiling; the cap is
+# latency, not the API — raise to 84 (the real ceiling) only if duplicate recall measurably misses at 40.
+JEV_CANDIDATES = 40
+# A relationship below this confidence is recorded but never presented as definitive.
+JEV_CONF = 0.85
 
 
 def _jev_candidates(conn, l: dict) -> list[dict]:
-    """The bounded, deterministic set to compare against: same scope only, oldest first."""
+    """The bounded, deterministic set to compare against: same repo only, same kind first then newest, and a
+    proposed candidate must be older than the proposal (no forward pointers), while an active one may be any age."""
     return [dict(r) for r in conn.execute(
         "SELECT id, kind, body, status FROM learning WHERE scope = ? AND id <> ? "
-        "AND status IN ('active', 'proposed') ORDER BY id ASC LIMIT ?", (l["scope"], l["id"], JEV_CANDIDATES))]
+        "AND (status = 'active' OR (status = 'proposed' AND id < ?)) "
+        "ORDER BY (kind = ?) DESC, id DESC LIMIT ?",
+        (l["scope"], l["id"], l["id"], l["kind"], JEV_CANDIDATES))]
 
 
 def _jev_fingerprint(l: dict, candidates: list[dict]) -> str:
@@ -232,8 +237,10 @@ def _jev_build(res: dict, fp: str, conn, l: dict, candidates: list[dict]) -> dic
         conf = ans.get("confidence")
         if isinstance(conf, (int, float)) and 0 <= conf <= 1:
             out["confidence"] = conf
+        else:
+            conf = None
         rel = _jev_relation(ans.get("choice"), candidates)
-        if rel:
+        if rel and conf is not None and conf >= JEV_CONF:
             out["relation"] = rel
             if rel["kind"] in ("duplicate", "supports"):
                 group = _jev_group(conn, l["id"], rel["learning_id"])
@@ -246,31 +253,31 @@ def _jev_build(res: dict, fp: str, conn, l: dict, candidates: list[dict]) -> dic
 
 def _jev_refresh(cfg, conn) -> None:
     """Assess the open learning decisions. The network call happens here, never under a transaction; each result
-    is persisted through core's jev.store, which rechecks the decision is still open in its own short transaction,
-    so one answered or withdrawn while it was in flight is left untouched."""
-    if jev is None:
-        return
+    is persisted at once through core's jev.store, whose own short transaction rechecks the decision is still open,
+    so one answered or withdrawn while in flight is left untouched. Storing immediately, oldest proposal first,
+    lets a later proposal in the same sync see the group root its duplicate/supports target just stored."""
     opens = conn.execute(
         "SELECT d.id did, l.id lid, l.kind, l.scope, l.body, l.source FROM decision d "
         "JOIN learning l ON l.id = CAST(d.ref AS INTEGER) "
-        "WHERE d.kind = 'learning' AND d.chosen IS NULL AND d.void_reason IS NULL ORDER BY d.id").fetchall()
-    updates: list[tuple[int, dict]] = []
+        "WHERE d.kind = 'learning' AND d.chosen IS NULL AND d.void_reason IS NULL "
+        "ORDER BY l.id, d.id").fetchall()
     for d in opens:
         l = {"id": d["lid"], "kind": d["kind"], "scope": d["scope"], "body": d["body"], "source": d["source"]}
         candidates = _jev_candidates(conn, l)
-        if not candidates:
-            continue  # nothing to compare: no guidance to show
         fp = _jev_fingerprint(l, candidates)
         cur = jev.stored(conn, d["did"]) or {}
         if cur.get("status") == "ok" and cur.get("fingerprint") == fp:
             continue  # unchanged successful judgment: reuse it
+        if not candidates:
+            if "relation" in cur or "group" in cur:
+                # Nothing left to compare: clear the relationship the vanished candidate set produced.
+                jev.store(conn, d["did"], {"status": "ok", "assessed_at": db.now(), "fingerprint": fp})
+            continue
         try:
             res = jev.evaluate(cfg, _jev_state(l, candidates), _jev_questions(candidates))
-        except Exception as e:  # evaluate is contractually non-raising; this keeps learn.sync safe regardless
-            res = {"status": "unavailable", "error": f"{type(e).__name__}: {str(e)[:160]}"}
-        updates.append((d["did"], _jev_build(res, fp, conn, l, candidates)))
-    for did, out in updates:
-        jev.store(conn, did, out)
+        except Exception as e:  # evaluate is contractually non-raising; a type-only error keeps learn.sync safe
+            res = {"status": "unavailable", "error": type(e).__name__}
+        jev.store(conn, d["did"], _jev_build(res, fp, conn, l, candidates))
 
 
 def rows(conn) -> list[dict]:
@@ -285,7 +292,7 @@ def rows(conn) -> list[dict]:
         d = dict(r)
         d["anchors"] = json.loads(d.pop("anchors"))
         did = d.pop("did")
-        if jev is not None and did is not None:
+        if did is not None:
             advice = jev.stored(conn, did)
             if advice:
                 d["jev"] = advice
