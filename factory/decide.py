@@ -232,7 +232,7 @@ def _row(conn, r) -> dict:
         x = d["detail"]
         d.update(key=x.get("key"), now=x.get("now"), evidence=x.get("evidence", []), depends_on=x.get("depends_on"))
         d["options"] = [{"changes": [], "result": None, "cost": None, "risk": None, **o} for o in d["options"]]
-    d["jev"] = jev.served(jev.stored(conn, d["id"]), conn, d["options"])
+    d["jev"] = jev.read(conn, d["id"], d["options"], jev.repos_for(conn, d) if d["run_id"] else None)
     d["deadline"], d["on_timeout"] = _deadline(conn, d) if d["open"] else (None, None)
     return d
 

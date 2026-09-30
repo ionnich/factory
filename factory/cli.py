@@ -71,7 +71,7 @@ def cmd_propose(cfg, conn, a):
     try:  # judgment guidance for open plan/ask/review decisions; a jev failure never costs a push or digest
         res["jev"] = jev.refresh(cfg, conn)
     except Exception as e:
-        print(f"factory: jev refresh: {type(e).__name__}: {e}", file=sys.stderr)
+        print(f"factory: jev refresh: {type(e).__name__}", file=sys.stderr)  # type-only, never str(e)
         res["jev"] = []
     execution_id = decide.notification_execution(cfg) if a.announce else None
     msgs = decide.notify(cfg, conn, res["swept"], execution_id=execution_id)
@@ -146,7 +146,7 @@ def cmd_decide(cfg, conn, a):
 
 
 def cmd_jev(cfg, conn, a):
-    out(jev.refresh(cfg, conn))
+    out(jev.refresh(cfg, conn, budget=None))  # explicit sync: judge the whole queue, no tick budget
 
 
 def _dispatch_repos(conn, run_ids) -> set[str]:
