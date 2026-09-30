@@ -32,6 +32,34 @@ class OwnedInScope(unittest.TestCase):
             self.assertEqual([s["issue_id"] for s in prune.owned_in_scope(cfg, c)], ["i2"])
 
 
+class Recheck(unittest.TestCase):
+    def test_a_recheck_carries_the_prior_verdict_and_only_the_cited_files_diff(self):
+        repo = Path(tempfile.mkdtemp())
+        git = lambda *a: prune.repos.git(repo, *a)
+        git("init", "-q")
+        git("config", "user.email", "t@x"); git("config", "user.name", "t")
+        (repo / "cited.py").write_text("x = 1\n"); (repo / "other.py").write_text("y = 1\n")
+        git("add", "."); git("commit", "-qm", "one")
+        old = git("rev-parse", "HEAD").strip()
+        (repo / "cited.py").write_text("x = 2\n"); (repo / "other.py").write_text("y = 2\n")
+        git("commit", "-qam", "two")
+        new = git("rev-parse", "HEAD").strip()
+        c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
+        c.execute("INSERT INTO linear_snapshot VALUES ('i1','FIN-1',?,?,'unstarted',1,'{}')", (SNAP, SNAP))
+        c.execute("INSERT INTO verdict(issue_id,snapshot_updated_at,repo,trunk_sha,kind,reason,evidence_json,"
+                  "evidence_paths_json,created_at,created_by) VALUES ('i1',?,'r','" + old + "','valid','x is 1',"
+                  "'[{\"type\":\"file\",\"path\":\"cited.py\"}]','[\"cited.py\"]',?,'t')", (SNAP, SNAP))
+        cfg = SimpleNamespace(mirror_path=lambda _: repo)
+        s, ctx = {"issue_id": "i1"}, SimpleNamespace(repo="r")
+        got = prune._recheck(cfg, c, s, ctx, "evidence-changed", {"sha": new})
+        self.assertEqual((got["prior"]["kind"], got["prior"]["reason"]), ("valid", "x is 1"))
+        self.assertIn("+x = 2", got["cited_diff"])
+        self.assertNotIn("other.py", got["cited_diff"])
+        self.assertEqual(prune._recheck(cfg, c, s, ctx, "aged", {"sha": old})["cited_diff"],
+                         "(no change to the cited files)")
+        self.assertEqual(prune._recheck(cfg, c, s, ctx, "ticket-changed", {"sha": new}), {})
+
+
 class Dagster(unittest.TestCase):
     def run_q(self, query):
         return witness._dagster(SimpleNamespace(), {"url": "http://d", "token_env": "T"}, query)

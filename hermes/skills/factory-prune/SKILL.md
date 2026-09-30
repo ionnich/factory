@@ -22,8 +22,23 @@ repo, or to a database.
 
 The prompt starts with the gate's JSON: `context.tickets[]`, each with
 `identifier`, `title`, `why` (new | ticket-changed | context-changed |
-evidence-changed), `context`, `repo`, `mirror` (a checkout of trunk),
+evidence-changed | aged), `context`, `repo`, `mirror` (a checkout of trunk),
 `trunk_sha`, and `witnesses` (read-only data sources mapped to this context).
+A re-check (`why` evidence-changed or aged) also carries `prior` (the current
+verdict: kind, target, reason, evidence, its trunk_sha) and `cited_diff` (the
+git diff of only the files that verdict cited, prior trunk → current trunk).
+
+## Re-check first (when `prior` is present)
+
+Read `cited_diff` before anything else. The diff is observed in this run.
+
+- It does not touch what `prior.reason` relies on: record `prior.kind` again
+  (same target), re-citing the prior `file` evidence (the CLI checks the paths
+  still exist at trunk) with notes saying what you checked in the diff. Re-run
+  each `sql`/`dagster` witness query the prior cited (data moves without
+  commits) and cite the new `witness_log_id`. Nothing else: no ticket read, no
+  survey. This should take 1-3 calls.
+- It does touch it, or you can't tell from the diff: investigate as below.
 
 ## The CLI
 

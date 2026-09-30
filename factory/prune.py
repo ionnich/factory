@@ -144,7 +144,28 @@ def gate(cfg: Config, conn) -> dict:
             todo.append({"identifier": s["identifier"], "title": json.loads(s["raw_json"])["title"],
                          "why": reason, "context": ctx.name, "repo": ctx.repo,
                          "mirror": str(cfg.mirror_path(ctx.repo)), "trunk_sha": trunk["sha"] if trunk else None,
-                         "witnesses": ctx.witnesses})
+                         "witnesses": ctx.witnesses, **_recheck(cfg, conn, s, ctx, reason, trunk)})
+    return {"wakeAgent": bool(todo), "context": {"tickets": todo, "auto_needs_clarification": auto}}
+
+
+RECHECK_DIFF_CHARS = 8000
+
+
+def _recheck(cfg: Config, conn, s, ctx: Context, reason: str, trunk) -> dict:
+    """Only trunk moved (or the verdict aged): hand the agent the prior verdict and the diff of just the files it
+    cited, so a confirm is a short read instead of a fresh investigation."""
+    if reason not in ("evidence-changed", "aged") or trunk is None:
+        return {}
+    v = conn.execute("SELECT * FROM verdict WHERE issue_id=? AND superseded_at IS NULL", (s["issue_id"],)).fetchone()
+    paths = json.loads(v["evidence_paths_json"])
+    mirror = cfg.mirror_path(ctx.repo)
+    if not paths or repos.changed_paths(mirror, v["trunk_sha"], trunk["sha"]) is None:
+        return {}  # prior trunk unknown to the mirror: no diff to give, investigate from scratch
+    diff = repos.git(mirror, "diff", v["trunk_sha"], trunk["sha"], "--", *paths) if v["trunk_sha"] != trunk["sha"] else ""
+    return {"prior": {"kind": v["kind"], "target": v["target"], "reason": v["reason"],
+                      "evidence": json.loads(v["evidence_json"]), "trunk_sha": v["trunk_sha"]},
+            "cited_diff": (diff[:RECHECK_DIFF_CHARS] + "\n… (truncated)" if len(diff) > RECHECK_DIFF_CHARS else diff)
+            or "(no change to the cited files)"}
     return {"wakeAgent": bool(todo), "context": {"tickets": todo, "auto_needs_clarification": auto}}
 
 
