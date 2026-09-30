@@ -30,6 +30,28 @@ export function Jev({ d }) {
       {j.error ? <span className="fx-jev-line">{j.error}</span> : null}
     </div>
   );
+  // The learning classifier supplies relation, not category: show the comparison, never a generic category hint.
+  if (d.kind === "learning") {
+    const rel = j.relation;
+    if (!rel || rel.learning_id == null) return null;
+    const conflict = rel.kind === "conflicts";
+    const [tone, label] = conflict ? ["amber", "Conflicts"] : ["blue", "Related learning"];
+    return (
+      <div className="fx-jev">
+        <span className={`fx-jev-badge t-${tone}`}>{label}</span>
+        <span className="fx-jev-line"><span className={conflict ? "fx-err" : undefined}>{REL[rel.kind] || "related to"}</span> <span className="fx-id">L{rel.learning_id}</span>{rel.body ? ` · ${rel.body}` : ""}</span>
+        <details className="fx-jev-det">
+          <summary>how Jev read this</summary>
+          <div className="fx-jev-meta">
+            {j.model ? <span className="fx-hint">model {j.model}</span> : null}
+            {pct(j.confidence) ? <span className="fx-hint">confidence {pct(j.confidence)} · advisory, not approval</span> : null}
+            {j.focus && j.focus !== "none" ? <span className="fx-hint">focus: {j.focus}</span> : null}
+            {j.error ? <span className="fx-err">{j.error}</span> : null}
+          </div>
+        </details>
+      </div>
+    );
+  }
   const [tone, label, hint] = CATEGORY[j.category] || CATEGORY.unclear;
   const ruleOpt = j.rule ? (d.options || []).find((o) => o.id === j.rule.option_id) : null;
   const head = j.rule && j.category === "policy"

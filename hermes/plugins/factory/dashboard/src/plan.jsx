@@ -369,19 +369,32 @@ export function Quick({ items, context, onDone }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   if (!items.length) return null;
+  // Related learnings share jev.group ("learning:<root-id>"); the root proposed learning itself has no group, so
+  // attach it via ref/detail.learning. Only duplicate/supports rows group; conflicts stay visible outside.
   const groupOf = (d) => (d.kind === "learning" && d.jev?.group ? d.jev.group : null);
-  const sets = [];  // [group, [decisions…]]; related learnings share jev.group, each still answers on its own
-  const seen = new Map();
+  const lidOf = (d) => (d.kind === "learning" ? (d.detail?.learning ?? (d.ref != null && !isNaN(+d.ref) ? Number(d.ref) : null)) : null);
+  const sets = new Map();  // group -> {members: [...], conflicts: [...]}
   items.forEach((d) => {
     const g = groupOf(d);
     if (!g) return;
-    if (seen.has(g)) sets[seen.get(g)][1].push(d);
-    else { seen.set(g, sets.length); sets.push([g, [d]]); }
+    let s = sets.get(g);
+    if (!s) sets.set(g, s = { members: [], conflicts: [] });
+    (d.jev?.relation?.kind === "conflicts" ? s.conflicts : s.members).push(d);
   });
-  const grouped = sets.filter(([, ds]) => ds.length > 1);
-  const inSet = new Set(grouped.flatMap(([, ds]) => ds.map((d) => d.id)));
+  const grouped = [];
+  sets.forEach((s, g) => {
+    const lid = g.startsWith("learning:") ? Number(g.slice("learning:".length)) : null;
+    if (lid != null) {
+      const inSet = new Set([...s.members, ...s.conflicts].map((d) => d.id));
+      const root = items.find((d) => d.kind === "learning" && !groupOf(d) && !inSet.has(d.id) && lidOf(d) === lid
+        && d.jev?.relation?.kind !== "conflicts");
+      if (root) s.members.unshift(root);
+    }
+    if (s.members.length > 1) grouped.push([g, s]);
+  });
+  const inSet = new Set(grouped.flatMap(([, s]) => s.members.map((d) => d.id)));
   const row = (d) => <QuickRow key={d.id} d={d} ctx={context(d)} onDone={onDone} />;
-  const conflicts = (ds) => ds.map((d) => d.jev?.relation).filter((r) => r?.kind === "conflicts" && r.learning_id != null);
+  const conflicts = (s) => s.conflicts.map((d) => d.jev?.relation).filter((r) => r?.kind === "conflicts" && r.learning_id != null);
   const all = () => {
     setBusy(true); setErr(null);
     post("/decisions/ok", { ids: items.map((x) => x.id) }).then((r) => {
@@ -396,15 +409,15 @@ export function Quick({ items, context, onDone }) {
       <div className="fx-row between"><span className="fx-k">Quick · {items.length}</span>
         <Button size="sm" disabled={busy} onClick={all}>{busy ? "Taking ★…" : "Take all ★"}</Button></div>
       <ul>{items.filter((d) => !inSet.has(d.id)).map(row)}</ul>
-      {grouped.map(([g, ds]) => {
-        const cs = conflicts(ds);
+      {grouped.map(([g, s]) => {
+        const cs = conflicts(s);
         return (
           <details key={g} className="fx-fold fx-rel" open>
             <summary>
-              Related learnings <span className="fx-count">{ds.length}</span>
+              Related learnings <span className="fx-count">{s.members.length}</span>
               {cs.length ? <span className="fx-rel-conflict">{cs.map((r) => `conflicts with L${r.learning_id}`).join(" · ")}</span> : null}
             </summary>
-            <ul>{ds.map(row)}</ul>
+            <ul>{s.members.map(row)}</ul>
           </details>
         );
       })}

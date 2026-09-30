@@ -19,7 +19,9 @@ const Line = ({ l }) => {
   return (
     <div className="fx-note">
       <span className="fx-id">L{l.id}</span> {l.body}
-      <div className="fx-hint">{l.scope.split("/").pop()} · {l.status === "proposed" ? "awaiting you · proposed" : `${times(l.uses)} · observed`} from {l.source}</div>
+      <div className="fx-hint">{l.scope.split("/").pop()} · {l.status === "proposed" ? "awaiting you · proposed"
+        : l.kind === "codemap" ? `${times(l.uses)} · observed evidence`
+        : `${times(l.uses)} · approved`} from {l.source}</div>
       {rel && rel.learning_id != null ? (
         <div className={`fx-hint${rel.kind === "conflicts" ? " fx-err" : ""}`}>{REL[rel.kind] || "related to"} <span className="fx-id">L{rel.learning_id}</span>{rel.body ? ` · ${rel.body}` : ""}</div>
       ) : null}
@@ -62,7 +64,7 @@ export function Learnings({ items }) {
           </details>
         ) : null;
       })}
-      {!items.length ? <div className="fx-empty">Nothing learned yet. The code map fills in as tickets are verified and planned.</div> : null}
+      {!items.length ? <div className="fx-empty">Nothing learned yet.</div> : null}
     </div>
   );
 }
