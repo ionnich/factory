@@ -150,7 +150,11 @@ One-time, by hand:
   top-level as `decision.jev`. It classifies each open plan/ask/review decision (`investigate` / `policy` / `human`
   / `unclear` with a confidence), matches an active house rule a person kept (rule id, body and the matching
   option label — never a preselection), and picks a focus (`result`/`changes`/`cost`/`risk`/`none`) from the
-  existing consequence text. Guidance only: Jev never answers, voids or changes a decision; the UI never changes
+  existing consequence text. Each kept rule is its own question in the same call (which option it names, or none;
+  the question quotes the rule, since the model never sees a question id), so equivalent rules never split one
+  confidence: a rule is cited only when the provider's confidence in its own answer is >= 0.85 and it is still
+  eligible after the call; sure rules naming different options cite none, agreeing ones cite the most confident
+  (ties: the oldest). Guidance only: Jev never answers, voids or changes a decision; the UI never changes
   the selected option from it, and a disabled or failed call leaves the decision as it was, with a visible
   unavailable state and a sanitized error (no provider body). A plan question Jev is sure (>= 0.85) asks for pure
   missing investigation is refused at plan time with a StageError telling the planner to check the code and

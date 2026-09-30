@@ -1,7 +1,7 @@
 """Jev: the shared client contract (validated, sanitized, no fabrication, bounded), judgment guidance on open
-plan/ask/review decisions (batched typed-Choice category/rule/focus, fingerprint reuse, a budgeted refresh that
-never starves later decisions, scoped stale-claim removal), the plan-time investigation gate, and learning
-decisions never earning rule approval."""
+plan/ask/review decisions (one batched typed-Choice call: category, each rule's own option Choice, focus;
+fingerprint reuse, a budgeted refresh that never starves later decisions, scoped stale-claim removal), the
+plan-time investigation gate, and learning decisions never earning rule approval."""
 import io
 import json
 import sqlite3
@@ -24,13 +24,15 @@ def choice_answer(questions, qid, choice, confidence=0.9):
     return {"type": "choice", "choice": choice, "probabilities": probs, "confidence": confidence}
 
 
-def ok_result(category="human", confidence=0.9, rule=None, focus=None, rule_conf=0.9):
-    """evaluate() stub: answers every question asked, and the answers pass the client's own validation (complete,
+def ok_result(category="human", confidence=0.9, rules=None, focus=None):
+    """evaluate() stub: answers every question asked — each rule's own question (rule_<id>) with
+    rules[id] = (option id, confidence), else none — and the answers pass the client's own validation (complete,
     normalized probability maps), so assess sees a realistic batched judgment."""
     def stub(cfg, state, questions, timeout=None):
         answers = {"category": choice_answer(questions, "category", category, confidence)}
-        if "rule" in questions:
-            answers["rule"] = choice_answer(questions, "rule", rule or "none", rule_conf)
+        for qid in questions:
+            if qid.startswith("rule_"):
+                answers[qid] = choice_answer(questions, qid, *(rules or {}).get(int(qid[5:]), ("none", 0.9)))
         if "focus" in questions:
             answers["focus"] = choice_answer(questions, "focus", focus or "none", 0.9)
         res = {"status": "ok", "model": "jev-1.13.0", "answers": answers,
@@ -319,7 +321,7 @@ class Guidance(unittest.TestCase):
         body = "Console access already reaches preview environments; production stays unchanged."
         lid = self.seed_rule(body)
         with mock.patch("factory.jev.evaluate",
-                        side_effect=ok_result("policy", 0.9, rule=json.dumps([lid, "all"]))):
+                        side_effect=ok_result("policy", 0.9, rules={lid: ("all", 0.9)})):
             jev.refresh(self.cfg, self.c)
         d = decide.one(self.c, did)
         self.assertEqual(d["jev"]["category"], "policy")
@@ -332,7 +334,7 @@ class Guidance(unittest.TestCase):
                             decide.option("all", "Preview origins too", "y")], "prod", "why", "t", run_id="d1")
         lid = self.seed_rule("Console access already reaches preview environments.")
         with mock.patch("factory.jev.evaluate",
-                        side_effect=ok_result("policy", 0.9, rule=json.dumps([lid, "all"]), rule_conf=0.5)):
+                        side_effect=ok_result("policy", 0.9, rules={lid: ("all", 0.5)})):
             jev.refresh(self.cfg, self.c)
         d = decide.one(self.c, did)
         self.assertEqual(d["jev"]["category"], "policy")
@@ -348,6 +350,46 @@ class Guidance(unittest.TestCase):
             jev.refresh(self.cfg, self.c)
         self.assertNotIn("rule", decide.one(self.c, did)["jev"])
 
+    def test_equivalent_rules_each_match_on_their_own_confidence(self):
+        # Two kept rules say the same thing. Each is its own question quoting its rule (the model never sees a
+        # question id), all in one call, so neither dilutes the other's confidence the way one joint choice did.
+        opts = [decide.option("prod", "Production console only", "x"),
+                decide.option("all", "Preview origins too", "y")]
+        bodies = ["Console access already reaches preview environments.", "Preview environments get the console."]
+        older, newer = [self.seed_rule(b) for b in bodies]
+        calls = []
+
+        def judged(rules):
+            def stub(cfg, state, questions, timeout=None):
+                calls.append(questions)
+                return ok_result("policy", 0.9, rules=rules)(cfg, state, questions)
+            return stub
+
+        first = decide.open_(self.c, "plan", "Allow preview origins too?", opts, "prod", "why", "t", run_id="d1")
+        with mock.patch("factory.jev.evaluate", side_effect=judged({older: ("all", 0.9), newer: ("all", 0.97)})):
+            jev.refresh(self.cfg, self.c)
+        self.assertEqual(len(calls), 1)  # the category and both rules' questions in one call
+        for lid, body in zip((older, newer), bodies):
+            self.assertIn(body, calls[0][f"rule_{lid}"]["instructions"])
+        # both sure of the same option: the most confident rule is the citation
+        self.assertEqual(decide.one(self.c, first)["jev"]["rule"],
+                         {"id": newer, "body": bodies[1], "option_id": "all"})
+        tie = decide.open_(self.c, "plan", "Open previews to the console?", opts, "prod", "why", "t", run_id="d1")
+        with mock.patch("factory.jev.evaluate", side_effect=judged({older: ("all", 0.9), newer: ("all", 0.9)})):
+            jev.refresh(self.cfg, self.c)
+        self.assertEqual(decide.one(self.c, tie)["jev"]["rule"]["id"], older)  # a tie cites the oldest rule, stably
+
+    def test_sure_rules_that_disagree_cite_no_rule(self):
+        did = decide.open_(self.c, "plan", "Allow preview origins too?",
+                           [decide.option("prod", "Production console only", "x"),
+                            decide.option("all", "Preview origins too", "y")], "prod", "why", "t", run_id="d1")
+        only_prod = self.seed_rule("Preview environments never get the console.")
+        allow = self.seed_rule("Console access already reaches preview environments.")
+        with mock.patch("factory.jev.evaluate", side_effect=ok_result(
+                "policy", 0.9, rules={only_prod: ("prod", 0.95), allow: ("all", 0.92)})):
+            jev.refresh(self.cfg, self.c)
+        self.assertNotIn("rule", decide.one(self.c, did)["jev"])  # neither sure rule resolves it over the other
+
     def test_reads_drop_a_stale_rule_claim_and_its_policy_category(self):
         q = "Allow preview origins too?"
         did = decide.open_(self.c, "plan", q,
@@ -355,7 +397,7 @@ class Guidance(unittest.TestCase):
                             decide.option("all", "Preview origins too", "y")], "prod", "why", "t", run_id="d1")
         lid = self.seed_rule("Console access already reaches preview environments.")
         with mock.patch("factory.jev.evaluate",
-                        side_effect=ok_result("policy", 0.9, rule=json.dumps([lid, "all"]))):
+                        side_effect=ok_result("policy", 0.9, rules={lid: ("all", 0.9)})):
             jev.refresh(self.cfg, self.c)
         self.assertIsNotNone(decide.one(self.c, did)["jev"]["rule"])
         self.c.execute("UPDATE learning SET status='expired' WHERE id=?", (lid,))  # anchors moved on
@@ -372,7 +414,7 @@ class Guidance(unittest.TestCase):
         advice = {"status": "ok", "relation": {"kind": "duplicate", "learning_id": lid, "body": "b"},
                   "group": "learning:1"}
         self.assertTrue(jev.store(self.c, did, advice))
-        self.assertEqual(jev.served(advice, self.c, [])["group"], "learning:1")  # learn.rows' unscoped call
+        self.assertEqual(jev.served(advice, self.c, [])["group"], "learning:1")
         self.c.execute("UPDATE learning SET status='expired' WHERE id=?", (lid,))
         for shown in (decide.one(self.c, did)["jev"], jev.served(advice, self.c, [])):
             self.assertNotIn("relation", shown)  # no relation to a gone learning
@@ -454,7 +496,7 @@ class Guidance(unittest.TestCase):
         with mock.patch("factory.jev.evaluate", side_effect=stub):
             jev.refresh(self.cfg, self.c)
         self.assertNotIn("rules", seen["state"])  # the r-rule was never offered to a r2 question
-        self.assertNotIn("rule", seen["questions"])
+        self.assertEqual([k for k in seen["questions"] if k.startswith("rule_")], [])  # no rule question either
         self.assertNotIn("rule", decide.one(self.c, did)["jev"])
 
 
