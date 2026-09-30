@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -397,6 +397,26 @@ WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
   OR (OLD.notified_at IS NOT NULL AND NEW.notified_at IS NOT OLD.notified_at)
   OR (OLD.due_at IS NOT NULL AND NEW.due_at IS NOT OLD.due_at)
 BEGIN SELECT RAISE(ABORT, 'a decision''s clock (notified_at, due_at) is set once, while it is open'); END;""",
+    # v19: Jev guidance (and the learning slice's relation/group metadata) is persisted in
+    # decision.detail_json.jev while a decision is open. detail_json stays frozen once answered or withdrawn,
+    # like everything else on the row.
+    19: """DROP TRIGGER decision_answer_once;
+CREATE TRIGGER decision_answer_once BEFORE UPDATE OF run_id, node_id, issue_id, kind, ref, question, options_json,
+  recommended, why, detail_json, created_at, created_by, tier, chosen, chosen_by, chosen_at, chosen_note, void_reason,
+  void_at ON decision
+WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
+  OR NEW.run_id IS NOT OLD.run_id OR NEW.node_id IS NOT OLD.node_id OR NEW.issue_id IS NOT OLD.issue_id
+  OR NEW.kind IS NOT OLD.kind OR NEW.ref IS NOT OLD.ref OR NEW.question IS NOT OLD.question
+  OR NEW.options_json IS NOT OLD.options_json OR NEW.recommended IS NOT OLD.recommended OR NEW.why IS NOT OLD.why
+  OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.created_by IS NOT OLD.created_by OR NEW.tier IS NOT OLD.tier
+  OR (NEW.chosen IS NULL AND NEW.void_reason IS NULL AND NEW.detail_json IS OLD.detail_json)
+  OR (NEW.chosen IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(OLD.options_json)
+                                             WHERE json_extract(value, '$.id') = NEW.chosen))
+  OR (NEW.chosen IS NOT NULL AND length(trim(coalesce(NEW.chosen_note, ''))) = 0
+      AND EXISTS (SELECT 1 FROM json_each(OLD.options_json)
+                  WHERE json_extract(value, '$.id') = NEW.chosen AND json_extract(value, '$.note') IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'a decision is answered (with one of its options, and the text it asks for) or withdrawn once'); END;""",
 }
 
 

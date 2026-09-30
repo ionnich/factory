@@ -11,7 +11,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import db, decide, learn, prune, repos
+from . import db, decide, jev, learn, prune, repos
 from .config import Config, secret
 
 HERMES = str(Path.home() / ".local/bin/hermes")
@@ -433,7 +433,9 @@ def plan(cfg: Config, conn, run_id: str, nodes: list) -> dict:
        "recommend": option id, "why": reason}                                              a choice for the reviewer
     `under` nests a ticket under another (a tree); depends_on is ordering (a DAG). Both must be acyclic.
     Paths (files, evidence) must exist at the dispatch trunk of the node's repo, except files marked new.
-    Questions the reviewer leaves open take their recommendation at approval."""
+    Questions the reviewer leaves open take their recommendation at approval. When Jev is enabled, each question
+    and the review get judgment guidance in their details, and a question Jev is sure (>= 0.85) asks for pure
+    missing investigation is refused here — check the code and decide it in the plan instead."""
     d = _draft(conn, run_id)
     if d["planned_at"]:
         raise StageError(f"{run_id} already has a plan")
@@ -514,7 +516,14 @@ def plan(cfg: Config, conn, run_id: str, nodes: list) -> dict:
     review_why = str(root.get("why") or "").strip() or (
         f"The plan covers {len(kept)} ticket(s) in {len(steps)} step(s)"
         + (f"; dropped {', '.join(excluded)} as misfits" if excluded else "") + ". Nothing has changed since the draft.")
+    # Jev guidance (and the pure-investigation gate) before anything is written; network, so outside the
+    # transaction. A disabled or failing Jev changes nothing about the plan.
+    guidance = jev.assess_plan(cfg, conn, run_id, qs, recommend, review_why)
     with db.tx(conn):
+        # Refuse a stale plan: the draft may have moved while Jev judged it.
+        d2 = conn.execute("SELECT state, planned_at FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+        if d2 is None or d2["state"] != "draft" or d2["planned_at"]:
+            raise StageError(f"{run_id} changed while the plan was being judged; nothing was written")
         for t, why in excluded.items():
             conn.execute("DELETE FROM dispatch_ticket WHERE run_id=? AND identifier=?", (run_id, t))
             conn.execute("INSERT INTO dispatch_note(run_id, node_id, author, body, at) VALUES (?,?,?,?,?)",
@@ -531,11 +540,14 @@ def plan(cfg: Config, conn, run_id: str, nodes: list) -> dict:
                 [r for r in json.loads(d["repos_json"]) if r["repo"] in {repo_of[t] for t in kept}]), run_id))
         conn.execute("UPDATE dispatch SET planned_at=? WHERE run_id=?", (db.now(), run_id))
         learn.cite(conn, *(f"{n.get('title', '')} {n.get('detail', '')} {n.get('why', '')}" for n in nodes))
-        decide.review(conn, run_id, recommend, review_why, "agent:factory-plan")
-        for q in qs:
+        decide.review(conn, run_id, recommend, review_why, "agent:factory-plan",
+                      detail={"jev": guidance["review"]} if guidance and guidance["review"] else None)
+        for q, g in zip(qs, guidance["questions"] if guidance else (None,) * len(qs)):
+            detail = {k: q[k] for k in ("key", "now", "evidence", "depends_on")}
+            if g:
+                detail["jev"] = g
             decide.open_(conn, "plan", q["question"], q["options"], q["recommend"], q["why"], "agent:factory-plan",
-                         run_id=run_id, node_id=q["on"],
-                         detail={k: q[k] for k in ("key", "now", "evidence", "depends_on")})
+                         run_id=run_id, node_id=q["on"], detail=detail)
     return {"run_id": run_id, "tickets": kept, "excluded": excluded, "steps": len(steps), "questions": len(qs),
             "recommend": recommend}
 

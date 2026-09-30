@@ -305,6 +305,8 @@ CREATE TABLE linear_own_write (
 -- ---------------------------------------------------------------- decisions
 -- Every choice the factory needs from a person: >= 2 options, each saying what it leads to, one recommended
 -- with why. Answered once (chosen) or withdrawn once when the question stops applying (void); never edited.
+-- detail_json holds guidance (Jev judgments, relation/group metadata) and is writable while open, frozen
+-- with the rest once answered or withdrawn.
 -- node_id places it in its dispatch's graph (root, a ticket id, a step id); run_id may be a sweep-/followup- run.
 -- tier, fixed when asked: auto = the factory takes the recommendation on its next pass (nothing for a person to
 -- weigh, or the user took it the last EARNED_AFTER times); now = work is stopped until the user answers (pushed
@@ -355,9 +357,9 @@ WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
   OR NEW.run_id IS NOT OLD.run_id OR NEW.node_id IS NOT OLD.node_id OR NEW.issue_id IS NOT OLD.issue_id
   OR NEW.kind IS NOT OLD.kind OR NEW.ref IS NOT OLD.ref OR NEW.question IS NOT OLD.question
   OR NEW.options_json IS NOT OLD.options_json OR NEW.recommended IS NOT OLD.recommended OR NEW.why IS NOT OLD.why
-  OR NEW.detail_json IS NOT OLD.detail_json OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.created_at IS NOT OLD.created_at
   OR NEW.created_by IS NOT OLD.created_by OR NEW.tier IS NOT OLD.tier
-  OR (NEW.chosen IS NULL AND NEW.void_reason IS NULL)
+  OR (NEW.chosen IS NULL AND NEW.void_reason IS NULL AND NEW.detail_json IS OLD.detail_json)
   OR (NEW.chosen IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(OLD.options_json)
                                              WHERE json_extract(value, '$.id') = NEW.chosen))
   OR (NEW.chosen IS NOT NULL AND length(trim(coalesce(NEW.chosen_note, ''))) = 0
