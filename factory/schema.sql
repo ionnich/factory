@@ -15,6 +15,8 @@ CREATE TABLE linear_snapshot (
 CREATE INDEX linear_snapshot_ident ON linear_snapshot(identifier, updated_at);
 CREATE TRIGGER linear_snapshot_immutable BEFORE UPDATE ON linear_snapshot
 BEGIN SELECT RAISE(ABORT, 'linear_snapshot is append-only'); END;
+CREATE TRIGGER linear_snapshot_no_delete BEFORE DELETE ON linear_snapshot
+BEGIN SELECT RAISE(ABORT, 'linear_snapshot is append-only'); END;
 
 CREATE VIEW linear_latest AS
 SELECT s.* FROM linear_snapshot s
@@ -59,6 +61,8 @@ CREATE TABLE witness_log (
 );
 CREATE TRIGGER witness_log_immutable BEFORE UPDATE ON witness_log
 BEGIN SELECT RAISE(ABORT, 'witness_log is append-only'); END;
+CREATE TRIGGER witness_log_no_delete BEFORE DELETE ON witness_log
+BEGIN SELECT RAISE(ABORT, 'witness_log is append-only'); END;
 
 -- ---------------------------------------------------------------- verdicts
 CREATE TABLE verdict (
@@ -88,6 +92,8 @@ WHEN NEW.issue_id IS NOT OLD.issue_id OR NEW.snapshot_updated_at IS NOT OLD.snap
   OR NEW.evidence_json IS NOT OLD.evidence_json OR NEW.evidence_paths_json IS NOT OLD.evidence_paths_json
   OR (OLD.superseded_at IS NOT NULL AND NEW.superseded_at IS NOT OLD.superseded_at)
 BEGIN SELECT RAISE(ABORT, 'verdict is immutable except superseded_at/written_back_run'); END;
+CREATE TRIGGER verdict_no_delete BEFORE DELETE ON verdict
+BEGIN SELECT RAISE(ABORT, 'verdicts are never deleted'); END;
 
 -- ---------------------------------------------------------------- dispatches
 -- Directory is derived: dispatches/<run_id> or dispatches/_archived/<run_id>.
@@ -130,8 +136,8 @@ WHEN OLD.state <> 'draft' AND (NEW.body_sha256 IS NOT OLD.body_sha256 OR NEW.rep
   OR NEW.run_id IS NOT OLD.run_id OR NEW.created_at IS NOT OLD.created_at)
 BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;
 
-CREATE TRIGGER dispatch_no_delete BEFORE DELETE ON dispatch WHEN OLD.state <> 'draft'
-BEGIN SELECT RAISE(ABORT, 'only draft dispatches may be deleted'); END;
+CREATE TRIGGER dispatch_no_delete BEFORE DELETE ON dispatch
+BEGIN SELECT RAISE(ABORT, 'dispatches are never deleted; a draft leaves approved or rejected'); END;
 
 -- Plan tree of a draft, written once by the planner agent, only while draft. Rows: `root` (the dispatch's theme),
 -- a ticket id (its role; `parent` = the ticket it is nested under, NULL = root), or a step (`FIN-1/2`, nested
@@ -255,6 +261,8 @@ CREATE TABLE card_event (
 );
 CREATE TRIGGER card_event_append_only BEFORE UPDATE ON card_event
 BEGIN SELECT RAISE(ABORT, 'card_event is append-only'); END;
+CREATE TRIGGER card_event_no_delete BEFORE DELETE ON card_event
+BEGIN SELECT RAISE(ABORT, 'card_event is append-only'); END;
 
 -- ---------------------------------------------------------------- reconcile
 -- One row per planned Linear write. Only `factory reconcile apply` sends; the reconcile agent may edit
@@ -277,6 +285,10 @@ CREATE TRIGGER writeback_no_upgrade BEFORE UPDATE OF decision ON writeback
 WHEN NEW.decision IS NOT OLD.decision AND NOT (OLD.decision = 'apply' AND NEW.decision = 'flag')
   AND NOT (OLD.decision = 'flag' AND NEW.decision = 'apply' AND OLD.approved_by IS NULL AND NEW.approved_by IS NOT NULL)
 BEGIN SELECT RAISE(ABORT, 'writeback decision may only be downgraded apply -> flag, or re-applied by a person'); END;
+CREATE TRIGGER writeback_confirmed_final BEFORE UPDATE OF status ON writeback
+WHEN OLD.status = 'confirmed' AND NEW.status IS NOT OLD.status
+  AND NOT (OLD.approved_by IS NULL AND NEW.approved_by IS NOT NULL)
+BEGIN SELECT RAISE(ABORT, 'a confirmed write-back is final unless a person applies it anyway'); END;
 
 -- updatedAt values produced by reconcile's own writes: not a ticket change, so no re-verification.
 CREATE TABLE linear_own_write (

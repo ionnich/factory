@@ -9,7 +9,7 @@ from unittest import mock
 
 from factory import db, decide
 from factory.dispatch import StageError
-from factory.reconcile import _COMPLETION, plan, resolve, state_gate
+from factory.reconcile import CREATE, ISSUE_QUERY, STATES_QUERY, UPDATE, apply, plan, resolve, state_gate
 
 LEAD = "lead@finks.ai"
 CFG = SimpleNamespace(linear={"lead": LEAD})
@@ -89,15 +89,65 @@ class Resolve(unittest.TestCase):
         with self.assertRaises(StageError):  # answered once
             decide.choose(None, self.c, did, "skip", "user")
 
+    def test_replan_keeps_an_agent_hold(self):
+        resolve(self.c, "r", "FIN-1", "state", None, "owner objected in comments")
+        fresh = ("r", "i1", "state", json.dumps({"state": "Canceled"}), "apply", "dup", None, "planned")
+        with mock.patch("factory.reconcile._dispatch_rows", return_value=[fresh]):
+            plan(None, self.c, "r")  # the gate re-plans every done run, e.g. after the agent died before apply
+        self.assertEqual(self.c.execute("SELECT decision FROM writeback WHERE op='state'").fetchone()[0], "flag")
+
     def test_a_code_gate_hold_offers_no_apply(self):
         did = decide.writeback(self.c, "r", "i1", "state", {"state": "Canceled"}, "assigned to someone@else")
         self.assertEqual([o["id"] for o in decide.one(self.c, did)["options"]], ["skip", "manual"])
 
 
-class CompletionBlock(unittest.TestCase):
-    def test_replaces_only_the_completion_section(self):
-        desc = "Top\n## Completion\nOutcome: old\n\n## Notes\nkeep\n"
-        new = _COMPLETION.sub(lambda _: "## Completion\nOutcome: new\n\n", desc, count=1)
+class Apply(unittest.TestCase):
+    def setUp(self):
+        self.c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
+        self.c.execute("INSERT INTO linear_snapshot VALUES ('i1','FIN-1',?,?,'unstarted',1,'{}')", (T0, T0))
+        self.sent = []
+
+    def gql(self, cfg, query, variables=None):
+        self.sent.append((query, variables))
+        if query == ISSUE_QUERY:
+            return {"issue": {"updatedAt": T1, "description": "Top\n## Completion\nOutcome: old\n\n## Notes\nkeep\n"}}
+        if query == STATES_QUERY:
+            return {"team": {"states": {"nodes": [{"id": "s1", "name": "Todo"}]}}}
+        if query == CREATE:
+            return {"issueCreate": {"success": True, "issue": {"id": "n1", "identifier": "FIN-2", "url": "u"}}}
+        if query == UPDATE:
+            return {"issueUpdate": {"success": True, "issue": {"updatedAt": T1}}}
+        raise OSError("network down")  # RELATE, COMMENT
+
+    def row(self, op, payload, status="planned"):
+        self.c.execute("INSERT INTO writeback(run_id, issue_id, op, payload_json, decision, rule, status) "
+                       "VALUES ('r','i1',?,?,'apply','t',?)", (op, json.dumps(payload), status))
+
+    def apply(self):
+        with mock.patch("factory.linear.gql", self.gql):
+            return apply(CFG, self.c, "r")
+
+    def test_failed_relation_never_recreates_the_ticket(self):
+        self.row("create", {"title": "T", "description": "D", "team_id": "t1", "state": "Todo"})
+        self.apply()
+        w = self.c.execute("SELECT status, linear_ref FROM writeback WHERE op='create'").fetchone()
+        self.assertEqual(tuple(w), ("confirmed", "FIN-2"))
+        self.sent.clear()
+        self.apply()
+        self.assertNotIn(CREATE, [q for q, _ in self.sent])
+
+    def test_a_row_left_sent_is_not_resent_but_asked(self):
+        self.row("comment", {"body": "hi"}, status="sent")
+        self.assertEqual(self.apply()["unfinished"], 0)  # the run does not stall on it
+        self.assertEqual(self.sent, [])
+        w = self.c.execute("SELECT decision, status FROM writeback WHERE op='comment'").fetchone()
+        self.assertEqual(tuple(w), ("flag", "confirmed"))
+        self.assertEqual([(d["kind"], d["ref"]) for d in decide.rows(self.c, "r")], [("writeback", "comment")])
+
+    def test_completion_replaces_only_the_completion_section(self):
+        self.row("description", {"completion": "## Completion\nOutcome: new\n"})
+        self.apply()
+        new = next(v for q, v in self.sent if q == UPDATE)["input"]["description"]
         self.assertEqual(new, "Top\n## Completion\nOutcome: new\n\n## Notes\nkeep\n")
 
 

@@ -35,7 +35,7 @@ repo, so one pass through the code lands several of them with little context
 switching. Your job is to shape the cohort into a tree:
 
 1. For each ticket, read the evidence files in `mirror` (targeted ranges or
-   grep, at most 6 reads per ticket) and confirm where the change goes.
+   grep) and confirm where the change goes.
 2. Decide the tree:
    - `root`: a theme title (what the dispatch achieves) and a detail of 1-2
      sentences on why these tickets belong together.

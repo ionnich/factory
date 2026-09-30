@@ -112,8 +112,9 @@ def ingest(cfg: Config, conn, full: bool = False) -> dict:
     fetched = inserted = 0
     max_updated = cursor
     fetched_at = db.now()
+    issues = list(fetch(cfg, flt))  # paginated HTTP outside the write lock
     with db.tx(conn):
-        for issue in fetch(cfg, flt):
+        for issue in issues:
             fetched += 1
             cur = conn.execute(
                 "INSERT OR IGNORE INTO linear_snapshot VALUES (?,?,?,?,?,?,?)",

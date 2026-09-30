@@ -110,8 +110,8 @@ def review(conn, run_id: str, recommend: str, why: str, created_by: str, held: b
 
 def blocked(conn, run_id: str, ident: str, issue_id: str, reason: str, actor: str) -> int:
     return open_(conn, "blocked", f"{ident} is blocked. What next?", [
-        option("writeback", "Write back as blocked", "reconcile comments the reason on the Linear ticket; it is "
-                                                     "not drafted again until the ticket changes"),
+        option("writeback", "Leave it blocked", "no retry; it is not drafted again until the ticket changes "
+                                                "(reconcile comments the reason on Linear either way)"),
         option("retry", "Retry in a new dispatch", "the ticket goes back to Ready with your guidance attached as a "
                                                    "note; the next draft plans it again",
                note="What should the retry do differently?"),
@@ -448,6 +448,9 @@ def _mark(conn, ds: list, dues: dict, now: datetime) -> None:
             conn.execute("UPDATE decision SET due_at=? WHERE id=? AND due_at IS NULL", (dues[d["id"]], d["id"]))
 
 
+READY = "Factory · ready to start"
+
+
 def notify(cfg, conn, swept: list | None = None, now: datetime | None = None) -> list[str]:
     """Messages for the factory Bot Chat now. A push when work is stopped on the user (at most
     notify.interrupts_per_day a day; the rest wait for the digest) or an emergency started without review; the
@@ -457,7 +460,8 @@ def notify(cfg, conn, swept: list | None = None, now: datetime | None = None) ->
     url, msgs = n.get("url", ""), []
     with db.tx(conn):
         midnight = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-        pushed = conn.execute("SELECT count(*) FROM notice WHERE kind='push' AND at >= ?", (_iso(midnight),)).fetchone()[0]
+        pushed = conn.execute("SELECT count(*) FROM notice WHERE kind='push' AND at >= ? AND body NOT LIKE ?",
+                              (_iso(midnight), f"{READY}%")).fetchone()[0]
         push = [f"Emergency: dispatch {s.get('run_id')} started without review ({s['because']})."
                 for s in swept or () if s["kind"] == "review" and s["because"].startswith("emergency")
                 and s.get("chosen") == "approve"]
@@ -466,6 +470,14 @@ def notify(cfg, conn, swept: list | None = None, now: datetime | None = None) ->
             push += ["Factory · needs you now", *(_line(conn, d, None, now) for d in urgent),
                      f'Reply "ok" to take ★, or "#{urgent[0]["id"]} <option>". {url}'.rstrip()]
             _mark(conn, urgent, {}, now)
+        # A factory draft's review goes out once its plan is written, not at the next digest: only one dispatch runs
+        # at a time, so a review waiting overnight idles the factory. Not counted against interrupts_per_day.
+        ready = [d for d in rows(conn) if d["kind"] == "review" and not d["notified_at"] and _silent(conn, d)]
+        if ready:
+            dues = {d["id"]: _iso(now + _silent(conn, d)) for d in ready}
+            push += [READY, *(_line(conn, d, dues[d["id"]], now) for d in ready),
+                     f'Reply "ok" to take ★, or "#{ready[0]["id"]} hold: why". {url}'.rstrip()]
+            _mark(conn, ready, dues, now)
         if push:
             conn.execute("INSERT INTO notice(kind, body, at) VALUES ('push', ?, ?)", ("\n".join(push), _iso(now)))
             msgs.append("\n".join(push))

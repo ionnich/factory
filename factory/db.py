@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -230,6 +230,23 @@ CREATE TABLE notice (
   body TEXT NOT NULL,
   at   TEXT NOT NULL
 );""",
+    # v10: history tables are append-only against raw sqlite3 too; a draft leaves only via approve/reject; a
+    # confirmed write-back is final unless a person applies it anyway (approved_by set).
+    10: """CREATE TRIGGER linear_snapshot_no_delete BEFORE DELETE ON linear_snapshot
+BEGIN SELECT RAISE(ABORT, 'linear_snapshot is append-only'); END;
+CREATE TRIGGER witness_log_no_delete BEFORE DELETE ON witness_log
+BEGIN SELECT RAISE(ABORT, 'witness_log is append-only'); END;
+CREATE TRIGGER verdict_no_delete BEFORE DELETE ON verdict
+BEGIN SELECT RAISE(ABORT, 'verdicts are never deleted'); END;
+CREATE TRIGGER card_event_no_delete BEFORE DELETE ON card_event
+BEGIN SELECT RAISE(ABORT, 'card_event is append-only'); END;
+DROP TRIGGER dispatch_no_delete;
+CREATE TRIGGER dispatch_no_delete BEFORE DELETE ON dispatch
+BEGIN SELECT RAISE(ABORT, 'dispatches are never deleted; a draft leaves approved or rejected'); END;
+CREATE TRIGGER writeback_confirmed_final BEFORE UPDATE OF status ON writeback
+WHEN OLD.status = 'confirmed' AND NEW.status IS NOT OLD.status
+  AND NOT (OLD.approved_by IS NULL AND NEW.approved_by IS NOT NULL)
+BEGIN SELECT RAISE(ABORT, 'a confirmed write-back is final unless a person applies it anyway'); END;""",
 }
 
 

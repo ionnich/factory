@@ -65,12 +65,22 @@ def _clickhouse(cfg: Config, w: dict, query: str) -> tuple[list, int]:
 
 
 def _dagster(cfg: Config, w: dict, query: str) -> tuple[dict, int]:
+    if not query.strip().startswith(("{", "query")):
+        raise WitnessError("dagster takes a GraphQL query (`{ ... }` or `query ...`), not SQL")
     if not graphql_read_ok(query):
         raise WitnessError("only GraphQL queries are allowed (no mutation/subscription)")
     req = urllib.request.Request(w["url"], data=json.dumps({"query": query}).encode(), headers={
         "Content-Type": "application/json", "Dagster-Cloud-Api-Token": secret(cfg, w["token_env"])})
-    with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
-        body = json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
+            body = json.load(r)
+    except urllib.error.HTTPError as e:  # GraphQL validation errors come back as 400 with the reason in the body
+        raw = e.read().decode(errors="replace")
+        try:
+            raw = json.loads(raw)["errors"][0]["message"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            pass
+        raise WitnessError(f"dagster HTTP {e.code}: {raw.strip()[:400]}") from None
     if body.get("errors"):
         raise WitnessError(f"dagster: {body['errors'][0].get('message')}")
     data = _cap(body.get("data"))

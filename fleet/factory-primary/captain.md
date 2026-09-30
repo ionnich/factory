@@ -35,7 +35,7 @@ Execute factory dispatches, one at a time, and nothing else.
 ## Routes
 
 Route each card by subject against the secondmate scopes, then
-`data/projects.md` (repo -> owner). All five are factory-fleet homes under
+`data/projects.md` (repo -> owner). All six are factory-fleet homes under
 `~/.local/share/factory-fleet/homes/`:
 
 - **fx-news-pipeline**: news acquisition, clustering, enrichment, internal briefs,
@@ -44,6 +44,10 @@ Route each card by subject against the secondmate scopes, then
 - **fx-financial-data**: company and symbol data, fundamentals, FMP ingestion,
   historical ratios, crypto data, connected portfolios (finks-dagster,
   finks-portfolio-service).
+- **fx-finks-data**: the Finks Data platform (Linear Domain "Finks Data"):
+  Dagster platform and sandbox harness, ClickHouse master tables and views,
+  raw-data ingestion health (CoinGecko etc.), the data-platform contract
+  (finks-dagster). FMP Ingestion and Historical Ratios stay fx-financial-data.
 - **fx-personalization**: personalization profile and per-user Insights
   generation, ranking and serving (finks-insights-service,
   finks-personalization-service).

@@ -122,7 +122,7 @@ def _dispatch_repos(conn, run_ids) -> set[str]:
 
 
 def cmd_backup(cfg, conn, a):
-    out(db.backup(conn, cfg.db.parent / "factory" / "backups", f"{datetime.now(UTC):%Y-%m-%d}", a.keep))
+    out(db.backup(conn, cfg.db.parent / "factory" / "backups", f"{datetime.now().astimezone():%Y-%m-%d}", a.keep))
 
 
 def _p50(xs):
@@ -181,18 +181,32 @@ def cmd_reconcile(cfg, conn, a):
         res = reconcile.apply(cfg, conn, a.run_id)
         out(res)
         return 1 if res["unfinished"] else 0
-    # gate: archive reconciled dispatches, plan every done dispatch + a verdict sweep, and wake the agent
-    # for runs with unsent rows.
+    # gate: archive reconciled dispatches, plan every done dispatch + a verdict sweep, close out done runs with
+    # nothing left to send, and wake the agent for runs with unsent rows. One bad run never stops the others.
     for (run_id,) in conn.execute("SELECT run_id FROM dispatch WHERE state='reconciled'").fetchall():
-        dispatch.archive(cfg, conn, run_id)
+        try:
+            dispatch.archive(cfg, conn, run_id)
+        except Exception as e:
+            print(f"factory: gate: archive {run_id}: {type(e).__name__}: {e}", file=sys.stderr)
     dispatch.watch(cfg, conn)  # stuck / executor-gone decisions
-    ingest(cfg, conn)
+    try:
+        ingest(cfg, conn)
+    except OSError as e:  # network down (URLError, HTTPError, timeout): skip this tick, no agent run
+        return _gate_offline(e)
     for (run_id,) in conn.execute("SELECT run_id FROM dispatch WHERE state='done'").fetchall():
-        reconcile.plan(cfg, conn, run_id)
+        try:
+            reconcile.plan(cfg, conn, run_id)
+            reconcile.close(cfg, conn, run_id)
+        except Exception as e:
+            print(f"factory: gate: {run_id}: {type(e).__name__}: {e}", file=sys.stderr)
     reconcile.plan(cfg, conn, None)
     runs = [reconcile.show(conn, r) for (r,) in conn.execute(
         "SELECT DISTINCT run_id FROM writeback WHERE status <> 'confirmed' ORDER BY run_id").fetchall()]
     print(json.dumps({"wakeAgent": bool(runs), "context": {"runs": runs}}, default=str))
+
+
+def _gate_offline(e: OSError) -> None:
+    print(json.dumps({"wakeAgent": False, "context": {"error": f"{type(e).__name__}: {e}"}}))
 
 
 def cmd_archive(cfg, conn, a):
@@ -338,7 +352,10 @@ def cmd_ticket(cfg, conn, a):
 
 def cmd_prune_gate(cfg, conn, a):
     # Hermes reads the LAST stdout line as the wakeAgent gate.
-    print(json.dumps(prune.gate(cfg, conn)))
+    try:
+        print(json.dumps(prune.gate(cfg, conn)))
+    except OSError as e:
+        _gate_offline(e)
 
 
 def cmd_verdict_put(cfg, conn, a):

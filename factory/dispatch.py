@@ -26,7 +26,10 @@ def _foreign_holds(cfg: Config) -> dict[str, str]:
     pats = cfg.raw.get("stage", {}).get("foreign_backlogs", [])
     holds = {p: Path(p).read_text() for pat in pats for p in glob.glob(os.path.expanduser(pat))}
     own = cfg.raw.get("executor", {}).get("workspace", "factory")
-    r = subprocess.run(["herdr", "workspace", "list"], capture_output=True, text=True, timeout=10)
+    try:
+        r = subprocess.run(["herdr", "workspace", "list"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise StageError(f"herdr workspace list: {e}") from None
     if r.returncode == 0:
         labels = [w["label"] for w in json.loads(r.stdout)["result"]["workspaces"]
                   if w["label"] != own and not w["label"].startswith("2ndmate-fx-") and "fx-" not in w["label"]]
@@ -492,12 +495,15 @@ def mirror_cards(cfg: Config, conn, run_id: str, tickets: dict) -> list:
         return []
     board, res = cfg.kanban.get("board", "factory"), []
     for ident, t in tickets.items():
-        r = subprocess.run(
-            [HERMES, "kanban", "--board", board, "create", f"{ident}: {t['title']}",
-             "--body", f"Dispatch {run_id} ({cfg.dispatches / run_id / 'dispatch.md'})\n{t['url']}",
-             "--idempotency-key", f"factory:{run_id}:{ident}", "--completion-contract", t["repo"],
-             "--created-by", "factory", "--json"],
-            capture_output=True, text=True, timeout=60)
+        try:
+            r = subprocess.run(
+                [HERMES, "kanban", "--board", board, "create", f"{ident}: {t['title']}",
+                 "--body", f"Dispatch {run_id} ({cfg.dispatches / run_id / 'dispatch.md'})\n{t['url']}",
+                 "--idempotency-key", f"factory:{run_id}:{ident}", "--completion-contract", t["repo"],
+                 "--created-by", "factory", "--json"],
+                capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            r = subprocess.CompletedProcess([], 1, "", "hermes kanban create timed out")
         try:
             card = json.loads(r.stdout)["id"] if r.returncode == 0 else None
         except (json.JSONDecodeError, KeyError, TypeError):
@@ -510,7 +516,10 @@ def mirror_cards(cfg: Config, conn, run_id: str, tickets: dict) -> list:
 
 
 def _herdr(*args: str) -> dict:
-    r = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=10)
+    try:
+        r = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise StageError(f"herdr {' '.join(args)}: {e}") from None
     if r.returncode:
         raise StageError(f"herdr {' '.join(args)}: {r.stderr.strip() or r.stdout.strip()}")
     return json.loads(r.stdout) if r.stdout.strip().startswith("{") else {}
@@ -627,10 +636,11 @@ def archive(cfg: Config, conn, run_id: str) -> dict:
     if d is None or d["state"] != "reconciled":
         raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not reconciled")
     src, dst = cfg.dispatches / run_id, cfg.dispatches / "_archived" / run_id
-    for p in [src, *src.rglob("*")]:
-        os.chflags(p, 0)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    src.rename(dst)
+    if src.exists() or not dst.exists():  # re-run after a crash between rename and DB update: just finish the DB
+        for p in [src, *src.rglob("*")]:
+            os.chflags(p, 0)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
     with db.tx(conn):
         conn.execute("UPDATE dispatch SET state='archived', archived_at=?, last_actor='factory:archive' WHERE run_id=?",
                      (db.now(), run_id))

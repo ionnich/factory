@@ -6,9 +6,12 @@
 #   - Hermes cron jobs, created only when missing (matched by name)
 # Model for agent jobs: FACTORY_MODEL / FACTORY_PROVIDER (default deepseek).
 set -euo pipefail
+export PATH="$HOME/.local/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/opt/homebrew/bin:$PATH"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 hermes_home="${HERMES_HOME:-$HOME/.hermes}"
+# uv also ships inside Hermes; use its newest copy when none is on PATH.
+command -v uv >/dev/null || PATH="$PATH:$(ls -d "$hermes_home"/tools/uv-*/ | sort -V | tail -1)"
 provider="${FACTORY_PROVIDER:-deepseek}"
 model="${FACTORY_MODEL:-deepseek-v4-pro}"
 
@@ -38,6 +41,13 @@ for dest in "$hermes_home" "$hermes_home/profiles/factory"; do
 done
 [ -d "$hermes_home/profiles/factory" ] && cp "$here/hermes/profiles/factory/SOUL.md" "$hermes_home/profiles/factory/SOUL.md"
 
+# Jobs are created once; push the repo's prompt into an existing job on every install so prompt edits reach it.
+sync_prompt() {  # <cron list output> <job name> <prompt file> [hermes global args...]
+  local id
+  id="$(awk -v n="$2" '/^ +[0-9a-f]+ \[/{id=$1} /^ +Name:/{s=$0; sub(/^ +Name: +/, "", s); if (s == n) print id}' <<<"$1")"
+  [ -z "$id" ] || hermes "${@:4}" cron edit "$id" --prompt "$(cat "$3")" >/dev/null
+}
+
 # The planner bot (profile `planner`, created once by hand, see README.md): SOUL, its gate script and skill in its
 # own home (a profile's cron runs only scripts from its own scripts/), and its routine in its own cron store.
 pl="$hermes_home/profiles/planner"
@@ -52,6 +62,7 @@ if [ -d "$pl" ]; then
     --script factory-plan-gate.sh --skill factory-plan --workdir "$hermes_home/factory/mirrors" \
     --provider "$provider" --model "$model" --reasoning-effort medium \
     --name "[bot:planner] Plan drafts" --deliver local
+  sync_prompt "$planner_jobs" "[bot:planner] Plan drafts" "$here/hermes/prompts/plan.md" -p planner
 fi
 
 # factory-fleet primary: local charter + dispatch-intake skill (home data/ and the skill are untracked there)
@@ -70,9 +81,6 @@ grep -q '^ *factory ' <<<"$boards" \
 jobs="$(hermes cron list 2>/dev/null || true)"   # capture first: grep -q on a live pipe + pipefail = SIGPIPE false negative
 have_job() { grep -qE "Name: +$1\$" <<<"$jobs"; }
 
-have_job factory-ingest || hermes cron create "every 20m" --no-agent \
-  --script factory-ingest.sh --name factory-ingest --deliver local
-
 have_job factory-prune || hermes cron create "every 20m" "$(cat "$here/hermes/prompts/prune.md")" \
   --script factory-prune-gate.sh --skill factory-prune --workdir "$hermes_home/factory/mirrors" \
   --provider "$provider" --model "$model" --reasoning-effort medium \
@@ -82,6 +90,8 @@ have_job factory-reconcile || hermes cron create "every 20m" "$(cat "$here/herme
   --script factory-reconcile-gate.sh --skill factory-reconcile --workdir "$hermes_home/factory" \
   --provider "$provider" --model "$model" --reasoning-effort low \
   --name factory-reconcile --deliver local
+sync_prompt "$jobs" factory-prune "$here/hermes/prompts/prune.md"
+sync_prompt "$jobs" factory-reconcile "$here/hermes/prompts/reconcile.md"
 
 # Nightly consistent copy of factory.db to ~/.hermes/factory/backups (newest 14 kept).
 have_job factory-backup || hermes cron create "0 3 * * *" --no-agent \

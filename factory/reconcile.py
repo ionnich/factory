@@ -11,12 +11,13 @@ Every gate is re-checked against a live read immediately before each state write
 """
 import json
 import re
+import sys
 from datetime import UTC, datetime
 
 from . import db, linear, prune
 from .config import Config
 from . import decide
-from .dispatch import StageError
+from .dispatch import StageError, archive
 
 ISSUE_QUERY = "query($id: String!) { issue(id: $id) { %s } }" % linear.ISSUE_FIELDS
 STATES_QUERY = "query($id: String!) { team(id: $id) { states { nodes { id name type } } } }"
@@ -81,8 +82,10 @@ def _verdict_rows(cfg: Config, conn, run_id: str) -> list:
         v = conn.execute("SELECT * FROM verdict WHERE issue_id=? AND superseded_at IS NULL AND written_back_run IS NULL "
                          "AND kind IN ('already-done','duplicate-of') AND id NOT IN (SELECT json_extract(payload_json, "
                          "'$.verdict_id') FROM writeback WHERE status <> 'confirmed' AND json_extract(payload_json, "
-                         "'$.verdict_id') IS NOT NULL)", (s["issue_id"],)).fetchone()
-        if v is None:  # none, already written back, or pending in an unfinished run
+                         "'$.verdict_id') IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM decision WHERE kind='writeback' "
+                         "AND issue_id=verdict.issue_id AND chosen IS NULL AND void_reason IS NULL)",
+                         (s["issue_id"],)).fetchone()
+        if v is None:  # none, already written back, pending in an unfinished run, or a held write awaits the user
             continue
         issue = json.loads(s["raw_json"])
         tc = team_cfg(cfg, issue)
@@ -107,9 +110,7 @@ def plan(cfg: Config, conn, run_id: str | None) -> dict:
         rows = _verdict_rows(cfg, conn, run_id)
     else:
         rows = _dispatch_rows(cfg, conn, run_id)
-    with db.tx(conn):
-        # A write a person chose to apply anyway stays as they left it; re-planning must not bring back the hold.
-        conn.execute("DELETE FROM writeback WHERE run_id=? AND status='planned' AND approved_by IS NULL", (run_id,))
+    with db.tx(conn):  # INSERT OR IGNORE: rows already planned (agent downgrades and prose, a person's apply) stay
         conn.executemany("INSERT OR IGNORE INTO writeback(run_id, issue_id, op, payload_json, decision, rule, reason, "
                          "status) VALUES (?,?,?,?,?,?,?,?)", rows)
     return show(conn, run_id)
@@ -192,12 +193,27 @@ def _state_id(cfg: Config, issue: dict, name: str, cache: dict) -> str:
 
 def apply(cfg: Config, conn, run_id: str) -> dict:
     """Send planned apply rows (state first: a comment would bump updatedAt), ask about held ones, close the run."""
+    # 'sent' = an apply claimed the row and never finished: Linear may or may not have it. Never resend; a person
+    # checks. ponytail: an apply running concurrently right now looks the same; its row still lands, and the
+    # question is then moot.
+    for w in conn.execute("SELECT * FROM writeback WHERE run_id=? AND status='sent'", (run_id,)).fetchall():
+        key = (run_id, w["issue_id"], w["op"])
+        reason = "sent but never confirmed (an apply stopped mid-write); check Linear before deciding"
+        with db.tx(conn):
+            conn.execute("UPDATE writeback SET decision='flag', reason=? WHERE run_id=? AND issue_id=? AND op=? "
+                         "AND decision='apply'", (reason, *key))
+            decide.writeback(conn, run_id, w["issue_id"], w["op"], json.loads(w["payload_json"]), reason)
+            conn.execute("UPDATE writeback SET status='confirmed' WHERE run_id=? AND issue_id=? AND op=?", key)
     order = "CASE op WHEN 'state' THEN 0 WHEN 'description' THEN 1 WHEN 'create' THEN 2 ELSE 3 END"
     states: dict = {}
     touched: set[str] = set()
     for w in conn.execute(f"SELECT * FROM writeback WHERE run_id=? AND status IN ('planned','failed') "
                           f"ORDER BY issue_id, {order}", (run_id,)).fetchall():
         key = (run_id, w["issue_id"], w["op"])
+        # Claim it first: a second apply (cron agent + manual run) must not send it too.
+        if conn.execute("UPDATE writeback SET status='sent' WHERE run_id=? AND issue_id=? AND op=? "
+                        "AND status IN ('planned','failed')", key).rowcount != 1:
+            continue
         p = json.loads(w["payload_json"])
         decision, reason = w["decision"], w["reason"]
         try:
@@ -227,7 +243,8 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
                                                            "description": p["description"],
                                                            "stateId": _state_id(cfg, {"team": {"id": p["team_id"]}},
                                                                                 p["state"], states)}})["issueCreate"]
-                    # Record the new id before relating it, so a failed relation can never re-create the ticket.
+                    # Record the new id before relating it; the except below leaves a confirmed row alone, so a
+                    # failed relation can never re-create the ticket (the relation is then simply missing).
                     conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
                                  ("confirmed" if r["success"] else "failed", r["issue"]["identifier"], *key))
                     linear.gql(cfg, RELATE, {"input": {"issueId": r["issue"]["id"], "relatedIssueId": w["issue_id"],
@@ -242,20 +259,32 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
             if decision in ("flag", "skip"):
                 conn.execute("UPDATE writeback SET status='confirmed' WHERE run_id=? AND issue_id=? AND op=?", key)
         except Exception as e:  # one bad write never blocks the rest; failed rows retry on the next apply
-            conn.execute("UPDATE writeback SET status='failed', reason=? WHERE run_id=? AND issue_id=? AND op=?",
-                         (f"{type(e).__name__}: {e}"[:400], *key))
+            conn.execute("UPDATE writeback SET status='failed', reason=? WHERE run_id=? AND issue_id=? AND op=? "
+                         "AND status='sent'", (f"{type(e).__name__}: {e}"[:400], *key))
     # Our own writes bump updatedAt. Record the result so prune does not treat it as a ticket change and
     # re-verify (which re-plans the same comment every sweep). ponytail: a human edit landing between our
     # write and this read is also absorbed; the next human edit re-arms it.
     for issue_id in touched:
-        conn.execute("INSERT OR IGNORE INTO linear_own_write VALUES (?,?)",
-                     (issue_id, _live(cfg, issue_id)["updatedAt"]))
+        try:
+            conn.execute("INSERT OR IGNORE INTO linear_own_write VALUES (?,?)",
+                         (issue_id, _live(cfg, issue_id)["updatedAt"]))
+        except Exception as e:  # the writes landed; losing this only costs one re-verification
+            print(f"factory: reconcile: own-write read for {issue_id}: {type(e).__name__}: {e}", file=sys.stderr)
+    return {**show(conn, run_id), "unfinished": close(cfg, conn, run_id)}
+
+
+def close(cfg: Config, conn, run_id: str) -> int:
+    """Close-out once every row landed: verdicts written back, done -> reconciled -> archived. Returns rows left."""
     with db.tx(conn):  # a verdict is written back once all of its rows landed; never re-planned after
         conn.execute("UPDATE verdict SET written_back_run=? WHERE written_back_run IS NULL AND id IN ("
                      "SELECT json_extract(payload_json, '$.verdict_id') v FROM writeback WHERE run_id=? AND v IS NOT NULL "
                      "GROUP BY v HAVING min(status = 'confirmed') = 1)", (run_id, run_id))
     left = conn.execute("SELECT count(*) FROM writeback WHERE run_id=? AND status <> 'confirmed'", (run_id,)).fetchone()[0]
-    if left == 0:
-        conn.execute("UPDATE dispatch SET state='reconciled', reconciled_at=?, last_actor='factory:reconcile' "
-                     "WHERE run_id=? AND state='done'", (db.now(), run_id))
-    return {**show(conn, run_id), "unfinished": left}
+    if left == 0 and conn.execute("UPDATE dispatch SET state='reconciled', reconciled_at=?, "
+                                  "last_actor='factory:reconcile' WHERE run_id=? AND state='done'",
+                                  (db.now(), run_id)).rowcount:
+        try:  # right away: propose waits while any dispatch is reconciled; the gate retries a failure
+            archive(cfg, conn, run_id)
+        except Exception as e:
+            print(f"factory: reconcile: archive {run_id}: {type(e).__name__}: {e}", file=sys.stderr)
+    return left

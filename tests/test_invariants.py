@@ -65,6 +65,18 @@ class Invariants(unittest.TestCase):
         with self.assertRaises(sqlite3.DatabaseError):
             self.x("DELETE FROM transition_log")
 
+    def test_history_never_deleted(self):
+        for sql in ("DELETE FROM verdict WHERE id=2", "DELETE FROM dispatch WHERE run_id='d2'"):  # d2 is a draft
+            with self.subTest(sql=sql), self.assertRaisesRegex(sqlite3.DatabaseError, "never deleted"):  # not the FK
+                self.x(sql)
+
+    def test_confirmed_writeback_final(self):
+        self.x("INSERT INTO writeback(run_id,issue_id,op,payload_json,decision,rule,status) "
+               "VALUES ('d1','i1','state','{}','flag','r','confirmed')")
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.x("UPDATE writeback SET status='planned' WHERE run_id='d1'")
+        self.x("UPDATE writeback SET decision='apply', status='planned', approved_by='u' WHERE run_id='d1'")  # apply anyway
+
     def test_witness_statement_gates(self):
         drop = "DR" + "OP TABLE t"
         for q, ok in [("SELECT 1", True), ("show tables", True), ("DESCRIBE t", True), (drop, False),

@@ -11,8 +11,8 @@ propose (cron) drafts for `auto` repos, takes ★ on decisions whose time came, 
 
 ## Install
 
-`./install.sh` (idempotent): venv, `factory` on PATH, Hermes scripts/skills/cron jobs (`factory-ingest`,
-`factory-prune`, `factory-reconcile`, `factory-propose`, `factory-backup`), the planner bot's files and routine
+`./install.sh` (idempotent): venv, `factory` on PATH, Hermes scripts/skills/cron jobs (`factory-prune`,
+`factory-reconcile`, `factory-propose` (also syncs Linear), `factory-backup`), the planner bot's files and routine
 (`[bot:planner] Plan drafts`, in the `planner` profile's own cron store), the `factory` plugin (dashboard tab +
 chat tool), factory-fleet primary files.
 
@@ -43,7 +43,8 @@ One-time, by hand:
   checking / not for us, with the factory's recommended next group one tap away), **Draft** (assemble and
   revise/edit: rows are drafts, open one to see the plan's DAG — cards down a rail: dispatch → review → tickets →
   steps (branching where the plan branches) → results (PR, Linear writes), each decision hanging off the node
-  it's about, every node folded until tapped — and `+ note` on draft nodes), **Run** (staged, executing, done),
+  it's about; a ticket's steps stay folded under it ("▸ 5 steps · 1 open question") until tapped, except where a
+  question waits — and `+ note` on draft nodes), **Run** (staged, executing, done),
   and **Learn** (reconciled and the last archived ones, with write-backs in the result nodes; throughput and
   **Done for you** — what the factory answered itself this week — live here too). Dispatches are rows in an
   engineering table (stage, dispatch, tickets, progress, what waits on you, age; the columns fold on a phone).

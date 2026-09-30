@@ -150,6 +150,15 @@ class AskingLess(unittest.TestCase):
         tomorrow = decide.notify(self.cfg, self.c, now=today + timedelta(days=1))
         self.assertTrue(any(f"#{second}" in m for m in tomorrow))
 
+    def test_a_factory_drafts_review_is_pushed_once_planned_not_at_the_next_digest(self):
+        self.c.execute("UPDATE dispatch SET drafted_by=?, planned_at=? WHERE run_id='d1'", (dispatch.PROPOSE, SNAP))
+        did = decide.review(self.c, "d1", "approve", "small and safe", "agent:factory-plan")
+        evening = datetime.now().astimezone().replace(hour=22, minute=0, second=0, microsecond=0)
+        [push, *_] = decide.notify(self.cfg, self.c, now=evening)  # evening: the 09:00 digest is long gone
+        self.assertTrue(push.startswith(decide.READY) and f"#{did}" in push)
+        self.assertIsNotNone(decide.one(self.c, did)["due_at"])  # silence clock starts now, not at 09:00
+        self.assertEqual(decide.notify(self.cfg, self.c, now=evening + timedelta(minutes=10)), [])  # once
+
 
 if __name__ == "__main__":
     unittest.main()

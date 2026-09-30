@@ -342,6 +342,31 @@ function buildFlow(d, titles) {
   return { nodes: topo(nodes, edges), edges };
 }
 
+// A step (or a question on one) belongs to its ticket.
+const ownerOf = (n) => n.kind === "step" ? n.node.id.split("/")[0]
+  : n.kind === "decision" && n.decision.kind !== "writeback" && n.decision.node_id?.includes("/") ? n.decision.node_id.split("/")[0] : null;
+
+// Folded tickets hide their steps and the questions on them; edges through hidden steps reroute to the ticket.
+function fold(flow, shown) {
+  const steps = {}, asks = {};
+  flow.nodes.forEach((n) => {
+    const t = ownerOf(n);
+    if (n.kind === "step") steps[t] = (steps[t] || 0) + 1;
+    if (t && n.kind === "decision" && n.decision.open) asks[t] = (asks[t] || 0) + 1;
+  });
+  const hide = (n) => { const t = ownerOf(n); return t && !shown.has(t); };
+  const byId = Object.fromEntries(flow.nodes.map((n) => [n.id, n]));
+  const to = (id) => { const n = byId[id]; if (!hide(n)) return id; return n.kind === "step" ? `t:${ownerOf(n)}` : null; };
+  const seen = new Set(), edges = [];
+  flow.edges.forEach((e) => {
+    const s = to(e.s), t = to(e.t), k = `${s}>${t}`;
+    if (s && t && s !== t && !seen.has(k)) { seen.add(k); edges.push({ ...e, s, t }); }
+  });
+  const nodes = flow.nodes.filter((n) => !hide(n)).map((n) => n.kind === "ticket" && steps[n.node.id]
+    ? { ...n, steps: steps[n.node.id], asks: asks[n.node.id] || 0, folded: !shown.has(n.node.id) } : n);
+  return { nodes: topo(nodes, edges), edges };
+}
+
 // Kahn's algorithm, ties broken by build order, so every edge points down the page.
 function topo(nodes, edges) {
   const pos = Object.fromEntries(nodes.map((n, i) => [n.id, i]));
@@ -489,6 +514,7 @@ function FlowCard({ n, d, open, onToggle, onDone, draft, cardRef, i }) {
           {n.card ? <Tone tone={CARD_TONE[n.card.card_status]}>{CARD[n.card.card_status]}</Tone> : null}</div>
         <div className="fx-title small">{n.title}</div>
         {open && n.node.detail ? <div className="fx-pre">{n.node.detail}</div> : null}
+        {n.steps ? <div className="fx-hint fx-fold-hint">{n.folded ? "▸" : "▾"} {plural(n.steps, "step")}{n.asks ? ` · ${plural(n.asks, "open question")}` : ""}</div> : null}
         <Notes notes={n.node.notes} />
         {draft ? <NoteBox run={d.run_id} nodeId={n.node.id} onDone={onDone} /> : null}
       </>);
@@ -526,9 +552,15 @@ function FlowCard({ n, d, open, onToggle, onDone, draft, cardRef, i }) {
 }
 
 function Flow({ d, titles, onDone, focusNode }) {
-  const flow = useMemo(() => buildFlow(d, titles), [d, titles]);
+  const full = useMemo(() => buildFlow(d, titles), [d, titles]);
+  const focusOwner = (id) => { const n = full.nodes.find((x) => x.id === id); return n && ownerOf(n); };
+  // Folded by default; tickets with open step questions (and the focused node's ticket) start unfolded.
+  const [shown, setShown] = useState(() => new Set(full.nodes.map((n) => n.kind === "decision" && n.decision.open ? ownerOf(n) : null)
+    .concat(focusOwner(focusNode)).filter(Boolean)));
+  const flow = useMemo(() => fold(full, shown), [full, shown]);
   const layout = useMemo(() => lanes(flow.nodes, flow.edges), [flow]);
   const [open, setOpen] = useState(focusNode || null);
+  const pending = useRef(focusNode || null);
   const refs = useRef([]);
   const box = useRef(null);
   const [ys, setYs] = useState([]);
@@ -543,10 +575,18 @@ function Flow({ d, titles, onDone, focusNode }) {
   }, [measure]);
   useEffect(() => {
     if (!focusNode) return;
+    const t = focusOwner(focusNode);
+    if (t) setShown((s) => (s.has(t) ? s : new Set(s).add(t)));
     setOpen(focusNode);
-    const i = flow.nodes.findIndex((n) => n.id === focusNode);
+    pending.current = focusNode;
+  }, [focusNode]);
+  useEffect(() => {  // scroll once the focused node is visible, not on every refresh
+    const i = flow.nodes.findIndex((n) => n.id === pending.current);
+    if (i < 0) return;
+    pending.current = null;
     refs.current[i]?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [focusNode, flow]);
+  }, [flow]);
+  const toggleFold = (t) => setShown((s) => { const x = new Set(s); x.has(t) ? x.delete(t) : x.add(t); return x; });
   const lit = useMemo(() => {  // the open card and everything downstream of it: what it leads to
     if (!open) return null;
     const s = new Set([open]), stack = [open];
@@ -562,7 +602,7 @@ function Flow({ d, titles, onDone, focusNode }) {
         <div key={n.id} className={`fx-flow-row${lit && !lit.has(n.id) ? " dim" : ""}`}
              style={{ paddingLeft: `${width + (layout.lane[n.id] > 0 && n.attach ? 0 : 0)}px` }}>
           <FlowCard n={n} d={d} i={i} draft={draft} open={open === n.id} cardRef={(el) => { refs.current[i] = el; }}
-                    onToggle={() => setOpen(open === n.id ? null : n.id)} onDone={onDone} />
+                    onToggle={() => { if (n.steps) toggleFold(n.node.id); setOpen(open === n.id ? null : n.id); }} onDone={onDone} />
         </div>
       ))}
     </div>
@@ -673,7 +713,7 @@ function Tickets({ data, onDone }) {
 }
 
 // ---- health + throughput -------------------------------------------------------------------------------------
-const JOB_NAME = { "factory-ingest": "Linear sync", "factory-prune": "Verification", "[bot:planner] Plan drafts": "Planning",
+const JOB_NAME = { "factory-prune": "Verification", "[bot:planner] Plan drafts": "Planning",
                    "factory-propose": "Proposals", "factory-reconcile": "Write-back", "factory-backup": "Backup" };
 function Health({ jobs }) {
   const name = (j) => JOB_NAME[j.name] || j.name;
@@ -715,7 +755,6 @@ function FactoryPage() {
   const [toast, setToast] = useState(null);
   const [showTp, setShowTp] = useState(false);
   const [, tick] = useState(0);
-  const flowRef = useRef(null);
   const inflight = useRef(false);
   const again = useRef(false);
   const load = useCallback(() => {  // one refresh at a time; a change mid-flight refreshes once more after
@@ -791,7 +830,6 @@ function FactoryPage() {
     setTab(stageOf(run));
     setSel(x.run_id);
     setFocus(x.kind === "review" ? "gate" : `d:${x.id}`);
-    setTimeout(() => flowRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
   };
   const pick = (runId) => { setSel(runId); setFocus(null); };
   const switchTab = (stage) => { setTab(stage); setSel(null); setFocus(null); };
@@ -832,7 +870,7 @@ function FactoryPage() {
           <Tickets data={data} onDone={done} />
         </section>
       ) : (
-        <section className="fx-sec" ref={flowRef}>
+        <section className="fx-sec">
           {list.length ? (<>
             <StageTable dispatches={list} titles={titles} needsOf={needsOf} selected={current} onSelect={pick} />
             {current ? <Flow key={current.run_id} d={current} titles={titles} onDone={done} focusNode={focus} /> : null}

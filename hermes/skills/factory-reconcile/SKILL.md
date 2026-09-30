@@ -30,6 +30,8 @@ A `create` row is a new follow-up ticket split out of `identifier`; its
 Use only `~/.local/bin/factory`. Never query the database, run scripts, or call
 Linear any other way: everything you need is in the gate JSON and
 `factory ticket <IDENT>`.
+`factory ticket <IDENT>` prints JSON; read it as is. Do not use pipes, heredocs,
+`$(...)` or `-c`: the terminal's security scan blocks them.
 
 ## Per run
 

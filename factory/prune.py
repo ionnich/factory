@@ -56,7 +56,12 @@ def owned_in_scope(cfg: Config, conn) -> list:
     if not conn.execute("SELECT 1 FROM linear_project LIMIT 1").fetchone():
         raise NotOwned("linear_project is empty; run factory ingest")
     review = {k: t.get("review_state") for k, t in cfg.linear.get("team", {}).items()}
-    return [s for s in conn.execute("SELECT * FROM linear_latest WHERE in_scope=1") if owned(cfg, conn, s)
+    # Tickets in a staged/executing/finished dispatch are frozen; drafts still get re-judged (staleness on approve).
+    busy = {r[0] for r in conn.execute(
+        "SELECT t.issue_id FROM dispatch_ticket t JOIN dispatch d USING (run_id) "
+        "WHERE d.state IN ('staged','executing','done','reconciled')")}
+    return [s for s in conn.execute("SELECT * FROM linear_latest WHERE in_scope=1")
+            if s["issue_id"] not in busy and owned(cfg, conn, s)
             and (raw := json.loads(s["raw_json"]))["state"]["name"] != review.get(raw["team"]["key"])]
 
 
