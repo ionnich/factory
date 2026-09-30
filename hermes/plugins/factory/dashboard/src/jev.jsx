@@ -10,7 +10,7 @@ const h = React.createElement;
 
 const CATEGORY = {
   investigate: ["amber", "Investigation requested", "Jev sees missing factual investigation before this can be answered."],
-  policy: ["blue", "Policy", "Jev matches an approved house rule."],
+  policy: ["blue", "Policy", "Jev sees a policy or convention call; no approved house rule matched."],
   human: ["amber", "Human tradeoff", "Jev sees a genuine preference or permission call."],
   unclear: ["gray", "Uncertain", "Jev could not place this as investigation, policy or preference."],
 };
