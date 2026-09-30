@@ -34,6 +34,16 @@
            background: var(--n); vertical-align: middle; }
 .fx-live.on { background: var(--g); animation: fx-pulse 2.4s ease-in-out infinite; }
 @keyframes fx-pulse { 50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--g) 25%, transparent); } }
+/* Needs you: a native disclosure whose summary is the page's headline; open, one link per thing waiting on you */
+.fx-needs-menu > summary { cursor: pointer; list-style: none; }
+.fx-needs-menu > summary::-webkit-details-marker { display: none; }
+.fx-needs-menu > summary::after { content: "▾"; margin-left: .4rem; font-size: .55em; vertical-align: middle; color: var(--color-muted-foreground); }
+.fx-needs-menu[open] > summary::after { content: "▴"; }
+.fx-needs-list { list-style: none; margin: .5rem 0 .6rem; padding: 0; display: grid; gap: .35rem; }
+.fx-need { display: grid; gap: .2rem; width: 100%; text-align: left; font: inherit; font-size: .86rem; color: inherit; cursor: pointer;
+           padding: .5rem .7rem; border-radius: 12px; border: 1px solid var(--color-border); background: var(--color-card);
+           overflow-wrap: anywhere; transition: border-color .15s; }
+.fx-need:hover { border-color: var(--color-foreground); }
 
 /* the deck */
 .fx-deck { margin-bottom: 1.75rem; }
@@ -97,19 +107,27 @@
 
 /* sections */
 .fx-sec { margin: 1.5rem 0; }
-.fx-sec > h2 { font-size: 1.05rem; font-weight: 700; margin: 0 0 .6rem; display: flex; gap: .5rem; align-items: baseline; }
 .fx-count { font-size: .75rem; font-weight: 600; padding: 0 .45rem; border-radius: 999px; border: 1px solid var(--color-border);
             color: var(--color-muted-foreground); }
 
-/* lifecycle stages: tab strip + engineering table */
+/* lifecycle: the stage tabs, Learn and Costs set apart after them, one strip that scrolls sideways; the open pane below */
 .fx-stage-tabs { display: flex; gap: .4rem; overflow-x: auto; margin: 0 0 1rem; padding: 4px 4px .3rem; scrollbar-width: none; }
 .fx-stage-tabs::-webkit-scrollbar { display: none; }
+.fx-tabs { display: flex; gap: .4rem; flex: 0 0 auto; }
+.fx-tabs + .fx-tabs { padding-left: .6rem; border-left: 1px solid var(--color-border); }
 .fx-stage-tab { flex: 0 0 auto; display: inline-flex; gap: .35rem; align-items: center; padding: .45rem .9rem; border-radius: 999px;
                 border: 1px solid var(--color-border); background: var(--color-card); color: var(--color-muted-foreground);
                 font: inherit; font-size: .85rem; font-weight: 600; cursor: pointer; transition: border-color .15s, color .15s, transform .15s var(--spring); }
 .fx-stage-tab:hover { transform: translateY(-1px); color: var(--color-foreground); }
 .fx-stage-tab.on { border-color: var(--b); color: var(--b); box-shadow: 0 0 0 3px color-mix(in srgb, var(--b) 15%, transparent); }
 .fx-stage-tab.on .fx-count { border-color: var(--b); color: var(--b); }
+/* keyboard focus shows wherever it lands: tabs, Needs you, rows, the pane, and a card or question a link focused */
+.fx-stage-tab:focus-visible, .fx-need:focus-visible, .fx-needs-menu > summary:focus-visible, .fx-tr:focus-visible,
+.fx-pane:focus-visible { outline: 2px solid var(--b); outline-offset: 2px; }
+.fx-pane [id^="fx-d-"]:focus-visible { outline: 2px solid var(--b); outline-offset: -2px; }
+.fx-line { margin: 0 0 .75rem; }
+.fx-moved { margin: .75rem 0; padding: .55rem .75rem; border: 1px dashed var(--color-border); border-radius: 12px; }
+.fx-audit { list-style: none; margin: 0; padding: 0; display: grid; gap: .15rem; font-size: .8rem; color: var(--color-muted-foreground); }
 .fx-table { display: grid; gap: .35rem; }
 .fx-thead { display: grid; grid-template-columns: 6.5rem minmax(0, 1fr) minmax(8rem, 13rem) 4.5rem 3.2rem 4rem;
             gap: .6rem; padding: 0 .75rem .15rem; font-size: .68rem; text-transform: uppercase; letter-spacing: .08em;
@@ -214,7 +232,7 @@
   .fx-hello { font-size: 1.35rem; }
   .fx-q { font-size: 1.08rem; }
   .fx-carousel { margin: 0 -.6rem; padding-left: .6rem; padding-right: .6rem; }
-  .fx-stage-tabs { gap: .3rem; }
+  .fx-stage-tabs, .fx-tabs { gap: .3rem; }
   .fx-stage-tab { padding: .45rem .55rem; }  /* the strip heads the page: tighter, so a phone rarely scrolls it sideways */
 }
 .fx-cost { list-style: none; margin: 0; padding: 0; display: grid; gap: .35rem; font-size: .82rem; }
@@ -290,7 +308,8 @@
              padding: 1rem 1rem calc(1rem + env(safe-area-inset-bottom)); background: var(--color-card); border-radius: 16px 16px 0 0;
              animation: fx-rise .35s var(--spring) both; }
 .fx-ev { margin: 0 0 0 1rem; font-size: .78rem; color: var(--color-muted-foreground); overflow-wrap: anywhere; }
-.fx-quick { margin: -1rem 0 1.5rem; padding: .6rem .8rem; border-radius: 14px; border: 1px solid var(--color-border); background: var(--color-card); }
+.fx-quick { margin: 0 0 1.5rem; padding: .6rem .8rem; border-radius: 14px; border: 1px solid var(--color-border); background: var(--color-card); }
+.fx-deck + .fx-quick { margin-top: -1rem; }  /* tucked under the deck when there is one */
 .fx-quick ul { list-style: none; margin: .4rem 0 0; padding: 0; display: grid; gap: .4rem; font-size: .86rem; }
 .fx-quick-row { overflow-wrap: anywhere; }
 .fx-quick-head { display: block; width: 100%; padding: 0; border: 0; background: none; font: inherit; color: inherit;
