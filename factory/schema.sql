@@ -372,14 +372,17 @@ WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
   OR (OLD.due_at IS NOT NULL AND NEW.due_at IS NOT OLD.due_at)
 BEGIN SELECT RAISE(ABORT, 'a decision''s clock (notified_at, due_at) is set once, while it is open'); END;
 
--- What the factory told the user in the factory Bot Chat (Hermex): pushes when work is stopped on them (capped
--- per day) and the digest at notify.digest times (one per slot, recorded even when it had nothing to say).
+-- Prepared pushes/digests, bound to the exact Hermes cron execution that carries stdout to Bot Chat.
+-- delivered_at requires its successful delivery receipt; preparation alone never starts a decision clock.
 CREATE TABLE notice (
   id   INTEGER PRIMARY KEY,
   kind TEXT NOT NULL CHECK (kind IN ('push', 'digest')),
   slot TEXT UNIQUE,                          -- digest: the local 'YYYY-MM-DD HH:MM' it is for
   body TEXT NOT NULL,
-  at   TEXT NOT NULL
+  at   TEXT NOT NULL,
+  execution_id TEXT,
+  decision_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(decision_ids_json)),
+  delivered_at TEXT
 );
 
 -- Cost ledger: each factory agent session (Hermes crons/chats, fleet captain/secondmates/crews) with its tokens

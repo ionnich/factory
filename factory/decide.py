@@ -6,6 +6,8 @@ ones whose time came; `notify` pushes the ones that stop work and puts the rest 
 takes ★ only for kinds where the user's last answer agreed with it; EARNED_AFTER straight ★ answers and the
 factory stops asking that kind."""
 import json
+import os
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 from . import db, dispatch
@@ -191,6 +193,8 @@ def _silent(conn, d) -> timedelta | None:
 
 def _deadline(conn, d) -> tuple[str | None, str]:
     """When ★ is taken without the user, and what happens if they stay silent."""
+    if d["kind"] == "ask":
+        return None, "it waits for your confirmed answer; that work is stopped until you answer"
     if d["tier"] == "auto":
         return d["due_at"], "the factory takes ★ on its next pass (a few minutes)"
     if d["due_at"]:
@@ -200,7 +204,8 @@ def _deadline(conn, d) -> tuple[str | None, str]:
     if d["tier"] == "now":
         return None, "it waits for you; that work is stopped until you answer"
     if (s := _silent(conn, d)) and not d["notified_at"]:
-        return None, f"it goes in the next digest; ★ is taken {s.total_seconds() / 3600:g}h after that"
+        return None, (f"delivery is not confirmed; it waits for you until then, then takes ★ "
+                      f"{s.total_seconds() / 3600:g}h after confirmed Bot Chat delivery")
     if d["kind"] in SILENT and streak(conn, d["kind"]) == 0:
         return None, "it waits for you (you overrode ★ on this kind last time)"
     return None, "it waits for you"
@@ -387,7 +392,10 @@ def sweep(cfg, conn) -> list[dict]:
     that can no longer start (a ticket moved under the plan) is rejected instead; anything else that no longer
     applies is withdrawn."""
     done = []
-    for (did,) in conn.execute(f"SELECT id FROM decision WHERE {OPEN} AND due_at <= ? ORDER BY id", (db.now(),)).fetchall():
+    for (did,) in conn.execute(
+            f"SELECT id FROM decision WHERE {OPEN} AND kind <> 'ask' AND due_at <= ? AND (tier='auto' OR EXISTS "
+            "(SELECT 1 FROM notice n, json_each(n.decision_ids_json) j "
+            "WHERE j.value=decision.id AND n.delivered_at IS NOT NULL)) ORDER BY id", (db.now(),)).fetchall():
         d = one(conn, did)
         if not d["open"]:
             continue  # an earlier answer in this pass withdrew it (a rejected draft's questions)
@@ -447,24 +455,65 @@ def _line(conn, d, due: str | None, now: datetime) -> str:
         q = d["question"]
     silent = ("waits for you" if not due else
               f"starts {_local(due, now)}" if rec["id"] == "approve" else f"★ at {_local(due, now)}")
+    if not due and (window := _silent(conn, d)):
+        silent = f"★ {window.total_seconds() / 3600:g}h after confirmed Bot Chat delivery; waits until confirmed"
     return f"#{d['id']} {q} ★ {rec['label']}: {_clip(d['why'], 70)} Silent: {silent}"
 
 
-def _mark(conn, ds: list, dues: dict, now: datetime) -> None:
-    """They reached the user: set each clock once (the silence window starts now)."""
-    for d in ds:
-        conn.execute("UPDATE decision SET notified_at=? WHERE id=? AND notified_at IS NULL", (_iso(now), d["id"]))
-        if dues.get(d["id"]) and not d["due_at"]:
-            conn.execute("UPDATE decision SET due_at=? WHERE id=? AND due_at IS NULL", (dues[d["id"]], d["id"]))
+def notification_execution(cfg) -> str | None:
+    """Bind the exec-based proposal script to its exact Hermes cron execution, never the latest run."""
+    root = cfg.db.parent / "cron"
+    if not (root / "executions.db").exists() or not (root / "jobs.json").exists():
+        return None
+    jobs = json.loads((root / "jobs.json").read_text())
+    jobs = jobs.get("jobs", []) if isinstance(jobs, dict) else jobs
+    ids = {j["id"] for j in jobs if j.get("name") == "factory-propose"
+           and j.get("deliver") == "bot-chat:factory" and j.get("script") == "factory-propose.sh"
+           and j.get("no_agent") is True}
+    with sqlite3.connect((root / "executions.db").resolve().as_uri() + "?mode=ro", uri=True) as receipts:
+        runs = receipts.execute("SELECT id, job_id FROM executions WHERE status='running' AND pid=?",
+                                (os.getppid(),)).fetchall()
+    matches = [r[0] for r in runs if r[1] in ids]
+    return matches[0] if len(matches) == 1 else None
+
+
+def acknowledge_notifications(cfg, conn) -> list[int]:
+    """Only a successful, delivered cron receipt starts silence; unknown/queued/failed never do."""
+    path = cfg.db.parent / "cron" / "executions.db"
+    pending = conn.execute("SELECT * FROM notice WHERE execution_id IS NOT NULL AND delivered_at IS NULL").fetchall()
+    if not pending or not path.exists():
+        return []
+    acknowledged = []
+    with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as receipts, db.tx(conn):
+        for n in pending:
+            receipt = receipts.execute(
+                "SELECT finished_at FROM executions WHERE id=? AND status='completed' AND delivery_outcome='delivered'",
+                (n["execution_id"],)).fetchone()
+            if not receipt or not receipt[0]:
+                continue
+            delivered = datetime.fromisoformat(receipt[0])
+            if delivered.tzinfo is None or not datetime.fromisoformat(n["at"]) <= delivered <= datetime.now(UTC):
+                continue
+            for did in json.loads(n["decision_ids_json"]):
+                d = one(conn, did)
+                if d is None or not d["open"] or d["notified_at"]:
+                    continue
+                window = _silent(conn, d)
+                conn.execute("UPDATE decision SET notified_at=?, due_at=coalesce(due_at,?) WHERE id=?",
+                             (_iso(delivered), _iso(delivered + window) if window else None, did))
+            conn.execute("UPDATE notice SET delivered_at=? WHERE id=?", (_iso(delivered), n["id"]))
+            acknowledged.append(n["id"])
+    return acknowledged
 
 
 READY = "Factory · ready to start"
 
 
-def notify(cfg, conn, swept: list | None = None, now: datetime | None = None) -> list[str]:
+def notify(cfg, conn, swept: list | None = None, now: datetime | None = None, *,
+           execution_id: str | None = None) -> list[str]:
     """Messages for the factory Bot Chat now. A push when work is stopped on the user (at most
     notify.interrupts_per_day a day; the rest wait for the digest) or an emergency started without review; the
-    digest at notify.digest times (local): everything waiting, what silence does, what the factory did on its own."""
+    digest at notify.digest times (local). Without a bound cron execution this is a non-consuming preview."""
     n = cfg.raw.get("notify", {})
     now = now or datetime.now(UTC)
     url, msgs = n.get("url", ""), []
@@ -472,30 +521,34 @@ def notify(cfg, conn, swept: list | None = None, now: datetime | None = None) ->
         midnight = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
         pushed = conn.execute("SELECT count(*) FROM notice WHERE kind='push' AND at >= ? AND body NOT LIKE ?",
                               (_iso(midnight), f"{READY}%")).fetchone()[0]
+        prepared = {r[0] for r in conn.execute("SELECT value FROM notice, json_each(decision_ids_json)")}
+        pushed_ids = []
         push = [f"Emergency: dispatch {s.get('run_id')} started without review ({s['because']})."
                 for s in swept or () if s["kind"] == "review" and s["because"].startswith("emergency")
                 and s.get("chosen") == "approve"]
-        urgent = [d for d in rows(conn) if d["tier"] == "now" and not d["notified_at"]]
+        urgent = [d for d in rows(conn) if d["tier"] == "now" and not d["notified_at"] and d["id"] not in prepared]
         if urgent and pushed < n.get("interrupts_per_day", 3):
             push += ["Factory · needs you now", *(_line(conn, d, None, now) for d in urgent),
                      f'Reply "ok" to take ★, or "#{urgent[0]["id"]} <option>". {url}'.rstrip()]
-            _mark(conn, urgent, {}, now)
+            pushed_ids += [d["id"] for d in urgent]
         # A factory draft's review goes out once its plan is written, not at the next digest: only one dispatch runs
         # at a time, so a review waiting overnight idles the factory. Not counted against interrupts_per_day.
-        ready = [d for d in rows(conn) if d["kind"] == "review" and not d["notified_at"] and _silent(conn, d)]
+        ready = [d for d in rows(conn) if d["kind"] == "review" and not d["notified_at"]
+                 and d["id"] not in prepared and _silent(conn, d)]
         if ready:
-            dues = {d["id"]: _iso(now + _silent(conn, d)) for d in ready}
-            push += [READY, *(_line(conn, d, dues[d["id"]], now) for d in ready),
+            push += [READY, *(_line(conn, d, None, now) for d in ready),
                      f'Reply "ok" to take ★, or "#{ready[0]["id"]} hold: why". {url}'.rstrip()]
-            _mark(conn, ready, dues, now)
+            pushed_ids += [d["id"] for d in ready]
         if push:
-            conn.execute("INSERT INTO notice(kind, body, at) VALUES ('push', ?, ?)", ("\n".join(push), _iso(now)))
+            if execution_id:
+                conn.execute("INSERT INTO notice(kind, body, at, execution_id, decision_ids_json) "
+                             "VALUES ('push', ?, ?, ?, ?)",
+                             ("\n".join(push), _iso(now), execution_id, json.dumps(pushed_ids)))
             msgs.append("\n".join(push))
         slot = _slot(now, n.get("digest", ["09:00", "17:00"]))
         if slot and not conn.execute("SELECT 1 FROM notice WHERE slot=?", (slot,)).fetchone():
             listed = sorted((d for d in rows(conn) if d["tier"] != "auto" and d["kind"] != "plan"),
                             key=lambda d: (d["tier"] != "now", d["id"]))
-            dues = {d["id"]: d["due_at"] or ((s := _silent(conn, d)) and _iso(now + s)) for d in listed}
             last = conn.execute("SELECT max(at) FROM notice WHERE kind='digest'").fetchone()[0]
             auto = done_for_you(conn, max(filter(None, [last, _iso(now - timedelta(days=1))])))
             lines = []
@@ -504,7 +557,7 @@ def notify(cfg, conn, swept: list | None = None, now: datetime | None = None) ->
                 lines.append(f"Factory digest · {now.astimezone():%H:%M} · " + (
                     f"{len(listed)} waiting on you" + (f" ({urgent_n} urgent)" if urgent_n else "") if listed
                     else "nothing waiting on you"))
-                lines += [_line(conn, d, dues[d["id"]], now) for d in listed]
+                lines += [_line(conn, d, d["due_at"], now) for d in listed]
                 if listed:
                     lines.append(f'Reply "ok" to take every ★, or "#{listed[0]["id"]} <option>", '
                                  f'"#{listed[0]["id"]} hold: why". {url}'.rstrip())
@@ -512,9 +565,10 @@ def notify(cfg, conn, swept: list | None = None, now: datetime | None = None) ->
                     lines.append("Done for you: " + "; ".join(
                         f"#{d['id']} {_clip(d['question'], 50)} → {next(o['label'] for o in d['options'] if o['id'] == d['chosen'])}"
                         f" ({d['chosen_by'].removeprefix(AUTO).strip(' ()') or d['chosen_by']})" for d in auto))
-            _mark(conn, listed, dues, now)
-            conn.execute("INSERT INTO notice(kind, slot, body, at) VALUES ('digest', ?, ?, ?)",
-                         (slot, "\n".join(lines), _iso(now)))
+            if execution_id:
+                conn.execute("INSERT INTO notice(kind, slot, body, at, execution_id, decision_ids_json) "
+                             "VALUES ('digest', ?, ?, ?, ?, ?)",
+                             (slot, "\n".join(lines), _iso(now), execution_id, json.dumps([d["id"] for d in listed])))
             if lines:
                 msgs.append("\n".join(lines))
     return msgs

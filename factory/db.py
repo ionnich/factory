@@ -361,6 +361,18 @@ CREATE UNIQUE INDEX ask_one_pending ON ask(decision_id) WHERE status = 'pending'
 CREATE TRIGGER dispatch_step_no_delete BEFORE DELETE ON dispatch_step
 WHEN (SELECT state FROM dispatch WHERE run_id = OLD.run_id) IS NOT 'draft'
 BEGIN SELECT RAISE(ABORT, 'the plan is frozen once the dispatch leaves draft'); END;""",
+    # v18: only acknowledged Bot Chat delivery starts silence; old open clocks have no receipt.
+    18: """ALTER TABLE notice ADD COLUMN execution_id TEXT;
+ALTER TABLE notice ADD COLUMN decision_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(decision_ids_json));
+ALTER TABLE notice ADD COLUMN delivered_at TEXT;
+DROP TRIGGER decision_clock;
+UPDATE decision SET notified_at=NULL, due_at=NULL
+WHERE chosen IS NULL AND void_reason IS NULL AND tier <> 'auto';
+CREATE TRIGGER decision_clock BEFORE UPDATE OF notified_at, due_at ON decision
+WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
+  OR (OLD.notified_at IS NOT NULL AND NEW.notified_at IS NOT OLD.notified_at)
+  OR (OLD.due_at IS NOT NULL AND NEW.due_at IS NOT OLD.due_at)
+BEGIN SELECT RAISE(ABORT, 'a decision''s clock (notified_at, due_at) is set once, while it is open'); END;""",
 }
 
 

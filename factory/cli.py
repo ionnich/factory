@@ -64,9 +64,12 @@ def cmd_handoff(cfg, conn, a):
 def cmd_propose(cfg, conn, a):
     """Cron: ingest, move dispatches along, take ★ where its time came, and say what the user needs to hear."""
     ingest(cfg, conn)
+    acknowledged = decide.acknowledge_notifications(cfg, conn)
     res = dispatch.propose(cfg, conn)
+    res["acknowledged_notices"] = acknowledged
     res["swept"] = decide.sweep(cfg, conn)
-    msgs = decide.notify(cfg, conn, res["swept"])
+    execution_id = decide.notification_execution(cfg) if a.announce else None
+    msgs = decide.notify(cfg, conn, res["swept"], execution_id=execution_id)
     try:  # the cost ledger is derived data: a failed sync never costs the user a push or digest
         costs.sync(conn, cfg.db.parent)
     except Exception as e:
