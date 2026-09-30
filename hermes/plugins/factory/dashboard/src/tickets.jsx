@@ -1,10 +1,11 @@
-// Tickets tab: every ticket in scope or ever touched (overview `all_tickets`), filtered by what it needs, newest
-// activity first. Ready tickets can be picked into a draft. A row opens a bottom sheet with the ticket's current
-// verdict and evidence, and its timeline (`/tickets/{id}/timeline`): everything the factory saw and did, oldest first.
+// Tickets tab: every ticket in scope or ever touched (`GET /tickets`, fetched while the tab is open and again on each
+// overview refresh), filtered by what it needs, newest activity first. Ready tickets can be picked into a draft. A row
+// opens a bottom sheet with the ticket's current verdict and evidence, and its timeline (`/tickets/{id}/timeline`):
+// everything the factory saw and did, oldest first.
 //
-// all_tickets row: {identifier, title, url, domain?, assignee?, linear_state, state_type, in_scope?, in_review?, owned?,
-//   context?, unmapped_reason?, freshness?, verdict?: {kind, target, reason}, dispatch?: {run_id, state, card_status,
-//   pr_url?}, last_at?}. Absent keys mean null/false (the server drops them to keep the overview small).
+// ticket row: {identifier, title, url, group: ready|answer|stale|dispatch|done|not, domain?, assignee?, linear_state,
+//   state_type, in_scope?, in_review?, owned?, context?, unmapped_reason?, freshness?, verdict?: {kind, target, reason},
+//   dispatch?: {run_id, state, card_status, pr_url?}, last_at?}. Absent keys mean null/false (the server drops them).
 // timeline event: {at, kind: linear|own-write|verdict|dispatch|note|decision|card|writeback, actor, summary, detail?}.
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
@@ -34,19 +35,21 @@ const EMPTY = { ready: "Nothing verified and free right now.", answer: "No quest
                 stale: "Every verdict is current.", dispatch: "No ticket is in a live dispatch.", done: "Nothing done yet.",
                 not: "Nothing set aside." };
 
-export function groupOf(t, skipped) {
+// Why a row sits in its group (the server picks the group: cli.py `group`).
+function whyOf(t, skipped) {
   const v = t.verdict, d = t.dispatch;
-  if (d && d.state !== "archived") return { group: "dispatch", why: `${d.run_id} · ${d.state} · card ${CARD[d.card_status]}` };
-  if (!t.owned) return { group: "not", why: t.domain ? `${t.domain}: another lead's Domain` : "No Domain: line" };
-  if (["completed", "canceled", "duplicate"].includes(t.state_type)) return { group: "done", why: `${t.linear_state} in Linear` };
-  if (t.in_review) return { group: "done", why: `${t.linear_state}: waits on a person` };
-  if (!t.in_scope) return { group: "not", why: `${t.linear_state}: out of scope in Linear` };
-  if (!t.context) return { group: "not", why: t.unmapped_reason || "No repo is mapped for this domain" };
-  if (!v || t.freshness !== "fresh") return { group: "stale", why: RECHECK[t.freshness] || "Queued for verification" };
-  if (v.kind === "valid") return skipped[t.identifier] ? { group: "not", why: skipped[t.identifier] } : { group: "ready", why: v.reason };
-  if (v.kind === "needs-clarification") return { group: "answer", why: v.reason };
-  if (v.kind === "invalid-references") return { group: "answer", why: `${v.target}: ${v.reason}` };
-  return { group: "not", why: `${v.kind === "duplicate-of" ? `Duplicate of ${v.target}` : v.kind.replace("-", " ")}: ${v.reason}` };
+  switch (t.group) {
+    case "dispatch": return `${d.run_id} · ${d.state} · card ${CARD[d.card_status]}`;
+    case "done": return t.in_review ? `${t.linear_state}: waits on a person` : `${t.linear_state} in Linear`;
+    case "stale": return RECHECK[t.freshness] || "Queued for verification";
+    case "ready": return v.reason;
+    case "answer": return v.kind === "invalid-references" ? `${v.target}: ${v.reason}` : v.reason;
+  }
+  if (!t.owned) return t.domain ? `${t.domain}: another lead's Domain` : "No Domain: line";
+  if (!t.in_scope) return `${t.linear_state}: out of scope in Linear`;
+  if (!t.context) return t.unmapped_reason || "No repo is mapped for this domain";
+  if (skipped[t.identifier]) return skipped[t.identifier];
+  return `${v.kind === "duplicate-of" ? `Duplicate of ${v.target}` : v.kind.replace("-", " ")}: ${v.reason}`;
 }
 
 function Row({ t, why, pick, onOpen }) {
@@ -146,21 +149,26 @@ export function TicketsTab({ data, onDone }) {
   const [err, setErr] = useState(null);
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(null);
-  const all = data.all_tickets || [];
+  const [all, setAll] = useState(null);
+  const [loadErr, setLoadErr] = useState(null);
+  useEffect(() => {  // mounted only while the tab shows; `data` is a new object on every overview refresh
+    SDK.fetchJSON(`${API}/tickets`).then((x) => { setAll(x); setLoadErr(null); }, (e) => setLoadErr(errText(e)));
+  }, [data]);
+  const counts = data.ticket_counts || {};
+  const [filter, setFilter] = useState(counts.answer && !counts.ready ? "answer" : "ready");
   const max = data.candidates?.max_tickets || 0;
   const stageable = (data.candidates?.candidates || []).map((c) => c.identifier);
   const suggested = (data.candidates?.suggested || []).filter((i) => stageable.includes(i));
   const sel = picked.filter((i) => stageable.includes(i));
   const skipped = Object.fromEntries((data.candidates?.skipped || []).map((x) => [x.identifier, x.reason]));
   const groups = { ready: [], answer: [], stale: [], dispatch: [], done: [], not: [] };
-  const rows = all.map((t) => ({ t, ...groupOf(t, skipped) }))
+  const rows = (all || []).map((t) => ({ t, group: t.group, why: whyOf(t, skipped) }))
     .sort((a, b) => (Date.parse(b.t.last_at) || 0) - (Date.parse(a.t.last_at) || 0));
   rows.forEach((r) => groups[r.group].push(r));
-  const [filter, setFilter] = useState(groups.answer.length && !groups.ready.length ? "answer" : "ready");
   const needle = q.trim().toLowerCase();
   // A search looks through every ticket, whatever the filter.
   const shown = needle ? rows.filter(({ t }) => `${t.identifier} ${t.title}`.toLowerCase().includes(needle)) : groups[filter];
-  const titles = Object.fromEntries(all.map((t) => [t.identifier, t.title]));
+  const titles = Object.fromEntries((data.candidates?.candidates || []).map((c) => [c.identifier, c.title]));
   const draft = (ids) => {
     setBusy(true); setErr(null);
     SDK.fetchJSON(`${API}/stage`, { method: "POST", headers: { "Content-Type": "application/json" },
@@ -168,14 +176,14 @@ export function TicketsTab({ data, onDone }) {
       .then(() => { setBusy(false); setPicked([]); onDone({}, null, "Drafted; a planner is writing the plan"); },
             (e) => { setBusy(false); setErr(errText(e)); });
   };
-  const current = open && all.find((t) => t.identifier === open);
+  const current = open && (all || []).find((t) => t.identifier === open);
   return (
     <>
       <Input className="fx-search" type="search" placeholder="Search id or title" value={q} onChange={(e) => setQ(e.target.value)} />
       <div className="fx-chips" role="tablist" aria-label="Ticket filter">
         {FILTERS.map(([k, label]) => (
           <button key={k} role="tab" aria-selected={!needle && filter === k} className={`fx-chip${!needle && filter === k ? " on" : ""}`}
-                  onClick={() => { setFilter(k); setQ(""); }}>{label} <span className="fx-count">{groups[k].length}</span></button>
+                  onClick={() => { setFilter(k); setQ(""); }}>{label} <span className="fx-count">{all ? groups[k].length : counts[k] || 0}</span></button>
         ))}
       </div>
       {!needle && filter === "ready" && suggested.length ? (
@@ -188,8 +196,9 @@ export function TicketsTab({ data, onDone }) {
           {err ? <div className="fx-err" role="alert">{err}</div> : null}
         </CardContent></Card>
       ) : null}
+      {loadErr ? <div className="fx-err">{loadErr}</div> : null}
       <div className="fx-list">
-        {shown.length ? shown.map(({ t, why, group }) => (
+        {!all ? <div className="fx-hint">Loading…</div> : shown.length ? shown.map(({ t, why, group }) => (
           <Row key={t.identifier} t={t} why={why} onOpen={() => setOpen(t.identifier)} pick={group === "ready" && stageable.includes(t.identifier) ? {
             checked: sel.includes(t.identifier), disabled: !sel.includes(t.identifier) && sel.length >= max,
             toggle: () => setPicked(sel.includes(t.identifier) ? sel.filter((i) => i !== t.identifier) : [...sel, t.identifier]),

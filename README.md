@@ -45,7 +45,8 @@ One-time, by hand:
   in the flow says how many are still open, so you answer the plan before approving it (approval takes ★ on any
   left). A tap answers at once: the card flies off while the server confirms, and comes back on top with the
   reason if it refuses.
-  Below the deck the factory is one tab per lifecycle stage: **Tickets** (every ticket in scope or ever touched,
+  Below the deck the factory is one tab per lifecycle stage: **Tickets** (every ticket in scope or ever touched —
+  `factory tickets --all`, fetched only while the tab is open; the overview carries just the per-filter counts —
   newest activity first, filtered ready / needs answer / stale / in dispatch / done / not ours, plus a search; ready
   ones are ticked into a draft, with the factory's recommended next group one tap away; a row opens a sheet with the
   Linear header, the current verdict with its evidence, and the ticket's timeline: Linear updates, every verdict

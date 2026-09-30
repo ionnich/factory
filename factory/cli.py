@@ -233,8 +233,9 @@ def cmd_overview(cfg, conn, a):
     runs = dict.fromkeys([d["run_id"] for d in st["dispatches"]] +
                          [x["run_id"] for x in st["decisions"] if x["run_id"] and x["kind"] == "blocked"] +
                          [x["run_id"] for x in st["archived"]])  # last closed ones, for the Learn tab
-    tk = tickets(cfg, conn)
-    out({"status": st, "tickets": tk, "all_tickets": ledger(cfg, conn, tk), "candidates": dispatch.candidates(cfg, conn),
+    tk, cands = tickets(cfg, conn), dispatch.candidates(cfg, conn)
+    counts = collections.Counter(t["group"] for t in ledger(cfg, conn, tk, cands["skipped"]))  # list: `tickets --all`
+    out({"status": st, "tickets": tk, "ticket_counts": counts, "candidates": cands,
          "dispatches": [dispatch_status(cfg, conn, r) for r in runs
                         if conn.execute("SELECT 1 FROM dispatch WHERE run_id=?", (r,)).fetchone()]})
 
@@ -302,7 +303,8 @@ def dispatch_status(cfg, conn, run_id):
 
 
 def cmd_tickets(cfg, conn, a):
-    out(tickets(cfg, conn))
+    tk = tickets(cfg, conn)
+    out(ledger(cfg, conn, tk, dispatch.candidates(cfg, conn)["skipped"]) if a.all else tk)
 
 
 def tickets(cfg, conn) -> list:
@@ -332,10 +334,33 @@ def tickets(cfg, conn) -> list:
     return rows
 
 
-def ledger(cfg, conn, owned_rows) -> list:
+DONE_TYPES = ("completed", "canceled", "duplicate")
+
+
+def group(t: dict, skipped) -> str:
+    """Which Tickets-tab filter a ledger row falls under (the tab says why): dispatch|not|done|stale|ready|answer."""
+    v, d = t.get("verdict"), t.get("dispatch")
+    if d and d["state"] != "archived":
+        return "dispatch"
+    if not t.get("owned"):
+        return "not"
+    if t["state_type"] in DONE_TYPES or t.get("in_review"):
+        return "done"
+    if not t.get("in_scope") or not t.get("context"):
+        return "not"
+    if not v or t.get("freshness") != "fresh":
+        return "stale"
+    if v["kind"] == "valid":
+        return "not" if t["identifier"] in skipped else "ready"
+    return "answer" if v["kind"] in ("needs-clarification", "invalid-references") else "not"
+
+
+def ledger(cfg, conn, owned_rows, skipped) -> list:
     """Every ticket in scope or ever touched (verdict, dispatch): one small row each, for the Tickets tab. Owned
-    in-scope ones reuse `tickets()` (mapping, freshness); the rest are read straight off linear_latest."""
+    in-scope ones reuse `tickets()` (mapping, freshness); the rest are read straight off linear_latest. `skipped`:
+    candidates()' skipped list (a valid ticket someone else holds is not ready)."""
     mine = {t["identifier"]: t for t in owned_rows}
+    skipped = {x["identifier"] for x in skipped}
     review = {k: t.get("review_state") for k, t in cfg.linear.get("team", {}).items()}
     verdicts = {r["issue_id"]: {"kind": r["kind"], "target": r["target"], "reason": r["reason"]} for r in conn.execute(
         "SELECT issue_id, kind, target, reason FROM verdict WHERE superseded_at IS NULL")}
@@ -365,7 +390,8 @@ def ledger(cfg, conn, owned_rows) -> list:
             "dispatch": run and {k: v for k, v in run.items() if k != "issue_id" and v is not None},
             "last_at": last.get(s["issue_id"]),
         }
-        rows.append({k: v for k, v in row.items() if v})  # ~240 rows ride every overview: absent = null/false
+        row = {k: v for k, v in row.items() if v}  # absent = null/false, keeps the list small
+        rows.append({**row, "group": group(row, skipped)})
     return rows
 
 
@@ -515,7 +541,10 @@ def main(argv=None):
     s = sub.add_parser("ticket", help="latest snapshot + mapping + current verdict")
     s.add_argument("identifier")
     s.set_defaults(fn=cmd_ticket)
-    sub.add_parser("tickets", help="owned tickets with verdict + freshness (JSON)").set_defaults(fn=cmd_tickets)
+    s = sub.add_parser("tickets", help="owned tickets with verdict + freshness (JSON)")
+    s.add_argument("--all", action="store_true", help="every ticket in scope or touched, one small row each, "
+                   "with its Tickets-tab group")
+    s.set_defaults(fn=cmd_tickets)
     s = sub.add_parser("ticket-timeline", help="everything the factory did with one ticket, oldest first (JSON)")
     s.add_argument("identifier")
     s.set_defaults(fn=cmd_ticket_timeline)

@@ -67,6 +67,11 @@ async def overview():
     return {**await factory("overview"), "jobs": jobs()}
 
 
+@router.get("/tickets")
+async def all_tickets():  # the Tickets tab's list; kept off /overview, which refreshes on every change
+    return await factory("tickets", "--all")
+
+
 @router.get("/tickets/{ident}/timeline")
 async def ticket_timeline(ident: str):
     if not IDENT.match(ident):

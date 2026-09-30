@@ -8,7 +8,7 @@
 // Every action goes through the plugin API to the factory CLI, which enforces the invariants.
 // Built by install.sh (`bun build`, classic JSX via tsconfig.json) to dist/index.js; React and the shadcn-style
 // components come from the dashboard SDK. The Tickets tab lives in tickets.jsx.
-import { TicketsTab, groupOf } from "./tickets.jsx";
+import { TicketsTab } from "./tickets.jsx";
 
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
@@ -730,13 +730,12 @@ function FactoryPage() {
       || (p.kind === "review") - (q.kind === "review") || p.id - q.id;
   });
   const byRun = Object.fromEntries(data.dispatches.map((d) => [d.run_id, d]));
-  const skipped = Object.fromEntries((data.candidates?.skipped || []).map((x) => [x.identifier, x.reason]));
-  const answers = (data.all_tickets || []).filter((t) => groupOf(t, skipped).group === "answer").length;
+  const answers = data.ticket_counts?.answer || 0;
   const needs = decisions.length;
   const needsOf = (runId) => open.filter((x) => x.run_id === runId && x.tier !== "auto").length;
   const rows = { tickets: [], draft: [], run: [], learn: [] };
   data.dispatches.forEach((d) => rows[stageOf(d)].push(d));
-  const ready = (data.all_tickets || []).filter((t) => groupOf(t, skipped).group === "ready").length;
+  const ready = data.ticket_counts?.ready || 0;
   const count = (stage) => stage === "tickets" ? ready : rows[stage].length;
   // Default stage: what needs you, else where the dispatches are. A dispatch belongs to one stage for its whole
   // life there, so a row only ever moves forward.
