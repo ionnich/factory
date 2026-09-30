@@ -33,6 +33,7 @@ class JevLearning(unittest.TestCase):
         self.dbpath = Path(tempfile.mkdtemp()) / "t.db"
         self.c = db.connect(self.dbpath)
         self.cfg = SimpleNamespace(mirror_path=lambda _: self.repo, raw={})
+        self.n = 0
         self.c.execute("INSERT OR REPLACE INTO repo_trunk VALUES ('r','main',?,?)", (self.sha, SNAP))
         self.c.execute("INSERT INTO linear_snapshot VALUES ('i1','FIN-1',?,?,'unstarted',1,'{}')", (SNAP, SNAP))
 
@@ -43,9 +44,14 @@ class JevLearning(unittest.TestCase):
                        (SNAP, self.sha, json.dumps(ev), '["other.py"]', SNAP))
         return self.c.execute("SELECT id FROM verdict ORDER BY id DESC LIMIT 1").fetchone()[0]
 
-    def candidate(self, body, scope="r", kind="codemap", status="active", source="verdict:1"):
+    def candidate(self, body, scope="r", kind="codemap", status="active", source=None, anchors=None):
+        # Distinct source AND anchors per call: the learning dedupe key is (kind, scope, source, anchors), so a
+        # shared fixture default would collapse every candidate into one row.
+        self.n += 1
         self.c.execute("INSERT INTO learning(kind,scope,body,anchors_json,trunk_sha,source,status,created_at) "
-                       "VALUES (?,?,?,'[\"other.py\"]',NULL,?,?,?)", (kind, scope, body, source, status, SNAP))
+                       "VALUES (?,?,?,?,NULL,?,?,?)",
+                       (kind, scope, body, json.dumps(anchors if anchors is not None else [f"cand{self.n}.py"]),
+                        source if source is not None else f"verdict:{self.n}", status, SNAP))
         return self.c.execute("SELECT id FROM learning ORDER BY id DESC LIMIT 1").fetchone()[0]
 
     def propose(self, body, scope="r", kind="pitfall", source="decision:9"):
@@ -211,6 +217,24 @@ class JevLearning(unittest.TestCase):
         row = next(r for r in learn.rows(self.c) if r["id"] == lid)
         self.assertEqual(row["jev"]["relation"], {"kind": "duplicate", "learning_id": cid,
                                                   "body": "other.py: x lives here"})
+
+    def test_rows_never_show_a_stale_relation_or_group_once_the_target_rejects_or_expires(self):
+        cid = self.candidate("other.py: x lives here")
+        lid, did = self.propose("the parser lives in other.py")
+        with mock.patch.object(jev, "evaluate", side_effect=lambda cfg, state, questions: ok(f"duplicate:{cid}")):
+            learn.sync(self.cfg, self.c)
+        self.assertIn("relation", jev.stored(self.c, did))  # raw storage keeps the record
+        for status in ("rejected", "expired"):
+            self.c.execute("UPDATE learning SET status=? WHERE id=?", (status, cid))
+            with mock.patch.object(jev, "evaluate",
+                                   side_effect=AssertionError("read paths never touch the model")) as ev:
+                row = next(r for r in learn.rows(self.c) if r["id"] == lid)
+                self.assertEqual(ev.call_count, 0)  # real storage: no network on reads
+            self.assertIn("jev", row)
+            self.assertNotIn("relation", row["jev"])
+            self.assertNotIn("group", row["jev"])
+            self.assertIn("relation", jev.stored(self.c, did))  # display filtering, not storage mutation
+            self.c.execute("UPDATE learning SET status='active' WHERE id=?", (cid,))
 
     def test_a_decision_answered_while_the_call_is_in_flight_is_left_untouched(self):
         cid = self.candidate("other.py: x lives here")
