@@ -6,8 +6,9 @@ and expiry. `sync` (every propose tick) harvests and expires them:
   house_rule  from the user's plan answers: a label chosen twice, or a non-★ choice with a note; proposed likewise.
 Gates hand agents the relevant ones (`relevant`); agents cite `L<id>` when one saved them work (`cite`).
 Once the harvesting transaction commits, `sync` also compares each proposed learning with the same-scope learnings
-(core's factory.jev) and records the judgment on its open decision's detail_json['jev']; guidance never answers the
-decision or changes a learning's status."""
+(core's factory.jev) and persists the judgment on its open decision through `jev.store` (the separate `jev_advice`
+table core owns; decision detail_json stays untouched). Guidance never answers the decision or changes a learning's
+status."""
 import hashlib
 import json
 import re
@@ -158,9 +159,10 @@ def pitfalls(conn, repos_) -> list[str]:
 
 # ---- jev: relationship guidance on proposed learnings ----------------------------------------------------------
 # After the harvesting transaction commits, each open learning decision is compared through core's factory.jev with
-# up to JEV_CANDIDATES same-scope learnings; the judgment is stored on the decision's detail_json['jev'] (key 'jev',
-# no space). Unchanged inputs reuse the last successful judgment; failed or disabled calls stay visible and are
-# retried next tick. Guidance never answers the decision and never changes a learning's status.
+# up to JEV_CANDIDATES same-scope learnings; the judgment is persisted via jev.store and read back via jev.stored
+# (core owns the separate jev_advice table — decision.detail_json and its trigger stay untouched). Unchanged inputs
+# reuse the last successful judgment; failed or disabled calls stay visible and are retried next tick. Guidance
+# never answers the decision and never changes a learning's status.
 JEV_CANDIDATES = 5
 
 
@@ -212,10 +214,10 @@ def _jev_group(conn, lid: int, target: int) -> str | None:
     """learning:<root>: every member of a duplicate/supports component points at its lowest id, and the root points
     nowhere, so group links can never form cycles."""
     root = min(lid, target)
-    row = conn.execute("SELECT detail_json FROM decision WHERE kind='learning' AND ref=? ORDER BY id LIMIT 1",
+    row = conn.execute("SELECT id FROM decision WHERE kind='learning' AND ref=? ORDER BY id LIMIT 1",
                        (str(target),)).fetchone()
     if row:
-        g = ((json.loads(row["detail_json"]) or {}).get("jev") or {}).get("group")
+        g = (jev.stored(conn, row["id"]) or {}).get("group")
         if isinstance(g, str) and g.startswith("learning:") and g[9:].isdigit():
             root = min(root, int(g[9:]))
     return f"learning:{root}" if root < lid else None
@@ -243,12 +245,13 @@ def _jev_build(res: dict, fp: str, conn, l: dict, candidates: list[dict]) -> dic
 
 
 def _jev_refresh(cfg, conn) -> None:
-    """Assess the open learning decisions. The network call happens here, never under a transaction; a decision
-    answered or withdrawn while it was in flight is left untouched."""
+    """Assess the open learning decisions. The network call happens here, never under a transaction; each result
+    is persisted through core's jev.store, which rechecks the decision is still open in its own short transaction,
+    so one answered or withdrawn while it was in flight is left untouched."""
     if jev is None:
         return
     opens = conn.execute(
-        "SELECT d.id did, d.detail_json, l.id lid, l.kind, l.scope, l.body, l.source FROM decision d "
+        "SELECT d.id did, l.id lid, l.kind, l.scope, l.body, l.source FROM decision d "
         "JOIN learning l ON l.id = CAST(d.ref AS INTEGER) "
         "WHERE d.kind = 'learning' AND d.chosen IS NULL AND d.void_reason IS NULL ORDER BY d.id").fetchall()
     updates: list[tuple[int, dict]] = []
@@ -258,7 +261,7 @@ def _jev_refresh(cfg, conn) -> None:
         if not candidates:
             continue  # nothing to compare: no guidance to show
         fp = _jev_fingerprint(l, candidates)
-        cur = (json.loads(d["detail_json"]) or {}).get("jev") or {}
+        cur = jev.stored(conn, d["did"]) or {}
         if cur.get("status") == "ok" and cur.get("fingerprint") == fp:
             continue  # unchanged successful judgment: reuse it
         try:
@@ -266,31 +269,25 @@ def _jev_refresh(cfg, conn) -> None:
         except Exception as e:  # evaluate is contractually non-raising; this keeps learn.sync safe regardless
             res = {"status": "unavailable", "error": f"{type(e).__name__}: {str(e)[:160]}"}
         updates.append((d["did"], _jev_build(res, fp, conn, l, candidates)))
-    if not updates:
-        return
-    with db.tx(conn):
-        for did, out in updates:
-            d = conn.execute("SELECT detail_json FROM decision WHERE id=? AND chosen IS NULL AND void_reason IS NULL",
-                             (did,)).fetchone()
-            if d is None:
-                continue  # answered or withdrawn during the network call: guidance never rewrites a closed decision
-            detail = json.loads(d["detail_json"]) or {}
-            detail["jev"] = out
-            conn.execute("UPDATE decision SET detail_json=? WHERE id=?", (json.dumps(detail), did))
+    for did, out in updates:
+        jev.store(conn, did, out)
 
 
 def rows(conn) -> list[dict]:
-    """The Learn tab: active and proposed learnings, each with the guidance (`jev`) its decision carries."""
+    """The Learn tab: active and proposed learnings, each with the guidance (`jev`) its decision carries via
+    core's jev.stored."""
     out = []
     for r in conn.execute(
             "SELECT l.id, l.kind, l.scope, l.body, l.anchors_json anchors, l.source, l.status, l.created_at, l.uses, "
-            "(SELECT detail_json FROM decision d WHERE d.kind='learning' AND d.ref = CAST(l.id AS TEXT) "
-            " ORDER BY d.id LIMIT 1) detail_json FROM learning l "
+            "(SELECT id FROM decision d WHERE d.kind='learning' AND d.ref = CAST(l.id AS TEXT) "
+            " ORDER BY d.id LIMIT 1) did FROM learning l "
             "WHERE l.status IN ('active', 'proposed') ORDER BY l.kind, l.uses DESC, l.id DESC"):
         d = dict(r)
         d["anchors"] = json.loads(d.pop("anchors"))
-        detail = json.loads(d.pop("detail_json") or "{}") or {}
-        if detail.get("jev"):
-            d["jev"] = detail["jev"]
+        did = d.pop("did")
+        if jev is not None and did is not None:
+            advice = jev.stored(conn, did)
+            if advice:
+                d["jev"] = advice
         out.append(d)
     return out

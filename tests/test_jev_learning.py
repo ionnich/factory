@@ -1,12 +1,8 @@
 """Jev guidance on learnings: proposed learnings are compared (via core's factory.jev) with bounded same-scope
-candidates, the judgment lands on the open learning decision's detail_json['jev'], unchanged successes are reused
-and failed/disabled calls stay visible — while plan step text is no longer harvested as a code fact at all.
-
-INTEGRATION NOTE: persisting guidance needs `decision.detail_json` to be updatable while a decision is open. The
-v18 `decision_answer_once` trigger aborts that update (it only lets a decision be answered or withdrawn). The
-parent's schema migration must allow detail_json changes on open decisions while keeping answered/voided ones
-frozen, e.g. replace the trigger's identity-change list so detail_json is no longer in it and amend the
-`(NEW.chosen IS NULL AND NEW.void_reason IS NULL)` clause to `... AND NEW.detail_json IS OLD.detail_json`."""
+candidates, the judgment is persisted through core's jev.stored/jev.store (doubled here as FakeJev) and never
+touches decision.detail_json — the immutable decision_answer_once trigger stays unchanged — while plan step text
+is no longer harvested as a code fact at all. Unchanged successes are reused and failed/disabled calls stay
+visible."""
 import json
 import tempfile
 import unittest
@@ -19,13 +15,27 @@ SNAP = "2026-09-01T00:00:00Z"
 
 
 class FakeJev:
-    def __init__(self, respond):
+    """Test double for core's factory.jev: `evaluate` delegates to `respond`; `stored`/`store` keep the advice in
+    memory, and `store` rechecks the decision is still open the way the real helper's upsert does."""
+    def __init__(self, conn, respond):
+        self.conn = conn
         self.respond = respond  # callable(cfg, state, questions) -> dict
         self.calls = 0
+        self.advice: dict[int, dict] = {}
 
     def evaluate(self, cfg, state, questions):
         self.calls += 1
         return self.respond(cfg, state, questions)
+
+    def stored(self, conn, decision_id):
+        return self.advice.get(decision_id)
+
+    def store(self, conn, decision_id, advice):
+        if conn.execute("SELECT id FROM decision WHERE id=? AND chosen IS NULL AND void_reason IS NULL",
+                        (decision_id,)).fetchone() is None:
+            return False
+        self.advice[decision_id] = advice
+        return True
 
 
 def ok(choice, confidence=0.9):
@@ -72,8 +82,11 @@ class JevLearning(unittest.TestCase):
         return lid, did
 
     def jev(self, did):
-        return json.loads(self.c.execute("SELECT detail_json FROM decision WHERE id=?",
-                                         (did,)).fetchone()[0]).get("jev")
+        advice = learn.jev.stored(self.c, did)
+        detail = json.loads(self.c.execute("SELECT detail_json FROM decision WHERE id=?",
+                                           (did,)).fetchone()[0])
+        self.assertNotIn("jev", detail)  # guidance never touches decision detail_json
+        return advice
 
     # ---- plan step text is no longer a code fact ---------------------------------------------------------------
     def test_plan_step_text_is_not_harvested_as_a_code_map_fact(self):
@@ -104,7 +117,7 @@ class JevLearning(unittest.TestCase):
     def test_duplicate_guidance_lands_on_the_open_decision_and_reuses_unchanged_inputs(self):
         cid = self.candidate("other.py: x lives here")
         lid, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(lambda cfg, state, questions: ok(f"duplicate:{cid}"))
+        learn.jev = FakeJev(self.c, lambda cfg, state, questions: ok(f"duplicate:{cid}"))
         learn.sync(self.cfg, self.c)
         j = self.jev(did)
         self.assertEqual(j["status"], "ok")
@@ -123,7 +136,7 @@ class JevLearning(unittest.TestCase):
     def test_candidate_status_or_body_change_reassesses(self):
         cid = self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(lambda cfg, state, questions: ok(f"duplicate:{cid}"))
+        learn.jev = FakeJev(self.c, lambda cfg, state, questions: ok(f"duplicate:{cid}"))
         learn.sync(self.cfg, self.c)
         self.c.execute("UPDATE learning SET body=? WHERE id=?", ("other.py: y lives here", cid))
         learn.sync(self.cfg, self.c)
@@ -135,7 +148,7 @@ class JevLearning(unittest.TestCase):
     def test_unavailable_is_visible_and_retried_next_tick(self):
         self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(lambda cfg, state, questions: {"status": "unavailable", "error": "timeout"})
+        learn.jev = FakeJev(self.c, lambda cfg, state, questions: {"status": "unavailable", "error": "timeout"})
         learn.sync(self.cfg, self.c)
         j = self.jev(did)
         self.assertEqual(j["status"], "unavailable")
@@ -146,7 +159,7 @@ class JevLearning(unittest.TestCase):
     def test_disabled_is_visible_without_crashing_on_an_unconfigured_cfg(self):
         self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(lambda cfg, state, questions: {"status": "disabled", "error": "no key"})
+        learn.jev = FakeJev(self.c, lambda cfg, state, questions: {"status": "disabled", "error": "no key"})
         learn.sync(SimpleNamespace(raw={}), self.c)
         j = self.jev(did)
         self.assertEqual(j["status"], "disabled")
@@ -155,7 +168,7 @@ class JevLearning(unittest.TestCase):
     def test_relation_to_an_unknown_candidate_is_not_trusted(self):
         self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(lambda cfg, state, questions: ok("duplicate:999"))
+        learn.jev = FakeJev(self.c, lambda cfg, state, questions: ok("duplicate:999"))
         learn.sync(self.cfg, self.c)
         j = self.jev(did)
         self.assertEqual(j["status"], "ok")
@@ -164,7 +177,7 @@ class JevLearning(unittest.TestCase):
     def test_conflicts_is_surfaced_without_a_group(self):
         cid = self.candidate("other.py: x lives here")
         _, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(lambda cfg, state, questions: ok(f"conflicts:{cid}"))
+        learn.jev = FakeJev(self.c, lambda cfg, state, questions: ok(f"conflicts:{cid}"))
         learn.sync(self.cfg, self.c)
         j = self.jev(did)
         self.assertEqual(j["relation"], {"kind": "conflicts", "learning_id": cid,
@@ -178,7 +191,7 @@ class JevLearning(unittest.TestCase):
         def respond(cfg, state, questions):
             return ok(f"duplicate:{c0 if state['proposal']['body'].startswith('b.py') else lid1}")
 
-        learn.jev = FakeJev(respond)
+        learn.jev = FakeJev(self.c, respond)
         learn.sync(self.cfg, self.c)
         self.assertEqual(self.jev(did1)["group"], f"learning:{c0}")
         lid2, did2 = self.propose("c.py: middle again", kind="pitfall", source="decision:2")
@@ -190,7 +203,7 @@ class JevLearning(unittest.TestCase):
     def test_unrelated_repo_and_no_candidates_are_not_compared(self):
         self.candidate("other.py: x lives here", scope="elsewhere")
         _, did = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(lambda cfg, state, questions: ok("none"))
+        learn.jev = FakeJev(self.c, lambda cfg, state, questions: ok("none"))
         learn.sync(self.cfg, self.c)
         self.assertEqual(learn.jev.calls, 0)
         self.assertIsNone(self.jev(did))
@@ -198,7 +211,7 @@ class JevLearning(unittest.TestCase):
     def test_rows_expose_guidance_on_the_learn_surface(self):
         cid = self.candidate("other.py: x lives here")
         lid, _ = self.propose("the parser lives in other.py")
-        learn.jev = FakeJev(lambda cfg, state, questions: ok(f"duplicate:{cid}"))
+        learn.jev = FakeJev(self.c, lambda cfg, state, questions: ok(f"duplicate:{cid}"))
         learn.sync(self.cfg, self.c)
         row = next(r for r in learn.rows(self.c) if r["id"] == lid)
         self.assertEqual(row["jev"]["relation"], {"kind": "duplicate", "learning_id": cid,
@@ -212,11 +225,9 @@ class JevLearning(unittest.TestCase):
             decide.choose(self.cfg, self.c, did, "reject", "user")
             return ok(f"duplicate:{lid - 1}")
 
-        learn.jev = FakeJev(answer_then_ok)
+        learn.jev = FakeJev(self.c, answer_then_ok)
         learn.sync(self.cfg, self.c)
-        detail = json.loads(self.c.execute("SELECT detail_json FROM decision WHERE id=?",
-                                           (did,)).fetchone()[0])
-        self.assertNotIn("jev", detail)  # guidance never rewrites a closed decision
+        self.assertIsNone(self.jev(did))  # guidance never lands on a closed decision
         self.assertEqual(self.c.execute("SELECT status FROM learning WHERE id=?",
                                         (lid,)).fetchone()[0], "rejected")
 
