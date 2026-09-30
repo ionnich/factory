@@ -1,6 +1,7 @@
 // Jev: the model's read of one decision — compact guidance before the options and the long "why?" text. It never
 // answers, never voids, never preselects; the server keeps review authority. Consumes the decision's top-level
-// `jev` ({status, category, rule, model, confidence, focus, error, relation, group}, also in detail_json.jev);
+// `jev` ({status, category, rule, model, confidence, focus, error, relation, group}) — core exposes it top-level
+// from the jev_advice table (never decision.detail_json);
 // absent or disabled renders nothing, so no guidance is ever fabricated. Focus highlights are applied by
 // jevFocus() in the option/switch renderers, not here.
 const SDK = window.__HERMES_PLUGIN_SDK__;
