@@ -109,4 +109,8 @@ and retry; never retry the same payload.
 - If the evidence shows the work is already done or the ticket is unclear,
   still write the plan, and make step 1 "Confirm ..." with what to check; the
   reviewer decides.
+- The CLI refuses a question Jev (a judgment model) is sure asks for missing
+  factual investigation (the code or data settle it; authority and consent
+  questions are never treated that way). When refused, check the evidence and
+  decide it in the plan instead of asking.
 - Finish with one line: `<run_id>: <theme>; kept <tickets>; dropped <tickets or none>; N steps; N questions; recommend <approve|hold|reject>`.

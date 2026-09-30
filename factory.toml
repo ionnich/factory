@@ -7,7 +7,17 @@ dispatches = "~/factory/dispatches"
 
 [secrets]
 # KEY=VALUE files; environment variables win. Values are never logged.
-env_files = ["~/.config/secrets/agents.env", "~/.config/secrets/dagster-cloud.env", "~/.config/secrets/factory.env"]
+env_files = ["~/.config/secrets/agents.env", "~/.config/secrets/dagster-cloud.env", "~/.config/secrets/factory.env",
+             "~/.config/secrets/factory-jev.env"]
+
+[jev]
+# Judgment guidance from the TypeSafe API (model jev-1.13.0, pinned): screens open plan/ask/review decisions and
+# refuses a plan question that is sure (>= 0.85) to be pure missing investigation. Guidance only: Jev never
+# answers, voids or changes a decision; the key lives in ~/.config/secrets/factory-jev.env (TYPESAFE_API_KEY) and
+# a missing key or a failed call leaves the decision exactly as it was, with a visible unavailable state.
+enabled = true
+model = "jev-1.13.0"
+timeout_seconds = 30
 
 [linear]
 teams = ["FIN"]

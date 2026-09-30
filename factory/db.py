@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -397,6 +397,13 @@ WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
   OR (OLD.notified_at IS NOT NULL AND NEW.notified_at IS NOT OLD.notified_at)
   OR (OLD.due_at IS NOT NULL AND NEW.due_at IS NOT OLD.due_at)
 BEGIN SELECT RAISE(ABORT, 'a decision''s clock (notified_at, due_at) is set once, while it is open'); END;""",
+    # v19: Jev guidance (and the learning slice's relation/group metadata) is derived, replaceable advice in its
+    # own row, referenced by decision id. decision_answer_once stays exactly as it was: a decision row is never
+    # edited while open, answered or withdrawn.
+    19: """CREATE TABLE jev_advice (
+  decision_id INTEGER PRIMARY KEY REFERENCES decision(id),
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
+);""",
 }
 
 

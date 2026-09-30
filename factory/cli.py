@@ -9,7 +9,7 @@ import statistics
 import sys
 from datetime import UTC, datetime, timedelta
 
-from . import ask, config, costs, db, decide, dispatch, learn, linear, prune, reconcile, repos, witness
+from . import ask, config, costs, db, decide, dispatch, jev, learn, linear, prune, reconcile, repos, witness
 
 
 def out(obj) -> None:
@@ -68,6 +68,11 @@ def cmd_propose(cfg, conn, a):
     res = dispatch.propose(cfg, conn)
     res["acknowledged_notices"] = acknowledged
     res["swept"] = decide.sweep(cfg, conn)
+    try:  # judgment guidance for open plan/ask/review decisions; a jev failure never costs a push or digest
+        res["jev"] = jev.refresh(cfg, conn)
+    except Exception as e:
+        print(f"factory: jev refresh: {type(e).__name__}: {e}", file=sys.stderr)
+        res["jev"] = []
     execution_id = decide.notification_execution(cfg) if a.announce else None
     msgs = decide.notify(cfg, conn, res["swept"], execution_id=execution_id)
     try:  # the cost ledger is derived data: a failed sync never costs the user a push or digest
@@ -138,6 +143,10 @@ def cmd_decide(cfg, conn, a):
     if d and d["kind"] == "review" and a.option == "approve":
         ingest(cfg, conn, only=_dispatch_repos(conn, [d["run_id"]]))  # check the tickets against Linear as it is now
     return out(decide.choose(cfg, conn, a.id, a.option, a.actor, a.note))
+
+
+def cmd_jev(cfg, conn, a):
+    out(jev.refresh(cfg, conn))
 
 
 def _dispatch_repos(conn, run_ids) -> set[str]:
@@ -702,6 +711,10 @@ def main(argv=None):
     s.add_argument("name")
     s.add_argument("query")
     s.set_defaults(fn=cmd_witness)
+    s = sub.add_parser("jev", help="Jev judgment guidance for open decisions").add_subparsers(dest="jcmd",
+                                                                                              required=True)
+    s2 = s.add_parser("sync", help="re-judge open plan/ask/review decisions (also runs each propose tick)")
+    s2.set_defaults(fn=cmd_jev)
 
     a = p.parse_args(argv)
     try:

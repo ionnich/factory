@@ -366,6 +366,13 @@ WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'a decision is answered (with one of its options, and the text it asks for) or withdrawn once'); END;
 CREATE TRIGGER decision_no_delete BEFORE DELETE ON decision
 BEGIN SELECT RAISE(ABORT, 'decisions are never deleted'); END;
+
+-- Jev judgment guidance (and the learning slice's relation/group metadata) per decision: derived, replaceable
+-- advice in its own row, never inside decision.detail_json (decision_answer_once keeps the decision immutable).
+CREATE TABLE jev_advice (
+  decision_id INTEGER PRIMARY KEY REFERENCES decision(id),
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
+);
 CREATE TRIGGER decision_clock BEFORE UPDATE OF notified_at, due_at ON decision
 WHEN OLD.chosen IS NOT NULL OR OLD.void_reason IS NOT NULL
   OR (OLD.notified_at IS NOT NULL AND NEW.notified_at IS NOT OLD.notified_at)
@@ -414,7 +421,7 @@ CREATE TABLE cost_session (
 );
 
 -- Learnings: one- or two-line facts that save agents tokens, each with provenance (source), anchors (repo paths)
--- and expiry. codemap (what lives at a path) is harvested from verdict evidence and plan steps and is active at
+-- and expiry. codemap (what lives at a path) is harvested from verdict evidence and is active at
 -- once; pitfall (from blocks) and house_rule (from the user's plan answers) are proposed and become active when the
 -- user keeps them (decision kind 'learning', ref = id). Active ones expire when trunk changes an anchor. Derived by
 -- `learn.sync`; uses counts `L<id>` cited in verdict reasons, plans and card comments.

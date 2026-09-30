@@ -10,7 +10,7 @@ import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
-from . import db, dispatch
+from . import db, dispatch, jev
 
 # Choices that start real work, stop it, write Linear or direct an executor: the chat tool asks the human through
 # Hermes's approval prompt before sending one of these.
@@ -56,7 +56,8 @@ def _tier(conn, kind: str, run_id: str | None, options: list) -> str:
     can wait for the next digest. A person's draft, or one they held, is never started without them."""
     if kind == "ask":
         return "now"  # Directing an executor always needs a fresh human choice, never an earned auto-answer.
-    earned = kind != "plan" and (streak(conn, kind) or 0) >= EARNED_AFTER
+    # Learnings never become rules by earned automation: a proposed learning waits for the user like any digest.
+    earned = kind not in ("plan", "learning") and (streak(conn, kind) or 0) >= EARNED_AFTER
     if kind == "review":
         d = conn.execute("SELECT drafted_by, emergency, held_reason FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
         own = d is not None and d["drafted_by"] == dispatch.PROPOSE and not d["held_reason"]
@@ -197,6 +198,9 @@ def _deadline(conn, d) -> tuple[str | None, str]:
     """When ★ is taken without the user, and what happens if they stay silent."""
     if d["kind"] == "ask":
         return None, "it waits for your confirmed answer; that work is stopped until you answer"
+    if d["kind"] == "learning":
+        # Raw legacy rows may still carry tier='auto' and a due_at: a learning is never taken on its own.
+        return None, "it waits for your explicit approval; a learning becomes a rule only when you keep it"
     if d["tier"] == "auto":
         return d["due_at"], "the factory takes ★ on its next pass (a few minutes)"
     if d["due_at"]:
@@ -221,11 +225,15 @@ def _row(conn, r) -> dict:
     d["open"] = d["chosen"] is None and d["void_reason"] is None
     if d["open"] and d["kind"] == "ask":
         d["tier"] = "now"  # Legacy earned-auto questions still need a visible, explicit human answer.
+    if d["open"] and d["kind"] == "learning" and d["tier"] == "auto":
+        # Legacy earned-auto learnings reach a human like any digest; they are never swept into rules.
+        d["tier"], d["due_at"] = "digest", None
     if d["kind"] == "plan":  # the configurator's fields (absent on plans written before v13)
         x = d["detail"]
         d.update(key=x.get("key"), now=x.get("now"), evidence=x.get("evidence", []), depends_on=x.get("depends_on"))
         d["options"] = [{"changes": [], "result": None, "cost": None, "risk": None, **o} for o in d["options"]]
-    d["deadline"], d["on_timeout"] = _deadline(conn, r) if d["open"] else (None, None)
+    d["jev"] = jev.served(jev.stored(conn, d["id"]), conn, d["options"])
+    d["deadline"], d["on_timeout"] = _deadline(conn, d) if d["open"] else (None, None)
     return d
 
 
@@ -470,11 +478,11 @@ def _because(conn, d) -> str:
 def sweep(cfg, conn) -> list[dict]:
     """Take ★ on every open decision whose time came: auto ones, and silent ones past their deadline. A review
     that can no longer start (a ticket moved under the plan) is rejected instead; anything else that no longer
-    applies is withdrawn."""
+    applies is withdrawn. Learning decisions are never swept: a rule is only ever approved by a person."""
     done = []
     for (did,) in conn.execute(
-            f"SELECT id FROM decision WHERE {OPEN} AND kind <> 'ask' AND due_at <= ? AND (tier='auto' OR EXISTS "
-            "(SELECT 1 FROM notice n, json_each(n.decision_ids_json) j "
+            f"SELECT id FROM decision WHERE {OPEN} AND kind NOT IN ('ask','learning') AND due_at <= ? AND "
+            "(tier='auto' OR EXISTS (SELECT 1 FROM notice n, json_each(n.decision_ids_json) j "
             "WHERE j.value=decision.id AND n.delivered_at IS NOT NULL)) ORDER BY id", (db.now(),)).fetchall():
         d = one(conn, did)
         if not d["open"]:
