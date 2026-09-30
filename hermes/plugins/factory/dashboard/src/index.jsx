@@ -142,15 +142,16 @@ function Silence({ d }) {
   return <div className="fx-hint">If you stay silent{when}: {d.on_timeout}.</div>;
 }
 
-// An explanation longer than ~3 lines starts folded to its opening words (native details: a tap or Enter opens it);
-// open, the preview gives way to the whole text.
+// An explanation longer than ~3 lines starts folded to its opening words (native details: a tap or Enter opens it).
+// Those words stay the summary, so the toggle keeps a visible, accessible label; open, the rest of the text follows.
 function Fold({ head, text, className }) {
   if (!text) return null;
   if (text.length <= 140) return <div className={className}>{head}{text}</div>;
+  const i = text.lastIndexOf(" ", 80), cut = i > 40 ? i : 80;  // the opening words end between words when they can
   return (
     <details className={`fx-more ${className}`}>
-      <summary>{head}<span className="fx-pv">{clip(text, 80)}</span></summary>
-      {text}
+      <summary>{head}{text.slice(0, cut)}<span className="fx-pv">…</span></summary>
+      {text.slice(cut)}
     </details>
   );
 }
@@ -420,7 +421,7 @@ function StageTable({ dispatches, titles, needsOf, selected, onSelect }) {
 
 // Run, beside the selected dispatch: the server's runtime read (dispatch_status.runtime, from recorded activity, open
 // decisions and executor deliveries). None (an older server, or not staged/executing): nothing shown, nothing guessed.
-// decision_id only names the decision; it is answered in Needs you.
+// Its blocker or next step names any decision it is about (#id); that is answered in Needs you, never here.
 function Runtime({ r }) {
   if (!r) return null;
   return (
@@ -429,7 +430,7 @@ function Runtime({ r }) {
       <dd>{r.last_activity_at ? `${r.last_activity_kind || "activity"} · ${ago(r.last_activity_at)}` : "none recorded"}</dd>
       {r.blocker ? <><dt>Blocker</dt><dd className="blk">{r.blocker}</dd></> : null}
       <dt>Next</dt>
-      <dd>{r.next_step}{r.decision_id != null ? <> <span className="fx-id">#{r.decision_id}</span></> : null}</dd>
+      <dd>{r.next_step}</dd>
     </dl>
   );
 }
@@ -491,6 +492,7 @@ function FactoryPage() {
   const top = useRef(null);
   useEffect(() => { top.current?.scrollIntoView(); }, [review]);
   const strip = useRef(null);
+  const panel = useRef(null);  // the stage section, after the deck: switchTab brings it into view
   useEffect(() => {  // the active stage tab fully in view (nearest edge), scrolling the strip only, never the page
     const s = strip.current, t = s?.querySelector(".on");
     if (!t) return;
@@ -594,7 +596,9 @@ function FactoryPage() {
     setTab(stageOf(run));
     setSel(x.run_id);
   };
-  const switchTab = (stage) => { setTab(stage); setSel(null); };
+  // A tab click brings its stage into view: it sits after the deck, often below a phone's fold. Next frame, once React
+  // has rendered the new stage, so its own height counts; a refresh never scrolls.
+  const switchTab = (stage) => { setTab(stage); setSel(null); requestAnimationFrame(() => panel.current?.scrollIntoView()); };
   const EMPTY = {
     draft: "No draft right now. The factory proposes one when verified tickets accumulate, or draft your own in Tickets.",
     run: "Nothing staged or executing right now.",
@@ -647,7 +651,7 @@ function FactoryPage() {
       <Deck decisions={deck} context={context} onDone={(r, d) => done(r, d)} onOpen={openNode} />
       <Quick items={decisions.filter(light)} context={context} onDone={done} />
 
-      <section className="fx-sec">
+      <section className="fx-sec" ref={panel}>
         <h2>{STAGES.find(([id]) => id === active)[1]}</h2>{/* the tabs sit above the deck: name the stage shown here */}
         {active === "tickets" ? <TicketsTab data={data} onDone={done} /> : list.length ? (<>
           <StageTable dispatches={list} titles={titles} needsOf={needsOf} selected={current} onSelect={setSel} />
