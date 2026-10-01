@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import db, prune
 from .config import Config
-from .dispatch import StageError
+from .dispatch import PHASE, StageError
 
 # --------------------------------------------------------------------------- grooming subprocess
 OMP = shutil.which("omp") or str(Path.home() / ".local/bin/omp")
@@ -111,12 +111,12 @@ def _valid_resource(r: str) -> bool:
 
 def _merge_resources(body_resources: list[str], repos: list[str], route: str) -> list[str]:
     """Server-derived repo:/route: are always present and never removable/editable. global:* is the conservative
-    default when the editor names no explicit resource; an explicit `global:*` is preserved (a human can name it
-    alongside other keys for a deliberate serial claim, or omit it for repo-only work). Only a human decides."""
+    default only when the editor names NO resource at all; a human can name an explicit `global:*` (preserved), omit
+    it for repo/route-only work, or name extra keys. Only a human decides."""
     mandatory = [*repos, route]
     explicit = [r for r in body_resources if not r.startswith("repo:") and not r.startswith("route:")]
-    if not explicit:
-        explicit = ["global:*"]  # no explicit decision -> conservative serial
+    if not body_resources:
+        explicit = ["global:*"]  # no explicit decision at all -> conservative serial
     merged = mandatory + explicit
     if len(set(merged)) != len(merged):
         raise StageError("duplicate resource key")
@@ -368,28 +368,46 @@ def _run_groom(sources: list[dict]) -> dict:
 # --------------------------------------------------------------------------- public API
 def overview(cfg: Config, conn) -> dict:
     """Pure cached-DB read: every brief version, the Strategy source list, policy and active scheduling. No
-    model/network. Prior versions stay readable; a draft amendment does not hide the current approved intent."""
+    model/network. Prior versions stay readable; readiness is derived from ready()/current-published so exact
+    blockers (dependencies, source safety) are truthful and superseded historical draft/published versions are
+    explicit. The downstream dispatch link carries its lifecycle phase."""
+    ready_by_id = {item["id"]: item for item in ready(cfg, conn)}
+    current = set(_current_published(conn))
+    children = {r[0] for r in conn.execute("SELECT parent_id FROM work_brief WHERE parent_id IS NOT NULL")}
     briefs = []
     for row in conn.execute("SELECT * FROM work_brief ORDER BY id").fetchall():
         body = json.loads(row["body_json"])
         sources = json.loads(row["sources_json"])
         changed = [s["identifier"] for s in sources if _source_changed(conn, s)]
         verified = _verdicts(conn, row["id"], sources)[0]
-        link = conn.execute("SELECT run_id, state FROM dispatch WHERE brief_id=?", (row["id"],)).fetchone()
-        blockers = ([f"held: {row['hold_reason']}"] if row["state"] == "held" else [])
-        blockers += ([f"needs-amendment: {', '.join(changed)}"] if changed else [])
-        readiness = ("draft" if row["state"] == "draft"
-                     else "held" if row["state"] == "held"
-                     else "needs-amendment" if changed
-                     else "verification-pending" if not verified
-                     else "ready")
+        link = conn.execute(f"SELECT run_id, state, {PHASE} AS phase FROM dispatch WHERE brief_id=?",
+                            (row["id"],)).fetchone()
+        item = ready_by_id.get(row["id"])
+        if item is not None:  # current published, unconsumed: exact readiness/blockers from ready()
+            readiness = ("held" if item["state"] == "held"
+                         else "needs-amendment" if changed
+                         else "blocked" if not item["intent_ready"]
+                         else "verification-pending" if not item["verified"]
+                         else "ready")
+            blockers = item["blockers"]
+            intent_ready = item["intent_ready"]
+            deps = item["dependencies"]
+        elif row["state"] == "draft":
+            readiness = "superseded" if row["id"] in children else "draft"
+            blockers, intent_ready, deps = [], False, []
+        elif row["id"] in current:  # current published but already dispatched
+            readiness, blockers, intent_ready, deps = "dispatched", [], None, []
+        else:  # historical published version superseded by a newer one
+            readiness, blockers, intent_ready, deps = "superseded", [], False, []
         briefs.append({"id": row["id"], "revision": row["revision"], "parent_id": row["parent_id"],
                        "state": row["state"], "title": body["title"],
                        "sources": [s["identifier"] for s in sources],
                        "created_at": row["created_at"], "created_by": row["created_by"],
-                       "approved_at": row["approved_at"], "source_changed": changed,
-                       "verified": verified, "readiness": readiness, "blockers": blockers,
-                       "dispatch": {"run_id": link["run_id"], "state": link["state"]} if link else None})
+                       "approved_at": row["approved_at"], "intent_ready": intent_ready,
+                       "source_changed": changed, "verified": verified, "readiness": readiness,
+                       "blockers": blockers, "dependencies": deps,
+                       "dispatch": {"run_id": link["run_id"], "state": link["state"], "phase": link["phase"]}
+                       if link else None})
     tickets = _ticket_list(cfg, conn)
     policy = conn.execute("SELECT max_parallel FROM execution_policy WHERE id=1").fetchone()
     active = []
@@ -455,6 +473,8 @@ def approve(cfg: Config, conn, brief_id, actor) -> dict:
         row = _row(conn, brief_id)
         if row["state"] != "draft":
             raise StageError(f"brief #{brief_id} is {row['state']}, not a draft")
+        if conn.execute("SELECT 1 FROM work_brief WHERE parent_id=?", (brief_id,)).fetchone():
+            raise StageError(f"brief #{brief_id} already has a newer revision; approve the latest version")
         sources = json.loads(row["sources_json"])
         drift = [s["identifier"] for s in sources if _source_changed(conn, s)]
         if drift:

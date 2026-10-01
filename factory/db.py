@@ -507,10 +507,11 @@ CREATE TABLE dispatch_resource (
   ),
   PRIMARY KEY (run_id, resource)
 );
--- Legacy active/done/reconciled history conservatively gets a global:* claim (held until archive) so it serializes
--- against everything (replaces the dropped one_executing). Archived dispatches are unchanged.
+-- Legacy (NULL-brief) history — draft, staged, executing, done, reconciled — conservatively gets a global:* claim
+-- (held until archive) so it serializes against everything (replaces the dropped one_executing); a claimless legacy
+-- draft would otherwise be frozen without claims once approved. Archived dispatches are unchanged.
 INSERT INTO dispatch_resource(run_id, resource)
-  SELECT run_id, 'global:*' FROM dispatch WHERE state IN ('staged', 'executing', 'done', 'reconciled');
+  SELECT run_id, 'global:*' FROM dispatch WHERE state IN ('draft', 'staged', 'executing', 'done', 'reconciled');
 CREATE TRIGGER dispatch_resource_draft_only_i BEFORE INSERT ON dispatch_resource
 WHEN (SELECT state FROM dispatch WHERE run_id = NEW.run_id) IS NOT 'draft'
 BEGIN SELECT RAISE(ABORT, 'dispatch resources are pinned while the dispatch is a draft'); END;
@@ -538,8 +539,9 @@ CREATE TABLE dispatch_launch (
 CREATE TRIGGER launch_reserve_state BEFORE INSERT ON dispatch_launch
 WHEN (SELECT state FROM dispatch WHERE run_id = NEW.run_id) NOT IN ('staged', 'executing')
   OR ((SELECT state FROM dispatch WHERE run_id = NEW.run_id) = 'executing'
-      AND (SELECT executor_pane FROM dispatch WHERE run_id = NEW.run_id) IS NOT NEW.pane_id)
-BEGIN SELECT RAISE(ABORT, 'a launch is reserved for a staged dispatch, or an executing dispatch at its own executor pane'); END;
+      AND ((SELECT executor_pane FROM dispatch WHERE run_id = NEW.run_id) IS NOT NEW.pane_id
+           OR (SELECT brief_id FROM dispatch WHERE run_id = NEW.run_id) IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'a launch is reserved for a staged dispatch, or a legacy executing dispatch at its own executor pane'); END;
 CREATE TRIGGER launch_edges BEFORE UPDATE OF state ON dispatch_launch
 WHEN NEW.state IS NOT OLD.state AND (OLD.state, NEW.state) NOT IN (VALUES
   ('reserved', 'sent'), ('reserved', 'uncertain'), ('uncertain', 'sent'), ('uncertain', 'reserved'),
@@ -577,17 +579,18 @@ WHERE c.resource = o.resource
             OR instr(substr(o.resource, instr(o.resource, ':') + 1), substr(c.resource, instr(c.resource, ':') + 1) || '/') = 1));
 
 CREATE TRIGGER launch_reserve_guard BEFORE INSERT ON dispatch_launch
-WHEN (SELECT count(DISTINCT run_id) FROM launch_active WHERE run_id <> NEW.run_id) + 1
-      > (SELECT max_parallel FROM execution_policy WHERE id = 1)
+WHEN ((SELECT state FROM dispatch WHERE run_id = NEW.run_id) = 'staged' AND (
+    (SELECT count(DISTINCT run_id) FROM launch_active WHERE run_id <> NEW.run_id) + 1
+        > (SELECT max_parallel FROM execution_policy WHERE id = 1)
+    OR ((SELECT route FROM dispatch WHERE run_id = NEW.run_id) IS NOT NULL
+        AND EXISTS (SELECT 1 FROM claim_holders WHERE route = (SELECT route FROM dispatch WHERE run_id = NEW.run_id)
+                    AND run_id <> NEW.run_id))
+    OR EXISTS (SELECT 1 FROM resource_conflicts rc WHERE rc.a = NEW.run_id
+               AND rc.b IN (SELECT run_id FROM claim_holders))
+    OR NOT EXISTS (SELECT 1 FROM dispatch_resource WHERE run_id = NEW.run_id)))
   OR EXISTS (SELECT 1 FROM dispatch_launch WHERE pane_id = NEW.pane_id AND run_id <> NEW.run_id)
   OR EXISTS (SELECT 1 FROM dispatch WHERE executor_pane = NEW.pane_id AND state = 'executing'
              AND run_id <> NEW.run_id)
-  OR ((SELECT route FROM dispatch WHERE run_id = NEW.run_id) IS NOT NULL
-      AND EXISTS (SELECT 1 FROM claim_holders WHERE route = (SELECT route FROM dispatch WHERE run_id = NEW.run_id)
-                  AND run_id <> NEW.run_id))
-  OR EXISTS (SELECT 1 FROM resource_conflicts rc WHERE rc.a = NEW.run_id
-             AND rc.b IN (SELECT run_id FROM claim_holders))
-  OR NOT EXISTS (SELECT 1 FROM dispatch_resource WHERE run_id = NEW.run_id)
 BEGIN SELECT RAISE(ABORT, 'launch conflicts with capacity, pane, route or a held resource, or the run has no claims'); END;
 
 CREATE TRIGGER dispatch_execute_guard BEFORE UPDATE OF state ON dispatch
