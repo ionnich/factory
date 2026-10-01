@@ -38,6 +38,8 @@ class Briefs(unittest.TestCase):
                           contexts=[Context(name="ctx", repo="Finks-ai/finks-ddd", domains=["My Domain"],
                                             route="fx-news")],
                           repos={}, witnesses={})
+        self.c.execute("INSERT INTO linear_project(id,slug_id,name,lead_email,fetched_at) VALUES "
+                       "('p1','my-domain','My Domain','me@example.com',?)", (SNAP,))
         for ident in ("FIN-1", "FIN-2"):
             self.c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,'unstarted',1,?)",
                            (ident.lower(), ident, SNAP, SNAP, _raw(ident=ident)))
@@ -45,6 +47,18 @@ class Briefs(unittest.TestCase):
                            "created_at,created_by) VALUES (?,?,'ctx','Finks-ai/finks-ddd','valid','r','[\"e\"]',?,'t')",
                            (ident.lower(), SNAP, SNAP))
         self.c.execute("INSERT INTO repo_trunk VALUES ('Finks-ai/finks-ddd','main','sha',?)", (SNAP,))
+
+    def verify(self, brief_id, identifier, issue_id):
+        """What the prune slice does: supersede the current verdict and bind a fresh valid one to this exact version."""
+        self.c.execute("UPDATE verdict SET superseded_at=? WHERE issue_id=? AND superseded_at IS NULL",
+                       (SNAP, issue_id))
+        self.c.execute("INSERT INTO verdict(issue_id,snapshot_updated_at,context,repo,kind,reason,evidence_json,"
+                       "created_at,created_by) VALUES (?,?,'ctx','Finks-ai/finks-ddd','valid','r','[\"e\"]',?,'prune')",
+                       (issue_id, SNAP, SNAP))
+        vid = self.c.execute("SELECT max(id) FROM verdict").fetchone()[0]
+        self.c.execute("INSERT INTO brief_verdict(brief_id,issue_id,verdict_id) VALUES (?,?,?)",
+                       (brief_id, issue_id, vid))
+        return vid
 
     def test_create_draft_defaults_global_resource(self):
         b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli")
@@ -113,17 +127,19 @@ class Briefs(unittest.TestCase):
         (row,) = strategy.ready(self.cfg, self.c)
         self.assertFalse(row["ready"])
         self.assertIn("dependency FIN-2 is unmet", row["blockers"])
-        # the dependency is recorded completed -> met
+        self.assertIn("source FIN-1 has no verdict for this version", row["blockers"])  # unverified too
+        # the dependency is recorded completed -> met, and the version is verified -> fully ready
         self.c.execute("INSERT INTO linear_snapshot VALUES ('fin-2','FIN-2',?,?,'completed',1,?)",
                        ("2026-09-02T00:00:00Z", "2026-09-02T00:00:00Z", _raw(ident="FIN-2", state="completed")))
+        self.verify(b["id"], "FIN-1", "fin-1")
         (row,) = strategy.ready(self.cfg, self.c)
         self.assertTrue(row["ready"])
         self.assertEqual(row["blockers"], [])
-        # source changed since capture -> needs-amendment, no longer ready
+        # source changed since capture -> needs-amendment, no longer intent-ready
         self.c.execute("INSERT INTO linear_snapshot VALUES ('fin-1','FIN-1',?,?,'unstarted',1,?)",
-                       ("2026-09-02T00:00:00Z", "2026-09-02T00:00:00Z", _raw(ident="FIN-1")))
+                       ("2026-09-03T00:00:00Z", "2026-09-03T00:00:00Z", _raw(ident="FIN-1")))
         (row,) = strategy.ready(self.cfg, self.c)
-        self.assertFalse(row["ready"])
+        self.assertFalse(row["intent_ready"])
         self.assertIn("source changed since capture: FIN-1", row["blockers"])
 
     def test_ready_excludes_consumed_brief(self):
@@ -177,6 +193,59 @@ class Briefs(unittest.TestCase):
             self.c.execute("INSERT INTO dispatch_resource VALUES ('d1','repo:x')")
         with self.assertRaises(sqlite3.IntegrityError):  # held until archived
             self.c.execute("DELETE FROM dispatch_resource WHERE run_id='d1'")
+
+    def test_approve_refuses_source_drift(self):
+        b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body())
+        self.c.execute("INSERT INTO linear_snapshot VALUES ('fin-1','FIN-1',?,?,'unstarted',1,?)",
+                       ("2026-09-02T00:00:00Z", "2026-09-02T00:00:00Z", _raw(ident="FIN-1")))
+        with self.assertRaises(StageError):
+            strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")
+
+    def test_agent_cannot_publish(self):
+        b = strategy.create(self.cfg, self.c, ["FIN-1"], "agent:factory-chat", _body())
+        with self.assertRaises(StageError):
+            strategy.approve(self.cfg, self.c, b["id"], "agent:factory-chat")
+        strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")  # a person may
+        with self.assertRaises(StageError):
+            strategy.hold(self.cfg, self.c, b["id"], "why", "factory:propose")
+
+    def test_ready_requires_exact_version_verdict(self):
+        b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body())
+        strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")
+        (row,) = strategy.ready(self.cfg, self.c)
+        self.assertFalse(row["verified"])  # the captured source verdict is never borrowed
+        self.assertFalse(row["ready"])
+        self.verify(b["id"], "FIN-1", "fin-1")
+        (row,) = strategy.ready(self.cfg, self.c)
+        self.assertTrue(row["verified"])
+        self.assertTrue(row["ready"])
+
+    def test_draft_amendment_does_not_supersede_approved(self):
+        a = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body())
+        strategy.approve(self.cfg, self.c, a["id"], "user:dashboard")
+        self.verify(a["id"], "FIN-1", "fin-1")
+        strategy.revise(self.cfg, self.c, a["id"], _body(title="T2"), "source changed", "user:cli")
+        (row,) = strategy.ready(self.cfg, self.c)  # the approved intent is still current
+        self.assertEqual(row["id"], a["id"])
+        self.assertTrue(row["ready"])
+
+    def test_superseding_approval_queues_only_latest(self):
+        a = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body())
+        strategy.approve(self.cfg, self.c, a["id"], "user:dashboard")
+        self.verify(a["id"], "FIN-1", "fin-1")
+        draft = strategy.revise(self.cfg, self.c, a["id"], _body(title="T2"), "amended", "user:cli")
+        strategy.approve(self.cfg, self.c, draft["id"], "user:dashboard")
+        self.verify(draft["id"], "FIN-1", "fin-1")
+        self.assertEqual([r["id"] for r in strategy.ready(self.cfg, self.c)], [draft["id"]])
+        self.assertEqual(strategy.get(self.c, a["id"])["state"], "approved")  # prior version stays readable
+
+    def test_brief_verdict_issue_consistency(self):
+        b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body())
+        strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")
+        other = self.c.execute("SELECT id FROM verdict WHERE issue_id='fin-2'").fetchone()[0]
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.c.execute("INSERT INTO brief_verdict(brief_id,issue_id,verdict_id) VALUES (?,?,?)",
+                           (b["id"], "fin-1", other))
 
 
 if __name__ == "__main__":

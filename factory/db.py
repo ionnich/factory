@@ -409,9 +409,10 @@ BEGIN SELECT RAISE(ABORT, 'a decision''s clock (notified_at, due_at) is set once
     # stays in Draft until the gate offers it or a plan for it is refused.
     20: """ALTER TABLE dispatch ADD COLUMN planning_requested_at TEXT;
 ALTER TABLE dispatch ADD COLUMN planning_error TEXT;""",
-    # v21: Strategy work briefs (immutable published versions) and brief-backed scheduling. one_executing is dropped
-    # and replaced by capacity/route/pane/resource admission guards; legacy active dispatches conservatively get a
-    # global:* claim so they serialize against everything until archived (no change to how they finish).
+    # v21: Strategy work briefs (immutable published versions + exact-version brief_verdict) and brief-backed
+    # scheduling. one_executing is dropped and replaced by capacity/route/pane/resource admission guards; legacy
+    # active/done/reconciled dispatches conservatively get a global:* claim so they serialize against everything
+    # until archived (no change to how they finish).
     21: """CREATE TABLE work_brief (
   id INTEGER PRIMARY KEY,
   revision INTEGER NOT NULL CHECK (revision >= 1),
@@ -462,6 +463,21 @@ BEGIN SELECT RAISE(ABORT, 'hold audit is append-only'); END;
 CREATE TRIGGER work_brief_hold_append_only_d BEFORE DELETE ON work_brief_hold
 BEGIN SELECT RAISE(ABORT, 'hold audit is append-only'); END;
 
+CREATE TABLE brief_verdict (
+  brief_id INTEGER NOT NULL REFERENCES work_brief(id),
+  issue_id TEXT NOT NULL,
+  verdict_id INTEGER NOT NULL REFERENCES verdict(id),
+  PRIMARY KEY (brief_id, issue_id)
+);
+CREATE TRIGGER brief_verdict_issue_i BEFORE INSERT ON brief_verdict
+WHEN (SELECT issue_id FROM verdict WHERE id = NEW.verdict_id) IS NOT NEW.issue_id
+BEGIN SELECT RAISE(ABORT, 'brief_verdict verdict must belong to the same issue'); END;
+CREATE TRIGGER brief_verdict_issue_u BEFORE UPDATE OF issue_id, verdict_id ON brief_verdict
+WHEN (SELECT issue_id FROM verdict WHERE id = NEW.verdict_id) IS NOT NEW.issue_id
+BEGIN SELECT RAISE(ABORT, 'brief_verdict verdict must belong to the same issue'); END;
+CREATE TRIGGER brief_verdict_key_frozen BEFORE UPDATE OF brief_id, issue_id ON brief_verdict
+BEGIN SELECT RAISE(ABORT, 'brief_verdict version/source key is immutable'); END;
+
 ALTER TABLE dispatch ADD COLUMN brief_id INTEGER REFERENCES work_brief(id);
 CREATE UNIQUE INDEX dispatch_one_brief ON dispatch(brief_id) WHERE brief_id IS NOT NULL;
 
@@ -470,9 +486,10 @@ CREATE TABLE dispatch_resource (
   resource TEXT NOT NULL,
   PRIMARY KEY (run_id, resource)
 );
--- Legacy active dispatches hold global:* so they serialize against everything (replaces the dropped one_executing).
+-- Legacy active/done/reconciled history conservatively gets a global:* claim (held until archive) so it serializes
+-- against everything (replaces the dropped one_executing). Archived dispatches are unchanged.
 INSERT INTO dispatch_resource(run_id, resource)
-  SELECT run_id, 'global:*' FROM dispatch WHERE state IN ('staged', 'executing');
+  SELECT run_id, 'global:*' FROM dispatch WHERE state IN ('staged', 'executing', 'done', 'reconciled');
 CREATE TRIGGER dispatch_resource_draft_only_i BEFORE INSERT ON dispatch_resource
 WHEN (SELECT state FROM dispatch WHERE run_id = NEW.run_id) IS NOT 'draft'
 BEGIN SELECT RAISE(ABORT, 'dispatch resources are pinned while the dispatch is a draft'); END;
@@ -505,9 +522,11 @@ WHEN NEW.state IS NOT OLD.state AND (OLD.state, NEW.state) NOT IN (VALUES
   ('reserved', 'sent'), ('reserved', 'uncertain'), ('uncertain', 'sent'), ('uncertain', 'reserved'))
 BEGIN SELECT RAISE(ABORT, 'illegal launch state transition'); END;
 CREATE TRIGGER launch_release_guard BEFORE DELETE ON dispatch_launch
-WHEN OLD.state IN ('sent', 'uncertain')
- AND (SELECT state FROM dispatch WHERE run_id = OLD.run_id) NOT IN ('done', 'reconciled', 'archived')
-BEGIN SELECT RAISE(ABORT, 'a sent/uncertain launch is released only once its dispatch is terminal'); END;
+WHEN OLD.state = 'uncertain'
+   OR (OLD.state = 'sent' AND (SELECT state FROM dispatch WHERE run_id = OLD.run_id)
+       NOT IN ('done', 'reconciled', 'archived'))
+BEGIN SELECT RAISE(ABORT, 'a sent launch is released only once its dispatch is terminal; an uncertain launch only '
+                           'via explicit safe release (uncertain -> reserved -> delete)'); END;
 
 CREATE VIEW launch_active AS
   SELECT run_id, route, executor_pane AS pane_id FROM dispatch WHERE state = 'executing'
@@ -516,10 +535,10 @@ CREATE VIEW launch_active AS
    WHERE l.state IN ('reserved', 'sent', 'uncertain')
      AND d.state NOT IN ('done', 'reconciled', 'archived');
 
-CREATE VIEW resource_holders AS
-  SELECT run_id FROM dispatch WHERE state IN ('executing', 'done', 'reconciled')
+CREATE VIEW claim_holders AS
+  SELECT run_id, route FROM dispatch WHERE state IN ('executing', 'done', 'reconciled')
   UNION
-  SELECT l.run_id FROM dispatch_launch l JOIN dispatch d ON d.run_id = l.run_id
+  SELECT l.run_id, d.route FROM dispatch_launch l JOIN dispatch d ON d.run_id = l.run_id
    WHERE l.state IN ('reserved', 'sent', 'uncertain')
      AND d.state NOT IN ('done', 'reconciled', 'archived');
 
@@ -538,20 +557,22 @@ CREATE TRIGGER launch_reserve_guard BEFORE INSERT ON dispatch_launch
 WHEN (SELECT count(DISTINCT run_id) FROM launch_active) + 1 > (SELECT max_parallel FROM execution_policy WHERE id = 1)
   OR EXISTS (SELECT 1 FROM launch_active WHERE pane_id = NEW.pane_id)
   OR ((SELECT route FROM dispatch WHERE run_id = NEW.run_id) IS NOT NULL
-      AND EXISTS (SELECT 1 FROM launch_active WHERE route = (SELECT route FROM dispatch WHERE run_id = NEW.run_id)))
+      AND EXISTS (SELECT 1 FROM claim_holders WHERE route = (SELECT route FROM dispatch WHERE run_id = NEW.run_id)))
   OR EXISTS (SELECT 1 FROM resource_conflicts rc WHERE rc.a = NEW.run_id
-             AND rc.b IN (SELECT run_id FROM resource_holders))
-BEGIN SELECT RAISE(ABORT, 'launch conflicts with capacity, pane, route or a held resource'); END;
+             AND rc.b IN (SELECT run_id FROM claim_holders))
+  OR NOT EXISTS (SELECT 1 FROM dispatch_resource WHERE run_id = NEW.run_id)
+BEGIN SELECT RAISE(ABORT, 'launch conflicts with capacity, pane, route or a held resource, or the run has no claims'); END;
 
 CREATE TRIGGER dispatch_execute_guard BEFORE UPDATE OF state ON dispatch
 WHEN OLD.state = 'staged' AND NEW.state = 'executing' AND (
   (SELECT count(DISTINCT run_id) FROM launch_active WHERE run_id <> NEW.run_id) + 1
       > (SELECT max_parallel FROM execution_policy WHERE id = 1)
   OR EXISTS (SELECT 1 FROM launch_active WHERE pane_id = NEW.executor_pane AND run_id <> NEW.run_id)
-  OR (NEW.route IS NOT NULL AND EXISTS (SELECT 1 FROM launch_active WHERE route = NEW.route AND run_id <> NEW.run_id))
+  OR (NEW.route IS NOT NULL AND EXISTS (SELECT 1 FROM claim_holders WHERE route = NEW.route AND run_id <> NEW.run_id))
   OR EXISTS (SELECT 1 FROM resource_conflicts rc WHERE rc.a = NEW.run_id
-             AND rc.b IN (SELECT run_id FROM resource_holders WHERE run_id <> NEW.run_id)))
-BEGIN SELECT RAISE(ABORT, 'execute conflicts with capacity, pane, route or a held resource'); END;
+             AND rc.b IN (SELECT run_id FROM claim_holders WHERE run_id <> NEW.run_id))
+  OR NOT EXISTS (SELECT 1 FROM dispatch_resource WHERE run_id = NEW.run_id))
+BEGIN SELECT RAISE(ABORT, 'execute conflicts with capacity, pane, route or a held resource, or the run has no claims'); END;
 
 CREATE TRIGGER dispatch_execute_launch BEFORE UPDATE OF state ON dispatch
 WHEN OLD.state = 'staged' AND NEW.state = 'executing' AND NEW.brief_id IS NOT NULL

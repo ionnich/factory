@@ -35,6 +35,7 @@ OUTCOME_MAX = 8000
 ITEM_MAX = 2000
 LIST_MAX = 200
 VALID_TTL = timedelta(days=7)  # mirrors prune.VALID_TTL for the DB-only staleness signal
+AGENT_PREFIX = ("agent:", "factory:")  # system actors: never publish intent or readiness
 
 
 # --------------------------------------------------------------------------- sources (server-captured)
@@ -217,6 +218,14 @@ def _ensure_acyclic(conn, own_ids: set[str], deps: list[str], exclude_id: int | 
 
 
 # --------------------------------------------------------------------------- read helpers
+def _require_human(actor) -> str:
+    """Only a person publishes intent or readiness: user:dashboard, user:factory-chat (externally confirmed) or an
+    explicit CLI user. Agents (agent:*, factory:*) may groom and revise drafts, never approve/hold/amend."""
+    if not actor or actor.startswith(AGENT_PREFIX):
+        raise StageError("only a person publishes briefs (agents cannot approve, hold or amend)")
+    return actor
+
+
 def _row(conn, brief_id):
     row = conn.execute("SELECT * FROM work_brief WHERE id=?", (brief_id,)).fetchone()
     if row is None:
@@ -320,35 +329,39 @@ def _run_groom(sources: list[dict]) -> dict:
 
 # --------------------------------------------------------------------------- public API
 def overview(cfg: Config, conn) -> dict:
-    """Pure cached-DB read: briefs, the Strategy source list, policy and active scheduling. No model/network."""
-    heads = [r[0] for r in conn.execute(
-        "SELECT id FROM work_brief WHERE id NOT IN (SELECT parent_id FROM work_brief WHERE parent_id IS NOT NULL) "
-        "ORDER BY id")]
+    """Pure cached-DB read: every brief version, the Strategy source list, policy and active scheduling. No
+    model/network. Prior versions stay readable; a draft amendment does not hide the current approved intent."""
     briefs = []
-    for bid in heads:
-        row = _row(conn, bid)
+    for row in conn.execute("SELECT * FROM work_brief ORDER BY id").fetchall():
         body = json.loads(row["body_json"])
         sources = json.loads(row["sources_json"])
         changed = [s["identifier"] for s in sources if _source_changed(conn, s)]
+        verified = _verdicts(conn, row["id"], sources)[0]
+        link = conn.execute("SELECT run_id, state FROM dispatch WHERE brief_id=?", (row["id"],)).fetchone()
         blockers = ([f"held: {row['hold_reason']}"] if row["state"] == "held" else [])
         blockers += ([f"needs-amendment: {', '.join(changed)}"] if changed else [])
-        link = conn.execute("SELECT run_id, state FROM dispatch WHERE brief_id=?", (bid,)).fetchone()
-        briefs.append({"id": row["id"], "revision": row["revision"], "state": row["state"],
-                       "title": body["title"], "sources": [s["identifier"] for s in sources],
+        readiness = ("draft" if row["state"] == "draft"
+                     else "held" if row["state"] == "held"
+                     else "needs-amendment" if changed
+                     else "verification-pending" if not verified
+                     else "ready")
+        briefs.append({"id": row["id"], "revision": row["revision"], "parent_id": row["parent_id"],
+                       "state": row["state"], "title": body["title"],
+                       "sources": [s["identifier"] for s in sources],
                        "created_at": row["created_at"], "created_by": row["created_by"],
                        "approved_at": row["approved_at"], "source_changed": changed,
-                       "readiness": (blockers[0] if blockers else "ready"), "blockers": blockers,
+                       "verified": verified, "readiness": readiness, "blockers": blockers,
                        "dispatch": {"run_id": link["run_id"], "state": link["state"]} if link else None})
     tickets = _ticket_list(cfg, conn)
     policy = conn.execute("SELECT max_parallel FROM execution_policy WHERE id=1").fetchone()
-    active = [{"run_id": d["run_id"], "state": d["state"], "route": d["route"],
-               "pane": (launch["pane_id"] if (launch := conn.execute(
-                   "SELECT pane_id, state FROM dispatch_launch WHERE run_id=?", (d["run_id"],)).fetchone())
-               else d["executor_pane"]),
-               "resources": [r["resource"] for r in conn.execute(
-                   "SELECT resource FROM dispatch_resource WHERE run_id=? ORDER BY resource", (d["run_id"],))]}
-              for d in conn.execute("SELECT run_id, state, route, executor_pane FROM dispatch "
-                                    "WHERE state IN ('staged','executing') ORDER BY created_at")]
+    active = []
+    for d in conn.execute("SELECT run_id, state, route, executor_pane FROM dispatch "
+                          "WHERE state IN ('staged','executing') ORDER BY created_at").fetchall():
+        launch = conn.execute("SELECT pane_id, state FROM dispatch_launch WHERE run_id=?", (d["run_id"],)).fetchone()
+        active.append({"run_id": d["run_id"], "state": d["state"], "route": d["route"],
+                       "pane": launch["pane_id"] if launch else d["executor_pane"],
+                       "resources": [r["resource"] for r in conn.execute(
+                           "SELECT resource FROM dispatch_resource WHERE run_id=? ORDER BY resource", (d["run_id"],))]})
     return {"briefs": briefs, "tickets": tickets,
             "policy": {"max_parallel": policy["max_parallel"] if policy else 2}, "active": active}
 
@@ -385,6 +398,7 @@ def revise(cfg: Config, conn, brief_id, body, reason, actor) -> dict:
             conn.execute("UPDATE work_brief SET body_json=?, amendment_reason=coalesce(?, amendment_reason) "
                          "WHERE id=?", (json.dumps(norm), (reason or "").strip() or None, brief_id))
         return get(conn, brief_id)
+    _require_human(actor)  # amending a published brief is a publish-adjacent operation; agents may revise drafts only
     reason = (reason or "").strip()
     if not reason:
         raise StageError("amending a published brief needs a reason")
@@ -400,12 +414,17 @@ def revise(cfg: Config, conn, brief_id, body, reason, actor) -> dict:
 
 
 def approve(cfg: Config, conn, brief_id, actor) -> dict:
-    """Publish intent: validate the draft and freeze body + sources. Intent approval only — verification may stay
-    pending. Source drift since capture is a readiness concern, not an approval block."""
+    """Publish intent: validate the draft, refuse source drift (visible amendment needed), then freeze body +
+    sources. Intent approval only — verification stays pending until the prune slice writes brief_verdict. Agents
+    cannot publish; a new version needs its own explicit prune (prior-version verdicts are never borrowed)."""
+    _require_human(actor)
     row = _row(conn, brief_id)
     if row["state"] != "draft":
         raise StageError(f"brief #{brief_id} is {row['state']}, not a draft")
     sources = json.loads(row["sources_json"])
+    drift = [s["identifier"] for s in sources if _source_changed(conn, s)]
+    if drift:
+        raise StageError(f"source changed since capture: {', '.join(drift)}; amend before approving")
     norm = _validate_body(json.loads(row["body_json"]), sources)
     repos, route = _derived_resources(sources)
     norm["resources"] = _merge_resources(norm["resources"], repos, route)  # idempotent re-merge
@@ -420,6 +439,7 @@ def approve(cfg: Config, conn, brief_id, actor) -> dict:
 
 def hold(cfg: Config, conn, brief_id, reason, actor) -> dict:
     """Explicit readiness hold on an approved brief; intent and version are preserved. Audit is append-only."""
+    _require_human(actor)
     row = _row(conn, brief_id)
     if row["state"] != "approved":
         raise StageError(f"brief #{brief_id} is {row['state']}, not approved")
@@ -436,6 +456,7 @@ def hold(cfg: Config, conn, brief_id, reason, actor) -> dict:
 
 def unhold(cfg: Config, conn, brief_id, actor) -> dict:
     """Release an explicit hold; the brief returns to approved unchanged."""
+    _require_human(actor)
     row = _row(conn, brief_id)
     if row["state"] != "held":
         raise StageError(f"brief #{brief_id} is {row['state']}, not held")
@@ -480,6 +501,52 @@ def _source_changed(conn, s: dict) -> bool:
     return cur is not None and cur["updated_at"] != s["snapshot_updated_at"]
 
 
+def _current_published(conn) -> list[int]:
+    """The latest published (approved|held) version id per lineage. A draft amendment (higher revision, still draft)
+    does NOT silently supersede the current approved intent; only an approved/held later revision does."""
+    rows = conn.execute("SELECT id, parent_id, revision, state FROM work_brief").fetchall()
+    parent = {r["id"]: r["parent_id"] for r in rows}
+
+    def root(i):
+        while parent.get(i) is not None:
+            i = parent[i]
+        return i
+
+    best: dict[int, tuple[int, int]] = {}
+    for r in rows:
+        if r["state"] in ("approved", "held"):
+            rt = root(r["id"])
+            if rt not in best or r["revision"] > best[rt][0]:
+                best[rt] = (r["revision"], r["id"])
+    return sorted(bid for _, bid in best.values())
+
+
+def _verdicts(conn, brief_id: int, sources: list[dict]) -> tuple[bool, list[dict], list[str]]:
+    """The exact-version verdict association (brief_verdict). A source counts verified only with a current valid
+    verdict bound to THIS brief version; a prior version's verdict (or the captured source verdict) is evidence,
+    never borrowed. Returns (verified, detail, blockers)."""
+    ok, detail, blockers = True, [], []
+    for s in sources:
+        r = conn.execute(
+            "SELECT bv.verdict_id, v.kind, v.superseded_at FROM brief_verdict bv "
+            "JOIN verdict v ON v.id = bv.verdict_id WHERE bv.brief_id=? AND bv.issue_id=?",
+            (brief_id, s["issue_id"])).fetchone()
+        if r is None:
+            ok = False
+            blockers.append(f"source {s['identifier']} has no verdict for this version")
+            detail.append({"identifier": s["identifier"], "issue_id": s["issue_id"], "verdict_id": None,
+                           "valid": False, "why": "unverified"})
+        elif r["superseded_at"] is not None or r["kind"] != "valid":
+            ok = False
+            blockers.append(f"source {s['identifier']} verdict is {r['kind']}, not a current valid verdict")
+            detail.append({"identifier": s["identifier"], "issue_id": s["issue_id"],
+                           "verdict_id": r["verdict_id"], "valid": False, "why": r["kind"]})
+        else:
+            detail.append({"identifier": s["identifier"], "issue_id": s["issue_id"],
+                           "verdict_id": r["verdict_id"], "valid": True, "why": None})
+    return ok, detail, blockers
+
+
 def _dependency_status(conn, identifier: str) -> str:
     """Dependencies count ready only on a recorded completed/accepted fact, never a title or model assertion."""
     s = conn.execute("SELECT * FROM linear_latest WHERE identifier=?", (identifier,)).fetchone()
@@ -492,31 +559,63 @@ def _dependency_status(conn, identifier: str) -> str:
     return "ready" if (v and v["kind"] == "already-done") else "unmet"
 
 
+def _source_safety(cfg: Config, conn, s: dict) -> str | None:
+    """DB-only source safeguards for an approved brief: completed, foreign domain, unmapped, no route, foreign
+    assignee, QA review. Backlog (owned, mapped, routed) is explicitly publishable and not blocked here."""
+    cur = conn.execute("SELECT * FROM linear_latest WHERE issue_id=?", (s["issue_id"],)).fetchone()
+    if cur is None:
+        return None
+    raw = json.loads(cur["raw_json"])
+    if cur["state_type"] == "completed":
+        return f"source {s['identifier']} is completed"
+    ctx, _ = prune.map_context(cfg, cur)
+    if ctx is None:
+        return f"source {s['identifier']} is unmapped (no bounded context)"
+    if not prune.owned(cfg, conn, cur):
+        return f"source {s['identifier']} is not owned (foreign domain)"
+    if ctx.owner(prune.issue_fields(cur)[0]) is None:
+        return f"source {s['identifier']} has no factory-fleet owner (route)"
+    lead = cfg.linear["lead"]
+    assignee = (raw["assignee"] or {}).get("email")
+    if assignee not in (None, lead):
+        return f"source {s['identifier']} is assigned to {assignee}"
+    review = {k: t.get("review_state") for k, t in cfg.linear.get("team", {}).items()}
+    if raw["state"]["name"] == review.get(raw["team"]["key"]):
+        return f"source {s['identifier']} is in QA review"
+    return None
+
+
 def ready(cfg: Config, conn) -> list[dict]:
-    """Approved, unconsumed current (head) briefs, each with a ready bool and string blockers. No mutation/network."""
+    """The current published (approved|held) unconsumed brief, one per lineage, with intent-ready vs verified-ready.
+
+    intent_ready = approved, not held, no source drift, dependencies met (the prune slice may now verify it).
+    verified = every source has a current valid verdict bound to THIS version via brief_verdict.
+    ready = intent_ready AND verified (the stage slice may now stage it). Pure read: no mutation/network.
+    """
     out = []
-    for (bid,) in conn.execute(
-            "SELECT id FROM work_brief WHERE id NOT IN (SELECT parent_id FROM work_brief WHERE parent_id IS NOT NULL) "
-            "ORDER BY id"):
+    for bid in _current_published(conn):
         row = _row(conn, bid)
-        if row["state"] not in ("approved", "held"):
-            continue
         if conn.execute("SELECT 1 FROM dispatch WHERE brief_id=?", (bid,)).fetchone():
             continue  # consumed: a dispatch already pins this version
         b = _brief(conn, row)
-        blockers, changed = [], []
+        intent_blockers, changed = [], []
         for s in b["sources"]:
             if _source_changed(conn, s):
                 changed.append(s["identifier"])
+            elif (why := _source_safety(cfg, conn, s)):
+                intent_blockers.append(why)
         if changed:
-            blockers.append(f"source changed since capture: {', '.join(changed)}")
+            intent_blockers.append(f"source changed since capture: {', '.join(changed)}")
         deps = [{"identifier": d, "status": _dependency_status(conn, d)} for d in b["body"]["dependencies"]]
-        blockers += [f"dependency {d['identifier']} is {d['status']}" for d in deps if d["status"] != "ready"]
+        intent_blockers += [f"dependency {d['identifier']} is {d['status']}" for d in deps if d["status"] != "ready"]
         if row["state"] == "held":
-            blockers.append(f"held: {row['hold_reason'] or 'no reason'}")
+            intent_blockers.append(f"held: {row['hold_reason'] or 'no reason'}")
+        intent_ready = row["state"] == "approved" and not intent_blockers
+        verified, verdicts, vblockers = _verdicts(conn, bid, b["sources"])
         item = dict(b)
-        item.update(ready=(row["state"] == "approved" and not blockers), blockers=blockers,
-                    source_changed=changed, dependencies=deps)
+        item.update(ready=(intent_ready and verified), intent_ready=intent_ready, verified=verified,
+                    blockers=intent_blockers + vblockers, source_changed=changed,
+                    dependencies=deps, verdicts=verdicts)
         out.append(item)
     return out
 
