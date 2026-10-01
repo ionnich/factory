@@ -96,18 +96,18 @@ def _conflict(a: str, b: str) -> bool:
 
 
 def _merge_resources(body_resources: list[str], repos: list[str], route: str) -> list[str]:
-    """Server-derived repo:/route: are always present; global:* is the default until the operator names at least
-    one explicit non-mandatory resource (the reviewed signal). Repo/route cannot be added or removed by an editor."""
+    """Server-derived repo:/route: are always present and never removable/editable. global:* is the conservative
+    default when the editor names no explicit resource; an explicit `global:*` is preserved (a human can name it
+    alongside other keys for a deliberate serial claim, or omit it for repo-only work). Only a human decides."""
     mandatory = [*repos, route]
-    explicit = [r for r in body_resources
-                if not r.startswith("repo:") and not r.startswith("route:") and r != "global:*"]
-    merged = mandatory + explicit
+    explicit = [r for r in body_resources if not r.startswith("repo:") and not r.startswith("route:")]
     if not explicit:
-        merged.append("global:*")
+        explicit = ["global:*"]  # no explicit decision -> conservative serial
+    merged = mandatory + explicit
     if len(set(merged)) != len(merged):
         raise StageError("duplicate resource key")
-    # global:* is the default serialization marker, not a specific claim: it conflicts with other dispatches only,
-    # never with this brief's own derived repo/route.
+    # global:* is a serialization marker, not a specific claim: it conflicts with other dispatches only, never with
+    # this brief's own derived repo/route.
     specific = [r for r in merged if not r.startswith("global:")]
     for i in range(len(specific)):
         for j in range(i + 1, len(specific)):
@@ -165,9 +165,10 @@ def _validate_body(body, sources: list[dict]) -> dict:
             "resources": resources, "risks": risks, "evidence": evidence}
 
 
-def _normalize_body(body, sources: list[dict], model: bool = False) -> dict:
-    """Validate then merge resources. model=True (groom) never trusts model-named resources: global:* default."""
-    if model:
+def _normalize_body(body, sources: list[dict], trust_resources: bool = True) -> dict:
+    """Validate then merge resources. trust_resources=False (model/agent) ignores body resources so the review signal
+    can only come from a human: global:* default. Only a human can keep or drop global:* explicitly."""
+    if not trust_resources:
         body = {**body, "resources": []}
     norm = _validate_body(body, sources)
     repos, route = _derived_resources(sources)
@@ -218,10 +219,15 @@ def _ensure_acyclic(conn, own_ids: set[str], deps: list[str], exclude_id: int | 
 
 
 # --------------------------------------------------------------------------- read helpers
+def _is_human(actor) -> bool:
+    """Whether the actor is a person (user:dashboard, user:factory-chat, CLI user), not an agent/system actor."""
+    return bool(actor) and not actor.startswith(AGENT_PREFIX)
+
+
 def _require_human(actor) -> str:
     """Only a person publishes intent or readiness: user:dashboard, user:factory-chat (externally confirmed) or an
     explicit CLI user. Agents (agent:*, factory:*) may groom and revise drafts, never approve/hold/amend."""
-    if not actor or actor.startswith(AGENT_PREFIX):
+    if not _is_human(actor):
         raise StageError("only a person publishes briefs (agents cannot approve, hold or amend)")
     return actor
 
@@ -278,9 +284,9 @@ def _parse_model_json(out: str) -> dict:
 
 def _groom_prompt(sources: list[dict]) -> str:
     ctx = [{"identifier": s["identifier"], "title": s["title"], "url": s["url"], "repo": s["repo"],
-            "context": s["context"], "description": s["description"][:3000],
-            "verdict_kind": s["verdict_kind"], "verdict_reason": (s["verdict_reason"] or "")[:3000],
-            "evidence": [str(e)[:300] for e in s["evidence"][:10]]} for s in sources]
+            "context": s["context"], "description": s["description"],
+            "verdict_kind": s["verdict_kind"], "verdict_reason": s["verdict_reason"] or "",
+            "evidence": s["evidence"]} for s in sources]
     lines = [
         "You are grooming an engineering work brief from the sources below. Output ONLY one JSON object — no prose, "
         "no markdown fences, no commentary.",
@@ -302,7 +308,10 @@ def _groom_prompt(sources: list[dict]) -> str:
         json.dumps(ctx, indent=2),
     ]
     prompt = "\n".join(lines)
-    return prompt if len(prompt.encode()) <= MAX_PROMPT_BYTES else prompt[:MAX_PROMPT_BYTES]
+    if len(prompt.encode()) > MAX_PROMPT_BYTES:
+        raise StageError(f"groom prompt is {len(prompt.encode())} bytes (limit {MAX_PROMPT_BYTES}); "
+                         "groom fewer sources at once — no source text is truncated")
+    return prompt
 
 
 def _run_groom(sources: list[dict]) -> dict:
@@ -371,7 +380,7 @@ def create(cfg: Config, conn, identifiers, actor, body=None) -> dict:
     Nothing is published until approve."""
     identifiers = _idents(identifiers)
     sources = _sources_for(cfg, conn, identifiers)
-    norm = _scaffold_body(sources) if body is None else _normalize_body(body, sources)
+    norm = _scaffold_body(sources) if body is None else _normalize_body(body, sources, _is_human(actor))
     _ensure_acyclic(conn, {s["identifier"] for s in sources}, norm["dependencies"], None)
     return _insert_draft(conn, sources, norm, actor)
 
@@ -381,31 +390,27 @@ def groom(cfg: Config, conn, identifiers, actor) -> dict:
     model-named resources are never trusted (global:* default until a human reviews)."""
     identifiers = _idents(identifiers)
     sources = _sources_for(cfg, conn, identifiers)
-    norm = _normalize_body(_run_groom(sources), sources, model=True)
+    norm = _normalize_body(_run_groom(sources), sources, False)
     _ensure_acyclic(conn, {s["identifier"] for s in sources}, norm["dependencies"], None)
     return _insert_draft(conn, sources, norm, actor)
 
 
 def revise(cfg: Config, conn, brief_id, body, reason, actor) -> dict:
-    """Edit an unpublished draft in place, or amend a published brief into a new draft revision (parent + reason +
-    freshly captured source versions). Published bodies are never overwritten."""
+    """Append a NEW draft version (a new id) on every revision — including revising an unpublished draft, so a
+    draft's body is never mutated in place. Published bodies are never overwritten; amending a published brief needs
+    a human and a reason. Each version re-captures its sources as they are now."""
     row = _row(conn, brief_id)
-    if row["state"] == "draft":
-        sources = json.loads(row["sources_json"])
-        norm = _normalize_body(body, sources)
-        _ensure_acyclic(conn, {s["identifier"] for s in sources}, norm["dependencies"], brief_id)
-        with db.tx(conn):
-            conn.execute("UPDATE work_brief SET body_json=?, amendment_reason=coalesce(?, amendment_reason) "
-                         "WHERE id=?", (json.dumps(norm), (reason or "").strip() or None, brief_id))
-        return get(conn, brief_id)
-    _require_human(actor)  # amending a published brief is a publish-adjacent operation; agents may revise drafts only
-    reason = (reason or "").strip()
-    if not reason:
+    if row["state"] != "draft":
+        _require_human(actor)  # amending a published brief is publish-adjacent; agents may revise drafts only
+    reason = (reason or "").strip() or None
+    if row["state"] != "draft" and not reason:
         raise StageError("amending a published brief needs a reason")
     sources = _sources_for(cfg, conn, [s["identifier"] for s in json.loads(row["sources_json"])])
-    norm = _normalize_body(body, sources)
+    norm = _normalize_body(body, sources, _is_human(actor))
     _ensure_acyclic(conn, {s["identifier"] for s in sources}, norm["dependencies"], None)
     with db.tx(conn):
+        if conn.execute("SELECT 1 FROM work_brief WHERE parent_id=?", (brief_id,)).fetchone():
+            raise StageError(f"brief #{brief_id} already has a newer revision; revise the latest version")
         cur = conn.execute(
             "INSERT INTO work_brief(revision, parent_id, state, body_json, sources_json, created_at, created_by, "
             "amendment_reason) VALUES (?, ?, 'draft', ?, ?, ?, ?, ?)",
@@ -415,25 +420,23 @@ def revise(cfg: Config, conn, brief_id, body, reason, actor) -> dict:
 
 def approve(cfg: Config, conn, brief_id, actor) -> dict:
     """Publish intent: validate the draft, refuse source drift (visible amendment needed), then freeze body +
-    sources. Intent approval only — verification stays pending until the prune slice writes brief_verdict. Agents
-    cannot publish; a new version needs its own explicit prune (prior-version verdicts are never borrowed)."""
+    sources — all inside ONE transaction so a concurrent revision is never implicitly approved. Intent approval only
+    — verification stays pending until the prune slice writes brief_verdict. Agents cannot publish."""
     _require_human(actor)
-    row = _row(conn, brief_id)
-    if row["state"] != "draft":
-        raise StageError(f"brief #{brief_id} is {row['state']}, not a draft")
-    sources = json.loads(row["sources_json"])
-    drift = [s["identifier"] for s in sources if _source_changed(conn, s)]
-    if drift:
-        raise StageError(f"source changed since capture: {', '.join(drift)}; amend before approving")
-    norm = _validate_body(json.loads(row["body_json"]), sources)
-    repos, route = _derived_resources(sources)
-    norm["resources"] = _merge_resources(norm["resources"], repos, route)  # idempotent re-merge
-    _ensure_acyclic(conn, {s["identifier"] for s in sources}, norm["dependencies"], brief_id)
-    with db.tx(conn):
-        cur = conn.execute("UPDATE work_brief SET state='approved', body_json=?, approved_at=?, approved_by=? "
-                           "WHERE id=? AND state='draft'", (json.dumps(norm), db.now(), actor, brief_id))
-        if cur.rowcount != 1:
-            raise StageError(f"brief #{brief_id} changed while validating; nothing was approved")
+    with db.tx(conn):  # BEGIN IMMEDIATE: validation + write are atomic against concurrent revisions
+        row = _row(conn, brief_id)
+        if row["state"] != "draft":
+            raise StageError(f"brief #{brief_id} is {row['state']}, not a draft")
+        sources = json.loads(row["sources_json"])
+        drift = [s["identifier"] for s in sources if _source_changed(conn, s)]
+        if drift:
+            raise StageError(f"source changed since capture: {', '.join(drift)}; amend before approving")
+        norm = _validate_body(json.loads(row["body_json"]), sources)
+        repos, route = _derived_resources(sources)
+        norm["resources"] = _merge_resources(norm["resources"], repos, route)  # idempotent re-merge
+        _ensure_acyclic(conn, {s["identifier"] for s in sources}, norm["dependencies"], brief_id)
+        conn.execute("UPDATE work_brief SET state='approved', body_json=?, approved_at=?, approved_by=? WHERE id=?",
+                     (json.dumps(norm), db.now(), actor, brief_id))
     return get(conn, brief_id)
 
 

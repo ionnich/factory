@@ -429,7 +429,7 @@ ALTER TABLE dispatch ADD COLUMN planning_error TEXT;""",
   CHECK ((approved_at IS NULL) = (approved_by IS NULL)),
   CHECK ((state IN ('approved', 'held')) = (approved_at IS NOT NULL))
 );
-CREATE INDEX work_brief_parent ON work_brief(parent_id) WHERE parent_id IS NOT NULL;
+CREATE UNIQUE INDEX work_brief_parent ON work_brief(parent_id) WHERE parent_id IS NOT NULL;
 CREATE TRIGGER work_brief_root_revision BEFORE INSERT ON work_brief
 WHEN NEW.parent_id IS NULL AND NEW.revision <> 1
 BEGIN SELECT RAISE(ABORT, 'a root work brief is revision 1'); END;
@@ -525,8 +525,7 @@ CREATE TRIGGER launch_release_guard BEFORE DELETE ON dispatch_launch
 WHEN OLD.state = 'uncertain'
    OR (OLD.state = 'sent' AND (SELECT state FROM dispatch WHERE run_id = OLD.run_id)
        NOT IN ('done', 'reconciled', 'archived'))
-BEGIN SELECT RAISE(ABORT, 'a sent launch is released only once its dispatch is terminal; an uncertain launch only '
-                           'via explicit safe release (uncertain -> reserved -> delete)'); END;
+BEGIN SELECT RAISE(ABORT, 'a sent launch is released only once its dispatch is terminal; an uncertain launch only via explicit safe release (uncertain -> reserved -> delete)'); END;
 
 CREATE VIEW launch_active AS
   SELECT run_id, route, executor_pane AS pane_id FROM dispatch WHERE state = 'executing'

@@ -84,17 +84,18 @@ class Briefs(unittest.TestCase):
         b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli")  # scaffold: empty acceptance/scope
         with self.assertRaises(StageError):
             strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")
-        strategy.revise(self.cfg, self.c, b["id"], _body(), None, "user:cli")
-        strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")
-        self.assertEqual(strategy.get(self.c, b["id"])["state"], "approved")
+        b2 = strategy.revise(self.cfg, self.c, b["id"], _body(), None, "user:cli")  # new draft id, filled
+        strategy.approve(self.cfg, self.c, b2["id"], "user:dashboard")
+        self.assertEqual(strategy.get(self.c, b2["id"])["state"], "approved")
+        self.assertEqual(strategy.get(self.c, b["id"])["state"], "draft")  # original scaffold unchanged
         # a published brief is never edited in place: revise appends a new draft revision instead
-        b2 = strategy.revise(self.cfg, self.c, b["id"], _body(title="X"), "change", "user:cli")
-        self.assertEqual(b2["revision"], 2)
-        self.assertEqual(b2["parent_id"], b["id"])
-        self.assertEqual(strategy.get(self.c, b["id"])["body"]["title"], "T")
+        b3 = strategy.revise(self.cfg, self.c, b2["id"], _body(title="X"), "change", "user:cli")
+        self.assertEqual(b3["revision"], 3)
+        self.assertEqual(b3["parent_id"], b2["id"])
+        self.assertEqual(strategy.get(self.c, b2["id"])["body"]["title"], "T")
         # raw sqlite3 cannot overwrite a published body either
         with self.assertRaises(sqlite3.IntegrityError):
-            self.c.execute("UPDATE work_brief SET body_json=? WHERE id=?", (json.dumps(_body(title="Z")), b["id"]))
+            self.c.execute("UPDATE work_brief SET body_json=? WHERE id=?", (json.dumps(_body(title="Z")), b2["id"]))
 
     def test_amend_appends_a_new_draft_revision(self):
         b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body())
@@ -246,6 +247,47 @@ class Briefs(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.c.execute("INSERT INTO brief_verdict(brief_id,issue_id,verdict_id) VALUES (?,?,?)",
                            (b["id"], "fin-1", other))
+
+    def test_revise_always_appends_new_version(self):
+        b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body(title="T"))
+        b2 = strategy.revise(self.cfg, self.c, b["id"], _body(title="T2"), "edit", "user:cli")
+        self.assertNotEqual(b2["id"], b["id"])
+        self.assertEqual(b2["revision"], 2)
+        self.assertEqual(b2["parent_id"], b["id"])
+        self.assertEqual(strategy.get(self.c, b["id"])["body"]["title"], "T")  # draft never mutated in place
+        self.assertEqual(b2["body"]["title"], "T2")
+
+    def test_linear_lineage_blocks_branching(self):
+        b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body())
+        strategy.revise(self.cfg, self.c, b["id"], _body(title="T2"), "e", "user:cli")
+        with self.assertRaises(StageError):  # same parent cannot have a second child
+            strategy.revise(self.cfg, self.c, b["id"], _body(title="T3"), "e2", "user:cli")
+
+    def test_explicit_global_resource_is_preserved(self):
+        b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli",
+                            _body(resources=["global:*", "clickhouse:serving/ck_dev"]))
+        self.assertIn("global:*", b["body"]["resources"])
+        self.assertIn("clickhouse:serving/ck_dev", b["body"]["resources"])
+        # a human can drop global for repo-only work
+        b2 = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli",
+                             _body(resources=["clickhouse:serving/ck_dev"]))
+        self.assertNotIn("global:*", b2["body"]["resources"])
+
+    def test_agent_cannot_signal_resource_review(self):
+        b = strategy.create(self.cfg, self.c, ["FIN-1"], "agent:factory-chat",
+                            _body(resources=["clickhouse:serving/ck_dev"]))
+        self.assertEqual(b["body"]["resources"],
+                         ["repo:Finks-ai/finks-ddd", "route:fx-news", "global:*"])
+
+    def test_groom_prompt_keeps_complete_sources_and_rejects_oversize(self):
+        src = {"identifier": "FIN-1", "title": "t", "url": "u", "repo": "r", "context": "c",
+               "description": "x" * 5000, "verdict_kind": "valid", "verdict_reason": "y" * 5000,
+               "evidence": ["e" * 5000]}
+        prompt = strategy._groom_prompt([src])
+        self.assertIn("x" * 5000, prompt)  # full description preserved
+        self.assertIn("e" * 5000, prompt)  # full evidence preserved
+        with self.assertRaises(StageError):  # oversize -> clear fewer-sources error, never silent truncation
+            strategy._groom_prompt([dict(src, description="z" * 300_000)])
 
 
 if __name__ == "__main__":
