@@ -11,15 +11,18 @@
 //   resource-review warning. Holding/unholding is an explicit readiness change.
 //
 // Layout: the brief list and the selected brief's editor come first (a deep link to a brief lands on it at once);
-// the source browser is a collapsed <details> with a paged list, so hundreds of sources never bury the review.
+// the source browser is a collapsed <details>: grouped-first by default (the backend's typed relationship groups as a
+// native collapsed outline), with a Flat list and a desktop Dependency DAG alternative, so hundreds of sources never
+// bury the review.
 //
 // <StrategyTab data view onViewChange onDone onNavigate />: data is the overview (its identity changes on every
-//   refresh, which re-fetches /strategy). view {q, picked, open, stateFilter, ctxFilter, assigneeFilter, sort, busy, err} is the parent's
-//   (one, kept while unmounted): q = source search, picked = source identifiers selected for grooming,
-//   stateFilter/ctxFilter/assigneeFilter = the source list's state/context/assignee filters, sort = its order (priority by default),
-//   open = the selected brief id, busy/err = the
-//   in-flight action and its error. busy and err are live state, not location: leaving Strategy and coming back
-//   keeps them; a late reply patches only this view. onViewChange is the parent's React-style setter;
+//   refresh, which re-fetches /strategy). view {q, picked, open, stateFilter, ctxFilter, assigneeFilter, sort,
+//   sourceMode, expandedGroups, srcOpen, limit, busy, err} is the parent's (one, kept while unmounted): q = source
+//   search, picked = source identifiers selected for grooming, stateFilter/ctxFilter/assigneeFilter = the source list's
+//   state/context/assignee filters, sort = its order (priority by default), sourceMode = groups|flat|dag,
+//   expandedGroups = open group ids, srcOpen = the browser is unfolded, limit = pagination, open = the selected brief
+//   id, busy/err = the in-flight action and its error. busy and err are live state, not location: leaving Strategy and
+//   coming back keeps them; a late reply patches only this view. onViewChange is the parent's React-style setter;
 //   onDone(result, null, toast) after a write; onNavigate({stage, run?, brief?, sources?}) owns history and the pane.
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
@@ -80,6 +83,75 @@ function sortSources(rows, sort) {
   };
   return [...rows].sort((a, b) => (order[sort] || order.priority)(key(a), key(b)));
 }
+
+// Group kind: the backend enum is exactly parent/dependency/related/project/context. An unknown kind keeps a truthful
+// fallback label (its raw kind), never an invented relationship.
+const GROUP_KIND = {
+  parent: { label: "Parent family", reason: "parent/child links" },
+  dependency: { label: "Dependency chain", reason: "blocking links" },
+  related: { label: "Related candidate", reason: "one-hop related links", candidate: true },
+  project: { label: "Project bucket", reason: "organizational", organizational: true },
+  context: { label: "Context bucket", reason: "organizational", organizational: true },
+};
+const GROUP_KINDS = new Set(Object.keys(GROUP_KIND));
+function groupKind(g) {
+  const k = g?.kind ?? "";
+  return GROUP_KINDS.has(k) ? k : "unknown";
+}
+// A prerequisite is "open" (unresolved) only on an explicit Linear state type: backlog/unstarted/started. A missing
+// status is unknown (never a block); completed/canceled is not open. Verification (verdict/stale) is never completion.
+function isUnresolvedPrereq(t) {
+  return !!(t && t.state_type && ["backlog", "unstarted", "started"].includes(t.state_type));
+}
+// ticket.reason (strategy.py _ticket_list) is a single readiness blocker: null = ready, "no verdict" = not checked,
+// "verdict stale …" = outdated, anything else = an execution blocker (completed, in QA, live dispatch, unmapped, no
+// owner, assigned elsewhere, non-valid verdict). This is the truthful source for the summary counts.
+function reasonState(t) {
+  const r = t.reason;
+  if (!r) return "ready";
+  if (r === "no verdict") return "notchecked";
+  if (r.startsWith("verdict stale")) return "outdated";
+  return "blocked";
+}
+// True when the recorded edges form a cycle (used to refuse pretending a cyclic graph is a DAG).
+function hasCycle(edges) {
+  const nodes = new Set();
+  for (const e of edges) { nodes.add(e.source); nodes.add(e.target); }
+  const adj = {}; const indeg = {};
+  for (const n of nodes) { adj[n] = []; indeg[n] = 0; }
+  for (const e of edges) { adj[e.source].push(e.target); indeg[e.target]++; }
+  const q = [...nodes].filter((n) => indeg[n] === 0);
+  let seen = 0;
+  while (q.length) { const n = q.shift(); seen++; for (const m of adj[n]) if (--indeg[m] === 0) q.push(m); }
+  return seen !== nodes.size;
+}
+// Parent family members as a depth-first outline (roots first, children indented); siblings keep the active sort order.
+// Cycles are broken via a seen set (the backend's `cycles` surface them separately, never a fake tree).
+function parentHierarchy(d) {
+  const order = d.orderedMembers.map((t) => t.identifier);
+  const memberSet = new Set(order);
+  const idx = new Map(order.map((id, i) => [id, i]));
+  const children = new Map();
+  const hasParent = new Set();
+  for (const e of d.parentEdges) {
+    if (!memberSet.has(e.source) || !memberSet.has(e.target)) continue;
+    if (!children.has(e.source)) children.set(e.source, []);
+    children.get(e.source).push(e.target);
+    hasParent.add(e.target);
+  }
+  for (const kids of children.values()) kids.sort((a, b) => (idx.get(a) ?? 0) - (idx.get(b) ?? 0));
+  const roots = order.filter((id) => !hasParent.has(id));
+  const out = [];
+  const seen = new Set();
+  const visit = (id, depth, parent) => {
+    if (seen.has(id)) return;
+    seen.add(id); out.push({ id, depth, parent });
+    for (const c of children.get(id) || []) visit(c, depth + 1, id);
+  };
+  for (const id of roots) visit(id, 0, null);
+  for (const id of order) if (!seen.has(id)) visit(id, 0, null);
+  return out;
+}
 const BADGE = { amber: "warning", green: "success", blue: "secondary", gray: "outline", red: "destructive" };
 const Tone = ({ tone, children }) => <Badge tone={BADGE[tone] || "outline"}>{children}</Badge>;
 const Ext = ({ href, children }) => <a className="fx-link" href={href} target="_blank" rel="noreferrer" onClick={stop}>{children}</a>;
@@ -87,7 +159,8 @@ const Ext = ({ href, children }) => <a className="fx-link" href={href} target="_
 const post = (path, body) => SDK.fetchJSON(API + path,
   { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
-const PAGE = 50;  // how many source rows render at a time inside the (collapsed) source browser
+const PAGE_FLAT = 50;    // flat-mode source rows per page
+const PAGE_GROUPS = 12;  // grouped-mode groups per page
 
 // The brief body's editable fields: one short title, one outcome, and eight lists (one item per line).
 const FIELDS = [
@@ -129,10 +202,11 @@ export function bumpNavToken() { NAV_TOKEN += 1; }  // shared across remounts so
 // not-ready for one reason and its verdict fresh or stale for another. `verdict` is the current verdict kind, `stale`
 // its freshness signal (null or a reason; a missing verdict is never "outdated"), `verdict_at` when that verdict was
 // made. Priority/created/updated/due are the source's own Linear facts, never the factory's fetch time.
-function SourceRow({ s, checked, onToggle }) {
+function SourceRow({ s, checked, onToggle, depth = 0, cycle = false, parent = null }) {
   const [pLabel, pTone] = priorityOf(s.priority);
   return (
-    <div className="fx-trow">
+    <div className={`fx-trow${cycle ? " fx-cycle" : ""}`} data-depth={depth || undefined}
+         style={depth ? { "--fx-depth": depth } : undefined}>
       <label className="fx-check-target">
         <input type="checkbox" className="fx-pick" checked={checked} onChange={onToggle}
                aria-label={`Select ${s.identifier}`} />
@@ -141,6 +215,7 @@ function SourceRow({ s, checked, onToggle }) {
         <div className="fx-row fx-row-title">
           <div className="fx-ttitle clamp">{s.title}</div>
           <span className="fx-row fx-row-status">
+            {cycle ? <Tone tone="red">cycle</Tone> : null}
             <Tone tone={pTone}>{pLabel}</Tone>
             {s.state ? <Tone tone="gray">{s.state}</Tone> : null}
           </span>
@@ -151,6 +226,7 @@ function SourceRow({ s, checked, onToggle }) {
           : <div className="fx-hint">verdict {s.verdict}{s.verdict_at ? ` · checked ${ago(s.verdict_at)}` : ""}</div>}
         <div className="fx-row fx-row-meta">
           <Ext href={s.url}>{s.identifier}</Ext>
+          {parent && depth > 3 ? <span className="fx-hint">child of {parent} · level {depth + 1}</span> : null}
           {s.repo ? <span className="fx-hint">{s.repo}</span> : null}
           {s.assignee ? <span className="fx-hint">{s.assignee}</span> : null}
           {s.created_at ? <span className="fx-hint" title={exactTime(s.created_at)}>Created {ago(s.created_at)}</span>
@@ -167,6 +243,7 @@ function SourceRow({ s, checked, onToggle }) {
 // One brief summary: state, title/revision, its readiness blockers, and its downstream dispatch (if dispatched).
 function BriefRow({ b, selected, onSelect, onDispatch }) {
   const blockers = b.blockers || [];
+  const relWarnings = b.relationship_warnings || [];
   const superseded = b.readiness === "superseded";
   return (
     <div id={`fx-brief-${b.id}`} className={`fx-trow${selected ? " picked" : ""}`} role="button" tabIndex={0}
@@ -184,6 +261,7 @@ function BriefRow({ b, selected, onSelect, onDispatch }) {
           {b.created_at ? ` · ${ago(b.created_at)}` : ""}
           {b.sources?.length ? ` · ${plural(b.sources.length, "source")}` : ""}</div>
         {blockers.length ? <div className="fx-hint">{clip(blockers.join("; "), 120)}</div> : null}
+        {relWarnings.length ? <div className="fx-err">{clip(relWarnings.join("; "), 160)}</div> : null}
       </div>
       <div className="fx-tc-ne">
         {b.dispatch?.run_id ? (
@@ -232,6 +310,290 @@ function Preview({ md, err, busy }) {
   if (err) return <div className="fx-err">Preview unavailable: {err}</div>;
   if (!md) return <div className="fx-hint">No preview.</div>;
   return <pre className="fx-pre">{md}</pre>;
+}
+
+// ---- grouped source browsing ----------------------------------------------------------------------------------
+// A group's one-line summary: title, type/reason, count (N matching / M in group when filtered), highest priority,
+// earliest real due date, execution-blocked / dependency-blocked / not-checked / outdated counts, and cross-assignee
+// / cross-repo labels. Context nodes are never counted as selectable work.
+function GroupSummary({ d }) {
+  const meta = GROUP_KIND[d.kind] || { label: String(d.g.kind || "Group"), reason: "unclassified" };
+  const n = d.matchingMembers.length, m = d.memberTickets.length;
+  const [pLabel, pTone] = d.highestPriority;
+  return (
+    <div className="fx-group-summary">
+      <div className="fx-group-head">
+        <span className="fx-k">{meta.label}</span>
+        <span className="fx-ttitle clamp">{d.g.title || d.g.id || "Untitled group"}</span>
+      </div>
+      <div className="fx-group-meta">
+        <span className="fx-id">{d.g.id}</span>
+        <span className="fx-hint">{meta.reason}</span>
+        {meta.candidate ? <Tone tone="amber">candidate</Tone> : null}
+        {meta.organizational ? <Tone tone="gray">organizational</Tone> : null}
+        <Tone tone={pTone}>{pLabel}</Tone>
+        {d.earliestDue ? <span className="fx-hint">due {d.earliestDue}</span> : null}
+        <span className="fx-count">{n !== m ? `${n} matching / ${m} in group` : m}</span>
+        {d.blocked ? <Tone tone="red">{d.blocked} blocked</Tone> : null}
+        {d.linkedPrereq ? <Tone tone="gray">{d.linkedPrereq} linked prerequisite</Tone> : null}
+        {d.depBlocked ? <Tone tone="amber">{d.depBlocked} dependency-blocked</Tone> : null}
+        {d.notChecked ? <Tone tone="gray">{d.notChecked} not checked</Tone> : null}
+        {d.outdated ? <Tone tone="gray">{d.outdated} outdated</Tone> : null}
+        {d.assigneeCount > 1 ? <span className="fx-hint">{d.assigneeCount} assignees</span> : null}
+        {d.repoCount > 1 ? <span className="fx-hint">{d.repoCount} repos</span> : null}
+        {d.g.continued ? <Tone tone="gray">continuation</Tone> : null}
+      </div>
+    </div>
+  );
+}
+
+// One recorded link line: kind, source -> target, with titles and a read-only reason on any endpoint that is outside
+// the current filters or outside the owned source scope. A blocks link marks an explicit unresolved prerequisite.
+function EdgeLine({ e, nodeInfo, reasonOf }) {
+  const s = nodeInfo(e.source), t = nodeInfo(e.target);
+  const endpoint = (n, id) => (
+    <>
+      {n?.url ? <Ext href={n.url}>{id}</Ext> : <span className="fx-id">{id}</span>}
+      {n?.title ? <span className="fx-hint">{clip(n.title, 48)}</span> : null}
+      {reasonOf(id) ? <Tone tone={reasonOf(id) === "outside source scope" ? "amber" : "gray"}>{reasonOf(id)}</Tone> : null}
+    </>
+  );
+  const open = e.kind === "blocks" && isUnresolvedPrereq(nodeInfo(e.source));
+  return (
+    <div className="fx-edge">
+      <span className="fx-id">{e.kind}</span>
+      {endpoint(s, e.source)}
+      <span className="fx-hint">→</span>
+      {endpoint(t, e.target)}
+      {open ? <Tone tone="amber">open prerequisite</Tone> : null}
+    </div>
+  );
+}
+
+// The group's typed recorded links as separate, labelled, readable sections (blocks/parent/related/duplicate). In DAG
+// mode the blocks section is visualised above (desktop only); these lists stay the accessible form everywhere.
+function EdgeSections({ d, nodeInfo, reasonOf }) {
+  const sections = [
+    ["blocks", "Dependency (blocks)", d.blocks],
+    ["parent", "Parent", d.parentEdges],
+    ["related", "Related", d.related],
+    ["duplicate", "Duplicate", d.duplicate],
+  ];
+  const present = sections.filter(([, , es]) => es.length);
+  const others = Object.keys(d.otherByKind || {}).sort();
+  if (!present.length && !others.length) return null;
+  return (
+    <>
+      {present.map(([k, label, es]) => (
+        <div className="fx-edge-sec" key={k}>
+          <div className="fx-k">{label} ({es.length})</div>
+          {es.map((e, i) => <EdgeLine key={`${k}-${e.source}-${e.target}-${i}`} e={e} nodeInfo={nodeInfo} reasonOf={reasonOf} />)}
+        </div>
+      ))}
+      {others.map((k) => (
+        <div className="fx-edge-sec" key={`other-${k}`}>
+          <div className="fx-k">{k} ({d.otherByKind[k].length})</div>
+          {d.otherByKind[k].map((e, i) => <EdgeLine key={`${k}-${e.source}-${e.target}-${i}`} e={e} nodeInfo={nodeInfo} reasonOf={reasonOf} />)}
+        </div>
+      ))}
+    </>
+  );
+}
+
+// Read-only linked context: members filtered out by the current filters, plus linked endpoints (context nodes) that are
+// not already shown as matching members — each with its reason (outside filters vs outside source scope).
+function ReadOnlyContext({ d, nodeInfo, reasonOf }) {
+  const rows = [];
+  const seen = new Set();
+  for (const t of d.excludedMembers) {
+    if (seen.has(t.identifier)) continue;
+    seen.add(t.identifier);
+    rows.push({ id: t.identifier, n: t, reason: "outside filters" });
+  }
+  for (const n of d.contextNodes) {
+    if (seen.has(n.identifier)) continue;
+    seen.add(n.identifier);
+    rows.push({ id: n.identifier, n: nodeInfo(n.identifier) || n, reason: reasonOf(n.identifier) || "linked endpoint" });
+  }
+  if (!rows.length) return null;
+  return (
+    <div className="fx-edge-sec">
+      <div className="fx-k">Linked context & excluded (read-only)</div>
+      <div className="fx-ctx-list">
+        {rows.map(({ id, n, reason }) => (
+          <div className="fx-ctx-row" key={id}>
+            {n?.url ? <Ext href={n.url}>{id}</Ext> : <span className="fx-id">{id}</span>}
+            {n?.title ? <span className="fx-hint">{clip(n.title, 48)}</span> : null}
+            {n?.state ? <span className="fx-hint">{n.state}</span> : null}
+            {n?.assignee ? <span className="fx-hint">{n.assignee}</span> : null}
+            {n?.repo ? <span className="fx-hint">{n.repo}</span> : n?.project?.name ? <span className="fx-hint">{n.project.name}</span> : null}
+            <Tone tone={reason === "outside source scope" ? "amber" : "gray"}>{reason}</Tone>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// A small layered dependency DAG over blocks edges only (desktop): prerequisites on the left, dependents on the right,
+// every incoming arrow preserved (multiple parents allowed). Cycles are refused here (the caller shows an edge list).
+function DagGraph({ gid, blocks, nodeTitle, statusOf }) {
+  const ids = [];
+  const idSet = new Set();
+  for (const e of blocks) for (const id of [e.source, e.target]) if (!idSet.has(id)) { idSet.add(id); ids.push(id); }
+  const adj = {}; const indeg = {};
+  ids.forEach((n) => { adj[n] = []; indeg[n] = 0; });
+  for (const e of blocks) { adj[e.source].push(e.target); indeg[e.target]++; }
+  const layer = {}; ids.forEach((n) => { layer[n] = 0; });
+  const deg = { ...indeg };
+  const queue = ids.filter((n) => indeg[n] === 0);
+  while (queue.length) { const n = queue.shift(); for (const m of adj[n]) { layer[m] = Math.max(layer[m], layer[n] + 1); if (--deg[m] === 0) queue.push(m); } }
+  const maxLayer = ids.reduce((m, n) => Math.max(m, layer[n]), 0);
+  const byLayer = {};
+  ids.forEach((n) => { (byLayer[layer[n]] ||= []).push(n); });
+  const maxRows = Math.max(...Object.values(byLayer).map((a) => a.length), 1);
+  const MARGIN = 18, NODE_W = 96, NODE_H = 30, LAYER_GAP = 168, ROW_GAP = 44;
+  const width = MARGIN * 2 + maxLayer * LAYER_GAP + NODE_W;
+  const height = MARGIN * 2 + (maxRows - 1) * ROW_GAP + NODE_H;
+  const pos = {};
+  ids.forEach((n) => {
+    const l = layer[n], arr = byLayer[l], i = arr.indexOf(n);
+    pos[n] = { x: MARGIN + l * LAYER_GAP, y: MARGIN + (maxRows - arr.length) * ROW_GAP / 2 + i * ROW_GAP };
+  });
+  const mid = `fxdag-${String(gid).replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+  return (
+    <div className="fx-dag" tabIndex={0} role="region" aria-label="Dependency DAG (blocks links)">
+      <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img"
+           aria-label="Dependency DAG (blocks links)">
+        <defs>
+          <marker id={mid} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" className="fx-dag-arrow" />
+          </marker>
+        </defs>
+        {blocks.map((e, i) => {
+          const a = pos[e.source], b = pos[e.target];
+          return <line key={i} className="fx-dag-edge" x1={a.x + NODE_W} y1={a.y + NODE_H / 2}
+                       x2={b.x} y2={b.y + NODE_H / 2} markerEnd={`url(#${mid})`} />;
+        })}
+        {ids.map((n) => (
+          <g key={n} className="fx-dag-node">
+            <rect x={pos[n].x} y={pos[n].y} width={NODE_W} height={NODE_H} rx={6} className={`fx-dag-box ${statusOf(n)}`} />
+            <text x={pos[n].x + NODE_W / 2} y={pos[n].y + NODE_H / 2} textAnchor="middle" dominantBaseline="central"
+                  className="fx-dag-text">{n}</text>
+            <title>{nodeTitle(n)}</title>
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+// One group card: a native collapsed <details>. Open, it lists matching members (parent families as a hierarchy),
+// offers an explicit "Select matching", then the typed edge sections and the read-only linked context.
+function GroupCard({ d, open, sourceMode, pickedSet, onPick, onSelectMatching, onToggle, nodeInfo, reasonOf, statusOf }) {
+  const cycle = d.cycleIds.size > 0 || d.hasBlockCycle;
+  return (
+    <details className="fx-group" open={open}
+             onToggle={(e) => { if (e.target !== e.currentTarget || e.target.open === open) return; onToggle(d.g.id, e.target.open); }}>
+      <summary><GroupSummary d={d} /></summary>
+      {open ? (
+        <div className="fx-group-body">
+          {cycle ? (
+            <div className="fx-cycle-warn">
+              {d.cycleIds.size ? `Cycle among: ${[...d.cycleIds].join(", ")}` : "Dependency links form a cycle"}. Shown as an
+              edge list, not a DAG.
+            </div>
+          ) : null}
+          <div className="fx-k">{d.matchingMembers.length
+            ? `Sources · ${d.matchingMembers.length} matching / ${d.memberTickets.length} in group`
+            : `No matching source · ${d.memberTickets.length} in group`}</div>
+          {d.matchingMembers.length ? (
+            <div className="fx-member-list">
+              {d.kind === "parent"
+                ? parentHierarchy(d).map(({ id, depth, parent }) => {
+                    const t = nodeInfo(id);
+                    return t ? <SourceRow key={id} s={t} depth={depth} parent={parent} cycle={d.cycleIds.has(id)}
+                                          checked={pickedSet.has(id)} onToggle={() => onPick(id)} /> : null;
+                  })
+                : d.orderedMembers.map((t) => (
+                    <SourceRow key={t.identifier} s={t} cycle={d.cycleIds.has(t.identifier)}
+                               checked={pickedSet.has(t.identifier)} onToggle={() => onPick(t.identifier)} />
+                  ))}
+            </div>
+          ) : null}
+          {d.matchingMembers.length ? (
+            <div className="fx-row">
+              <button className="fx-link-btn" onClick={() => onSelectMatching(d)}>Select matching ({d.matchingMembers.length})</button>
+            </div>
+          ) : null}
+          {sourceMode === "dag" ? (
+            d.blocks.length ? (
+              cycle ? null : (
+                <>
+                  <DagGraph gid={d.g.id} blocks={d.blocks} nodeTitle={(id) => nodeInfo(id)?.title || id} statusOf={statusOf} />
+                  <div className="fx-dag-phone">Dependency arrows are desktop-only; the readable edge list below shows the same links.</div>
+                </>
+              )
+            ) : <div className="fx-hint">No recorded blocking links.</div>
+          ) : null}
+          <EdgeSections d={d} nodeInfo={nodeInfo} reasonOf={reasonOf} />
+          <ReadOnlyContext d={d} nodeInfo={nodeInfo} reasonOf={reasonOf} />
+        </div>
+      ) : null}
+    </details>
+  );
+}
+
+// Relationship snapshot status: always shown while the source browser is open (even with no picks) so missing or
+// incomplete relationship data is never mistaken for a known-empty graph.
+function RelationshipStatus({ relationships, missingIds }) {
+  if (!relationships) {
+    return <div className="fx-err fx-rel-status">Relationship snapshot unavailable — links are unknown.</div>;
+  }
+  const incomplete = !relationships.complete;
+  const nMissing = missingIds.size;
+  return (
+    <div className="fx-rel-status">
+      <div className="fx-hint">Relationship snapshot {relationships.observed_at ? `observed ${ago(relationships.observed_at)}` : "not yet observed"}</div>
+      {incomplete ? <div className="fx-err">Relationships incomplete — some recorded links may be missing.</div> : null}
+      {nMissing ? <div className="fx-hint">{nMissing} source{nMissing === 1 ? "" : "s"} without a relationship snapshot</div> : null}
+    </div>
+  );
+}
+
+// The relationship review, shown before grooming: each picked source's recorded links (typed, read-only), including
+// endpoints that are filtered out or outside the owned source scope. A picked id with no relationships object, outside
+// any group, or in the missing list is explicitly unknown — never "No recorded links".
+function RelationshipReview({ picked, memberGroupId, groupById, missingIds, relationships, nodeInfo, reasonOf }) {
+  const hasRelationships = !!relationships;
+  return (
+    <div className="fx-rel-review">
+      <div className="fx-k">Relationship review — before grooming</div>
+      {picked.map((id) => {
+        const gid = memberGroupId[id];
+        const g = gid != null ? groupById[gid] : null;
+        const edges = g ? (g.edges || []).filter((e) => e.source === id || e.target === id)
+                        .map((e) => ({ kind: e.kind, source: e.source, target: e.target })) : [];
+        const n = nodeInfo(id);
+        const unknown = !hasRelationships || g == null || missingIds.has(id);
+        return (
+          <div key={id} className="fx-rel-item">
+            <div className="fx-rel-head">
+              {n?.url ? <Ext href={n.url}>{id}</Ext> : <span className="fx-id">{id}</span>}
+              <span className="fx-ttitle clamp">{n?.title || ""}</span>
+              {unknown ? <Tone tone="amber">relations unknown</Tone> : null}
+              {reasonOf(id) ? <Tone tone="gray">{reasonOf(id)}</Tone> : null}
+            </div>
+            {edges.length ? (
+              <div className="fx-rel-edges">
+                {edges.map((e, i) => <EdgeLine key={`${id}-${e.kind}-${e.source}-${e.target}-${i}`} e={e} nodeInfo={nodeInfo} reasonOf={reasonOf} />)}
+              </div>
+            ) : <div className="fx-hint">{unknown ? "Relations unknown (no snapshot, outside a group, or not captured)." : "No recorded links."}</div>}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
@@ -330,8 +692,9 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     const atOpen = open, atNav = NAV_TOKEN;
     const r = await call("/strategy/groom", { identifiers: submitted }, "groom");
     if (!r) return;
-    // Remove only the identifiers this request submitted; picks made since are left alone.
-    onViewChange((s) => ({ picked: (s.picked || []).filter((i) => !submitted.includes(i)) }));
+    // Remove only the identifiers this request submitted; picks made since are left alone. Spread `s` so the rest of
+    // the view (open brief, filters, sort, source mode, expansions, pagination) is preserved.
+    onViewChange((s) => ({ ...s, picked: (s.picked || []).filter((i) => !submitted.includes(i)) }));
     if (applyGuarded(r, atNav)) settleId(r, atOpen);
     onDone(r, null, `Groomed a draft brief #${r.id} from ${submitted.length} source${submitted.length === 1 ? "" : "s"}`);
   };
@@ -405,7 +768,17 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     if (r) onDone(r, null, "Sources refreshed");
   };
 
-  // Sources: searchable, filterable by state/context/assignee, compact, multi-select, paged inside a collapsed <details>.
+  // ---- Sources: grouped-first browsing over the backend's recorded relationship groups -------------------------
+  // `groups` (GET /strategy) are the backend's stable, typed link clusters — parent families, dependency chains,
+  // one-hop related candidates, and organizational project/context buckets. Each selectable source belongs to exactly
+  // one group; a group's edges/context are recorded links (read-only), never model-inferred here.
+  const groups = all?.groups || [];
+  const relationships = all?.relationships || null;  // {complete, observed_at, missing:[identifier]}
+  const sourceMode = view?.sourceMode === "flat" ? "flat" : view?.sourceMode === "dag" ? "dag" : "groups";
+  const expandedGroups = view?.expandedGroups || [];
+  const srcOpen = !!view?.srcOpen;
+  const limit = view?.limit || (sourceMode === "flat" ? PAGE_FLAT : PAGE_GROUPS);
+
   const needle = q.trim().toLowerCase();
   const states = useMemo(() => [...new Set(tickets.map((t) => t.state).filter(Boolean))].sort(), [tickets]);
   const contexts = useMemo(() => [...new Set(tickets.map((t) => t.context).filter(Boolean))].sort(), [tickets]);
@@ -415,22 +788,126 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const assigneeMatch = (t) => assigneeFilter === "all" ||
     (assigneeFilter === "me" ? t.assignee != null && t.lead != null && t.assignee === t.lead :
      assigneeFilter === "unassigned" ? !t.assignee : t.assignee === assigneeFilter);
-  const filtered = tickets.filter((t) =>
-    (stateFilter === "all" || t.state === stateFilter) &&
-    (ctxFilter === "all" || t.context === ctxFilter) &&
-    assigneeMatch(t));
-  const list = needle ? filtered.filter((t) => `${t.identifier} ${t.title || ""}`.toLowerCase().includes(needle)) : filtered;
+  const inFilters = (t) => (stateFilter === "all" || t.state === stateFilter) &&
+    (ctxFilter === "all" || t.context === ctxFilter) && assigneeMatch(t);
+  const matches = (t) => inFilters(t) && (!needle || `${t.identifier} ${t.title || ""}`.toLowerCase().includes(needle));
+  const list = tickets.filter(matches);  // matching = state/context/assignee filters + search
   // Filter first, sort second, paginate third; sorting copies `list` so `tickets` is never mutated.
   const sorted = sortSources(list, sort);
   const matching = list.length;
   const total = tickets.length;
-  const [srcOpen, setSrcOpen] = useState(false);
-  const [limit, setLimit] = useState(PAGE);
-  useEffect(() => { setLimit(PAGE); }, [needle, stateFilter, ctxFilter, assigneeFilter, sort]);
-  const shown = sorted.slice(0, limit);
-  const shownCount = shown.length;
   const filteredActive = !!needle || stateFilter !== "all" || ctxFilter !== "all" || assigneeFilter !== "all";
-  const pick = (id) => update({ picked: picked.includes(id) ? picked.filter((i) => i !== id) : [...picked, id] });
+  const pick = (id) => onViewChange((v) => {
+    const cur = v.picked || [];
+    return { ...v, picked: cur.includes(id) ? cur.filter((i) => i !== id) : [...cur, id] };
+  });
+
+  const ticketById = useMemo(() => Object.fromEntries(tickets.map((t) => [t.identifier, t])), [tickets]);
+  const groupById = useMemo(() => Object.fromEntries(groups.map((g) => [g.id, g])), [groups]);
+  const rankById = useMemo(() => { const m = {}; sorted.forEach((t, i) => { m[t.identifier] = i; }); return m; }, [sorted]);
+  const contextById = useMemo(() => {
+    const m = {};
+    for (const g of groups) for (const n of g.context || []) if (n && n.identifier && !(n.identifier in m)) m[n.identifier] = n;
+    return m;
+  }, [groups]);
+  const memberGroupId = useMemo(() => {
+    const m = {};
+    for (const g of groups) for (const id of g.members || []) if (!(id in m)) m[id] = g.id;
+    return m;
+  }, [groups]);
+  const missingIds = useMemo(() => new Set(relationships?.missing || []), [relationships]);
+  const pickedSet = useMemo(() => new Set(picked), [picked]);
+  // A display record: cached context metadata merged with the ticket, so context-only fields (state_type, project) are
+  // retained even when the ticket lacks them; non-null ticket fields win.
+  const nodeInfo = (id) => {
+    const t = ticketById[id], c = contextById[id];
+    if (!t && !c) return null;
+    const out = { ...(c || {}) };
+    if (t) for (const k in t) if (t[k] != null) out[k] = t[k];
+    return out;
+  };
+  const reasonOf = (id) => {
+    const t = ticketById[id];
+    if (!t) return "outside source scope";
+    return matches(t) ? null : "outside filters";
+  };
+  const statusOf = (id) => {
+    const t = ticketById[id];
+    if (!t) return "ext";
+    return matches(t) ? "in" : "off";
+  };
+
+  // Group order follows the existing sorted source order: a group ranks by its first (best) matching member; groups
+  // with no matching member follow last, in stable backend order (deterministic id tie-break).
+  const orderedGroups = [...groups].sort((a, b) => {
+    const key = (g) => { let r = Infinity; for (const id of g.members || []) { const rk = rankById[id]; if (rk != null && rk < r) r = rk; } return r; };
+    const ra = key(a), rb = key(b);
+    if (ra === Infinity && rb === Infinity) return cmp(a.id || "", b.id || "");
+    if (ra === Infinity) return 1;
+    if (rb === Infinity) return -1;
+    return ra - rb || cmp(a.id || "", b.id || "");
+  });
+
+  // Per-group figures over MATCHING members only (context is never counted as selectable work).
+  const groupData = orderedGroups.map((g) => {
+    const kind = groupKind(g);
+    const memberTickets = (g.members || []).map((id) => ticketById[id]).filter(Boolean);
+    const matchingMembers = memberTickets.filter(matches);
+    const orderedMembers = sortSources(matchingMembers, sort);
+    const edges = g.edges || [];  // exact edge kinds preserved; only literal "blocks" is a dependency link
+    const blocks = edges.filter((e) => e.kind === "blocks");
+    const parentEdges = edges.filter((e) => e.kind === "parent");
+    const related = edges.filter((e) => e.kind === "related");
+    const duplicate = edges.filter((e) => e.kind === "duplicate");
+    const otherByKind = {};
+    for (const e of edges) if (!["blocks", "parent", "related", "duplicate"].includes(e.kind)) (otherByKind[e.kind] ||= []).push(e);
+    const mm = matchingMembers;
+    // Execution readiness straight from ticket.reason (see reasonState): blocked is independent of not-checked/outdated.
+    const notChecked = mm.filter((t) => reasonState(t) === "notchecked").length;
+    const outdated = mm.filter((t) => reasonState(t) === "outdated").length;
+    const blocked = mm.filter((t) => reasonState(t) === "blocked").length;
+    const highestPriority = priorityOf(mm.reduce((best, t) => Math.min(best, pRank(t.priority)), 5));
+    const dueDates = mm.map((t) => (isDue(t.due_date) ? t.due_date : null)).filter(Boolean).sort();
+    const earliestDue = dueDates[0] || null;
+    const assigneeCount = new Set(mm.map((t) => t.assignee).filter(Boolean)).size;
+    const repoCount = new Set(mm.map((t) => t.repo).filter(Boolean)).size;
+    // Linked prerequisites: any incoming blocks edge (any status). Dependency-blocked: an incoming blocks edge whose
+    // prerequisite is open (state_type backlog/unstarted/started). Never derived from verdict/stale.
+    const linkedPrereq = mm.filter((t) => blocks.some((e) => e.target === t.identifier)).length;
+    const depBlocked = mm.filter((t) => blocks.some((e) => e.target === t.identifier && isUnresolvedPrereq(nodeInfo(e.source)))).length;
+    const excludedMembers = memberTickets.filter((t) => !matches(t));
+    const contextNodes = (g.context || []).filter((n) => n && n.identifier && !matchingMembers.some((t) => t.identifier === n.identifier));
+    const cycleIds = new Set(g.cycles || []);
+    const hasBlockCycle = hasCycle(blocks);
+    return { g, kind, memberTickets, matchingMembers, orderedMembers, edges, blocks, parentEdges, related, duplicate,
+             otherByKind, notChecked, outdated, blocked, linkedPrereq, depBlocked, highestPriority, earliestDue,
+             assigneeCount, repoCount, excludedMembers, contextNodes, cycleIds, hasBlockCycle };
+  });
+
+  // Picked sources hidden by the current filters/search (kept intact, never silently dropped).
+  const hiddenPicked = picked.filter((id) => !(id in rankById)).length;
+  // Grouped modes only paginate groups that actually match; excluded linked members stay read-only inside them.
+  const visibleGroups = groupData.filter((d) => d.matchingMembers.length > 0);
+  // Pagination: `limit` counts matching rows in flat mode, matching groups in grouped modes. It lives in the parent
+  // view (retained across remounts); only an explicit filter/mode/sort change resets it.
+  const shown = sorted.slice(0, limit);
+  const shownGroups = visibleGroups.slice(0, limit);
+  const shownCount = sourceMode === "flat" ? shown.length : shownGroups.length;
+  const pageTotal = sourceMode === "flat" ? matching : visibleGroups.length;
+  const moreCount = pageTotal - shownCount;
+
+  const pageDefault = (mode) => (mode === "flat" ? PAGE_FLAT : PAGE_GROUPS);
+  const changeFilter = (patch) => update({ ...patch, limit: pageDefault(patch.sourceMode ?? sourceMode) });
+
+  const setExpanded = (id, open) => onViewChange((v) => {
+    const cur = v.expandedGroups || [];
+    return { ...v, expandedGroups: open ? [...new Set([...cur, id])] : cur.filter((x) => x !== id) };
+  });
+  const selectGroupMatching = (d) => onViewChange((v) => {
+    const cur = v.picked || [];
+    const add = d.matchingMembers.map((t) => t.identifier).filter((id) => !cur.includes(id));
+    return add.length ? { ...v, picked: [...cur, ...add] } : v;
+  });
 
   const openBrief = (id) => onNavigate({ stage: "strategy", brief: id });
   const openDispatch = (d) => onNavigate({ stage: d.phase || DISPATCH_STAGE[d.state] || "draft", run: d.run_id });
@@ -492,6 +969,9 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
 
           <div className="fx-k">Captured sources (server-captured, not model-edited)</div>
           <Provenance sources={current.sources} />
+          {current.relationship_warnings?.length ? (
+            <div className="fx-err">Relationships: {current.relationship_warnings.join("; ")}</div>
+          ) : null}
 
           <details className="fx-sec fx-fold">
             <summary>Compiled preview (self-contained intent)</summary>
@@ -591,33 +1071,40 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
         </details>
       ) : null}
 
-      {/* ---- sources: collapsed, paged browser (never buries the brief review above) ---- */}
-      <details className="fx-sec fx-fold" onToggle={(e) => setSrcOpen(e.target.open)}>
-        <summary>Sources <span className="fx-count">{filteredActive ? `${matching}/${total}` : total}</span>{picked.length ? ` · ${picked.length} picked` : ""}</summary>
+      {/* ---- sources: collapsed, grouped-first browser (never buries the brief review above) ---- */}
+      <details className="fx-sec fx-fold" open={srcOpen}
+               onToggle={(e) => { if (e.target !== e.currentTarget || e.target.open === srcOpen) return; update({ srcOpen: e.target.open }); }}>
+        <summary>Sources <span className="fx-count">{filteredActive ? `${matching}/${total}` : total}</span>
+          {picked.length ? ` · ${picked.length} picked` : ""}{hiddenPicked ? ` · ${hiddenPicked} hidden` : ""}</summary>
         {srcOpen ? (
           <>
             <Input className="fx-search" type="search" placeholder="Search source id or title" value={q}
-                   onChange={(e) => update({ q: e.target.value })} />
+                   onChange={(e) => changeFilter({ q: e.target.value })} />
+            <div className="fx-seg fx-mode" role="group" aria-label="Source view">
+              <button className={sourceMode === "groups" ? "on" : ""} aria-pressed={sourceMode === "groups"} title="Grouped outline" onClick={() => changeFilter({ sourceMode: "groups" })}>Groups</button>
+              <button className={sourceMode === "flat" ? "on" : ""} aria-pressed={sourceMode === "flat"} title="Flat list" onClick={() => changeFilter({ sourceMode: "flat" })}>Flat</button>
+              <button className={sourceMode === "dag" ? "on" : ""} aria-pressed={sourceMode === "dag"} title="Dependency DAG (desktop)" onClick={() => changeFilter({ sourceMode: "dag" })}>DAG</button>
+            </div>
             <div className="fx-row fx-filters">
               <select className="fx-select" value={stateFilter} aria-label="State filter"
-                      onChange={(e) => update({ stateFilter: e.target.value })}>
+                      onChange={(e) => changeFilter({ stateFilter: e.target.value })}>
                 <option value="all">All states</option>
                 {states.map((s) => <option key={s} value={s}>{s}</option>)}
               </select>
               <select className="fx-select" value={ctxFilter} aria-label="Context filter"
-                      onChange={(e) => update({ ctxFilter: e.target.value })}>
+                      onChange={(e) => changeFilter({ ctxFilter: e.target.value })}>
                 <option value="all">All contexts</option>
                 {contexts.map((c) => <option key={c} value={c}>{c}</option>)}
               </select>
               <select className="fx-select" value={assigneeFilter} aria-label="Assignee filter"
-                      onChange={(e) => update({ assigneeFilter: e.target.value })}>
+                      onChange={(e) => changeFilter({ assigneeFilter: e.target.value })}>
                 <option value="all">All assignees</option>
                 <option value="me">Assigned to me</option>
                 <option value="unassigned">Unassigned</option>
                 {assignees.map((a) => <option key={a} value={a}>{a}</option>)}
               </select>
               <select className="fx-select" value={sort} aria-label="Source sort"
-                      onChange={(e) => update({ sort: e.target.value })}>
+                      onChange={(e) => changeFilter({ sort: e.target.value })}>
                 <option value="priority">Priority</option>
                 <option value="due">Due soon</option>
                 <option value="oldest">Oldest created</option>
@@ -625,6 +1112,11 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
                 <option value="updated">Recently updated</option>
               </select>
             </div>
+            <RelationshipStatus relationships={relationships} missingIds={missingIds} />
+            {picked.length ? (
+              <RelationshipReview picked={picked} memberGroupId={memberGroupId} groupById={groupById}
+                                  missingIds={missingIds} relationships={relationships} nodeInfo={nodeInfo} reasonOf={reasonOf} />
+            ) : null}
             <div className="fx-row">
               <Button size="sm" disabled={!picked.length || !!busy} onClick={groom}>
                 {busy === "groom" ? "Grooming…" : `Groom ${picked.length} source${picked.length === 1 ? "" : "s"}`}
@@ -632,16 +1124,32 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
               <Button size="sm" ghost disabled={!!busy} onClick={refresh}>{busy === "refresh" ? "Refreshing…" : "Refresh sources"}</Button>
               {picked.length ? <Button size="sm" ghost onClick={() => update({ picked: [] })}>Clear</Button> : null}
             </div>
-            <div className="fx-hint">Showing {shownCount} of {matching} matching · {total} total</div>
-            <div className="fx-list">
-              {!all && !loadErr ? <div className="fx-hint">Loading…</div>
-                : shown.length ? shown.map((t) => (
-                  <SourceRow key={t.identifier} s={t} checked={picked.includes(t.identifier)} onToggle={() => pick(t.identifier)} />
-                )) : <div className="fx-empty">{needle || stateFilter !== "all" || ctxFilter !== "all" || assigneeFilter !== "all" ? "No source matches." : "No sources yet; refresh sources first."}</div>}
+            {hiddenPicked ? <div className="fx-hint">{hiddenPicked} picked hidden by current filters (kept)</div> : null}
+            <div className="fx-hint">
+              {sourceMode === "flat"
+                ? `Showing ${shownCount} of ${matching} matching · ${total} total`
+                : `Showing ${shownCount} of ${visibleGroups.length} groups · ${matching} matching sources · ${total} total`}
             </div>
-            {list.length > shown.length ? (
+            {sourceMode === "flat" ? (
+              <div className="fx-list">
+                {!all && !loadErr ? <div className="fx-hint">Loading…</div>
+                  : shown.length ? shown.map((t) => (
+                    <SourceRow key={t.identifier} s={t} checked={pickedSet.has(t.identifier)} onToggle={() => pick(t.identifier)} />
+                  )) : <div className="fx-empty">{filteredActive ? "No source matches." : "No sources yet; refresh sources first."}</div>}
+              </div>
+            ) : (
+              <div className="fx-groups">
+                {!all && !loadErr ? <div className="fx-hint">Loading…</div>
+                  : shownGroups.length ? shownGroups.map((d) => (
+                    <GroupCard key={d.g.id} d={d} open={expandedGroups.includes(d.g.id)} sourceMode={sourceMode}
+                               pickedSet={pickedSet} onPick={pick} onSelectMatching={selectGroupMatching}
+                               onToggle={setExpanded} nodeInfo={nodeInfo} reasonOf={reasonOf} statusOf={statusOf} />
+                  )) : <div className="fx-empty">{filteredActive ? "No group has a matching source." : "No groups yet; refresh sources first."}</div>}
+              </div>
+            )}
+            {moreCount > 0 ? (
               <div className="fx-row">
-                <Button size="sm" ghost onClick={() => setLimit((l) => l + PAGE)}>Show {list.length - shown.length} more</Button>
+                <Button size="sm" ghost onClick={() => update({ limit: limit + pageDefault(sourceMode) })}>Show {moreCount} more</Button>
               </div>
             ) : null}
           </>
