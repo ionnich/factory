@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import ask, config, costs, db, decide, dispatch, jev, learn, linear, prune, reconcile, repos, witness
+from . import pr_reviews
 
 
 def out(obj) -> None:
@@ -38,6 +39,11 @@ def _json_body(src: str) -> dict:
     if not isinstance(body, dict):
         raise dispatch.StageError("body must be a JSON object")
     return body
+
+
+
+def cmd_pr_reviews(cfg, conn, a):
+    out(pr_reviews.list_reviews(conn))
 
 
 def cmd_ingest(cfg, conn, a):
@@ -687,6 +693,8 @@ def main(argv=None):
     s.add_argument("identifier")
     s.set_defaults(fn=cmd_ticket_timeline)
     sub.add_parser("overview", help="everything the Factory tab shows, in one call (JSON)").set_defaults(fn=cmd_overview)
+    sub.add_parser("pr-reviews", help="open GitHub pull requests requesting the viewer or their team (JSON)").set_defaults(
+        fn=cmd_pr_reviews)
     sub.add_parser("prune-gate", help="Hermes pre-check for the prune job").set_defaults(fn=cmd_prune_gate)
     sub.add_parser("candidates", help="stageable tickets (JSON), and why the rest are not").set_defaults(
         fn=cmd_candidates)

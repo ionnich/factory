@@ -72,6 +72,13 @@ async def all_tickets():  # the Tickets tab's list; kept off /overview, which re
     return await factory("tickets", "--all")
 
 
+@router.get("/pr-reviews")
+async def pr_reviews():
+    # Deliberately outside /overview and /stream: GitHub is read only on page load and explicit manual refresh.
+    return await factory("pr-reviews", timeout=60)
+
+
+
 @router.get("/archive")
 async def archive():  # the Archive stage: every archived dispatch (rejected drafts too), newest first; fetched on open
     return await factory("status", "--archived")
