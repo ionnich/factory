@@ -95,6 +95,83 @@ BEGIN SELECT RAISE(ABORT, 'verdict is immutable except superseded_at/written_bac
 CREATE TRIGGER verdict_no_delete BEFORE DELETE ON verdict
 BEGIN SELECT RAISE(ABORT, 'verdicts are never deleted'); END;
 
+-- ---------------------------------------------------------------- work briefs
+-- Strategy-stage statement of intent, published by a human before Factory verifies and executes it. Each row is
+-- one immutable VERSION; a draft is editable, approving freezes body and sources, and amending a published brief
+-- appends a new draft revision (parent_id -> prior version, revision + 1). The current version of a lineage is the
+-- row no other row points to as parent.
+CREATE TABLE work_brief (
+  id               INTEGER PRIMARY KEY,
+  revision         INTEGER NOT NULL CHECK (revision >= 1),
+  parent_id        INTEGER REFERENCES work_brief(id),
+  state            TEXT NOT NULL CHECK (state IN ('draft', 'approved', 'held')),
+  body_json        TEXT NOT NULL CHECK (json_valid(body_json)),
+  sources_json     TEXT NOT NULL CHECK (json_valid(sources_json) AND json_array_length(sources_json) > 0),
+  created_at       TEXT NOT NULL,
+  created_by       TEXT NOT NULL,
+  approved_at      TEXT,
+  approved_by      TEXT,
+  amendment_reason TEXT,
+  hold_reason      TEXT,
+  CHECK ((approved_at IS NULL) = (approved_by IS NULL)),
+  CHECK ((state IN ('approved', 'held')) = (approved_at IS NOT NULL))
+);
+CREATE INDEX work_brief_parent ON work_brief(parent_id) WHERE parent_id IS NOT NULL;
+CREATE TRIGGER work_brief_root_revision BEFORE INSERT ON work_brief
+WHEN NEW.parent_id IS NULL AND NEW.revision <> 1
+BEGIN SELECT RAISE(ABORT, 'a root work brief is revision 1'); END;
+CREATE TRIGGER work_brief_revision BEFORE INSERT ON work_brief
+WHEN NEW.parent_id IS NOT NULL
+ AND NEW.revision <> (SELECT revision + 1 FROM work_brief WHERE id = NEW.parent_id)
+BEGIN SELECT RAISE(ABORT, 'an amendment increments its parent revision'); END;
+CREATE TRIGGER work_brief_edges BEFORE UPDATE OF state ON work_brief
+WHEN NEW.state IS NOT OLD.state AND (OLD.state, NEW.state) NOT IN (VALUES
+  ('draft', 'approved'), ('approved', 'held'), ('held', 'approved'))
+BEGIN SELECT RAISE(ABORT, 'illegal work_brief state transition'); END;
+-- Published versions are immutable; amend (revise) to append a new draft revision instead of editing.
+CREATE TRIGGER work_brief_frozen BEFORE UPDATE ON work_brief
+WHEN OLD.state IN ('approved', 'held') AND (NEW.body_json IS NOT OLD.body_json
+  OR NEW.sources_json IS NOT OLD.sources_json OR NEW.parent_id IS NOT OLD.parent_id
+  OR NEW.revision IS NOT OLD.revision OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.created_by IS NOT OLD.created_by OR NEW.amendment_reason IS NOT OLD.amendment_reason)
+BEGIN SELECT RAISE(ABORT, 'a published work brief is immutable; amend it to create a new revision'); END;
+CREATE TRIGGER work_brief_no_delete BEFORE DELETE ON work_brief
+BEGIN SELECT RAISE(ABORT, 'work briefs are never deleted'); END;
+
+-- Hold/unhold audit: every explicit readiness change, append-only.
+CREATE TABLE work_brief_hold (
+  id       INTEGER PRIMARY KEY,
+  brief_id INTEGER NOT NULL REFERENCES work_brief(id),
+  action   TEXT NOT NULL CHECK (action IN ('hold', 'unhold')),
+  reason   TEXT,
+  actor    TEXT NOT NULL,
+  at       TEXT NOT NULL
+);
+CREATE TRIGGER work_brief_hold_append_only_u BEFORE UPDATE ON work_brief_hold
+BEGIN SELECT RAISE(ABORT, 'hold audit is append-only'); END;
+CREATE TRIGGER work_brief_hold_append_only_d BEFORE DELETE ON work_brief_hold
+BEGIN SELECT RAISE(ABORT, 'hold audit is append-only'); END;
+
+-- Exact version -> verdict bridge, written by the prune slice. A source is verified for a specific brief VERSION,
+-- never borrowed from a prior version: each newly approved version/amendment must be explicitly re-pruned. One
+-- verdict per (version, source); re-prune upserts the same key. No guessed ticket FK (linear_snapshot's PK is
+-- composite); issue consistency to the verdict row is enforced instead.
+CREATE TABLE brief_verdict (
+  brief_id   INTEGER NOT NULL REFERENCES work_brief(id),
+  issue_id   TEXT NOT NULL,
+  verdict_id INTEGER NOT NULL REFERENCES verdict(id),
+  PRIMARY KEY (brief_id, issue_id)
+);
+CREATE TRIGGER brief_verdict_issue_i BEFORE INSERT ON brief_verdict
+WHEN (SELECT issue_id FROM verdict WHERE id = NEW.verdict_id) IS NOT NEW.issue_id
+BEGIN SELECT RAISE(ABORT, 'brief_verdict verdict must belong to the same issue'); END;
+CREATE TRIGGER brief_verdict_issue_u BEFORE UPDATE OF issue_id, verdict_id ON brief_verdict
+WHEN (SELECT issue_id FROM verdict WHERE id = NEW.verdict_id) IS NOT NEW.issue_id
+BEGIN SELECT RAISE(ABORT, 'brief_verdict verdict must belong to the same issue'); END;
+-- The (version, source) key is immutable; only the verdict_id value may be re-bound on re-prune.
+CREATE TRIGGER brief_verdict_key_frozen BEFORE UPDATE OF brief_id, issue_id ON brief_verdict
+BEGIN SELECT RAISE(ABORT, 'brief_verdict version/source key is immutable'); END;
+
 -- ---------------------------------------------------------------- dispatches
 -- Directory is derived: dispatches/<run_id> or dispatches/_archived/<run_id>.
 CREATE TABLE dispatch (
@@ -107,6 +184,7 @@ CREATE TABLE dispatch (
   staged_at     TEXT, executing_at TEXT, done_at TEXT, reconciled_at TEXT, archived_at TEXT,
   executor_pane TEXT,
   route         TEXT,                       -- factory-fleet home that runs it (context route); NULL = the captain routes
+  brief_id      INTEGER REFERENCES work_brief(id),  -- the approved brief this dispatch pins (NULL = legacy path)
   -- review step (draft only): planner agent writes the plan, the user leaves notes, then approve/hold/reject. The
   -- review decision carries the clock (decision.due_at); a factory:propose draft may start without a person.
   drafted_by    TEXT,
@@ -118,7 +196,8 @@ CREATE TABLE dispatch (
   emergency     INTEGER NOT NULL DEFAULT 0, -- 1 = no review window (urgent, one ticket, tiny evidence footprint)
   CHECK (state = 'draft' OR body_sha256 IS NOT NULL)  -- rejected drafts are rendered too, as the record
 );
-CREATE UNIQUE INDEX one_executing ON dispatch(state) WHERE state = 'executing';
+-- A brief version is dispatched at most once; NULL is the legacy (pre-Strategy) path.
+CREATE UNIQUE INDEX dispatch_one_brief ON dispatch(brief_id) WHERE brief_id IS NOT NULL;
 
 CREATE TRIGGER dispatch_born_draft BEFORE INSERT ON dispatch WHEN NEW.state <> 'draft'
 BEGIN SELECT RAISE(ABORT, 'dispatch must be created in draft'); END;
@@ -137,7 +216,8 @@ BEGIN SELECT RAISE(ABORT, 'a draft leaves review only approved (staged) or rejec
 
 CREATE TRIGGER dispatch_frozen BEFORE UPDATE ON dispatch
 WHEN OLD.state <> 'draft' AND (NEW.body_sha256 IS NOT OLD.body_sha256 OR NEW.repos_json IS NOT OLD.repos_json
-  OR NEW.run_id IS NOT OLD.run_id OR NEW.created_at IS NOT OLD.created_at OR NEW.route IS NOT OLD.route)
+  OR NEW.run_id IS NOT OLD.run_id OR NEW.created_at IS NOT OLD.created_at OR NEW.route IS NOT OLD.route
+  OR NEW.brief_id IS NOT OLD.brief_id)
 BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;
 
 CREATE TRIGGER dispatch_no_delete BEFORE DELETE ON dispatch
@@ -460,3 +540,131 @@ CREATE TABLE ask (
   CHECK ((status = 'answered') = (answer IS NOT NULL) AND (status = 'failed') = (error IS NOT NULL))
 );
 CREATE UNIQUE INDEX ask_one_pending ON ask(decision_id) WHERE status = 'pending';
+
+-- ---------------------------------------------------------------- brief-backed scheduling (v21)
+-- Resource keys a dispatch claims for its whole run: repo:OWNER/NAME, route:home|<lead>, clickhouse:...,
+-- stack:..., global:*. Pinned while the dispatch is a draft and immutable afterwards. Rows are deletable while the
+-- dispatch is a draft (scheduler.set_claims replaces them) or once it is archived; a retained row after archive
+-- never conflicts because claim_holders excludes archived runs. A key is <namespace>:<key>; conflicts are equal keys,
+-- same-namespace slash ancestor/descendant, or global:*.
+CREATE TABLE dispatch_resource (
+  run_id   TEXT NOT NULL REFERENCES dispatch(run_id),
+  resource TEXT NOT NULL,
+  PRIMARY KEY (run_id, resource)
+);
+CREATE TRIGGER dispatch_resource_draft_only_i BEFORE INSERT ON dispatch_resource
+WHEN (SELECT state FROM dispatch WHERE run_id = NEW.run_id) IS NOT 'draft'
+BEGIN SELECT RAISE(ABORT, 'dispatch resources are pinned while the dispatch is a draft'); END;
+CREATE TRIGGER dispatch_resource_no_update BEFORE UPDATE ON dispatch_resource
+BEGIN SELECT RAISE(ABORT, 'dispatch resources are immutable'); END;
+CREATE TRIGGER dispatch_resource_held_to_archive BEFORE DELETE ON dispatch_resource
+WHEN (SELECT state FROM dispatch WHERE run_id = OLD.run_id) NOT IN ('draft', 'archived')
+BEGIN SELECT RAISE(ABORT, 'dispatch resources are immutable in staged/executing/done/reconciled'); END;
+
+-- The one scheduling policy, synced transactionally by the scheduler. Lowering max_parallel never kills work.
+CREATE TABLE execution_policy (
+  id           INTEGER PRIMARY KEY CHECK (id = 1),
+  max_parallel INTEGER NOT NULL DEFAULT 2 CHECK (max_parallel >= 1)
+);
+INSERT INTO execution_policy(id, max_parallel) VALUES (1, 2);
+
+-- A reserved launch slot: capacity + pane + route + resources are claimed atomically BEFORE the external /new or
+-- intake send. reserved (not yet sent) -> sent (handed off) -> [terminal: deleted]; uncertain (send outcome
+-- unknown) is shown to the operator and never auto-released (no TTL). Never /new twice after an uncertain send.
+CREATE TABLE dispatch_launch (
+  run_id     TEXT PRIMARY KEY REFERENCES dispatch(run_id),
+  pane_id    TEXT NOT NULL CHECK (length(trim(pane_id)) > 0),
+  state      TEXT NOT NULL CHECK (state IN ('reserved', 'sent', 'uncertain')),
+  owner_pid  INTEGER,
+  claimed_at TEXT,
+  sent_at    TEXT,
+  error      TEXT
+);
+CREATE TRIGGER launch_reserve_state BEFORE INSERT ON dispatch_launch
+WHEN (SELECT state FROM dispatch WHERE run_id = NEW.run_id) IS NOT 'staged'
+BEGIN SELECT RAISE(ABORT, 'a launch is reserved for a staged dispatch'); END;
+CREATE TRIGGER launch_edges BEFORE UPDATE OF state ON dispatch_launch
+WHEN NEW.state IS NOT OLD.state AND (OLD.state, NEW.state) NOT IN (VALUES
+  ('reserved', 'sent'), ('reserved', 'uncertain'), ('uncertain', 'sent'), ('uncertain', 'reserved'))
+BEGIN SELECT RAISE(ABORT, 'illegal launch state transition'); END;
+-- Release a reservation only when it was definitely never sent, or a `sent` launch once its dispatch is terminal
+-- (executor safe). An `uncertain` launch (unsafe pane) is retained even at terminal until an explicit safe release:
+-- the operator resolves it uncertain -> reserved (launch_edges), then deletes the reserved row. No auto-expiry.
+CREATE TRIGGER launch_release_guard BEFORE DELETE ON dispatch_launch
+WHEN OLD.state = 'uncertain'
+   OR (OLD.state = 'sent' AND (SELECT state FROM dispatch WHERE run_id = OLD.run_id)
+       NOT IN ('done', 'reconciled', 'archived'))
+BEGIN SELECT RAISE(ABORT, 'a sent launch is released only once its dispatch is terminal; an uncertain launch only '
+                           'via explicit safe release (uncertain -> reserved -> delete)'); END;
+
+-- Who holds a scheduling slot right now (capacity, route, pane): a running dispatch, or a non-terminal dispatch
+-- with a reserved/sent/uncertain launch. Terminal dispatches free their slot.
+CREATE VIEW launch_active AS
+  SELECT run_id, route, executor_pane AS pane_id FROM dispatch WHERE state = 'executing'
+  UNION ALL
+  SELECT l.run_id, d.route, l.pane_id FROM dispatch_launch l JOIN dispatch d ON d.run_id = l.run_id
+   WHERE l.state IN ('reserved', 'sent', 'uncertain')
+     AND d.state NOT IN ('done', 'reconciled', 'archived');
+
+-- Who still holds a route or resource claim right now: running + done + reconciled, plus non-terminal launches.
+-- Route and resource claims persist until archive (they conflict with new work until then); only capacity and the
+-- pane slot free at terminal. Archived dispatches are absent, so retained rows there never conflict/leak.
+CREATE VIEW claim_holders AS
+  SELECT run_id, route FROM dispatch WHERE state IN ('executing', 'done', 'reconciled')
+  UNION
+  SELECT l.run_id, d.route FROM dispatch_launch l JOIN dispatch d ON d.run_id = l.run_id
+   WHERE l.state IN ('reserved', 'sent', 'uncertain')
+     AND d.state NOT IN ('done', 'reconciled', 'archived');
+
+-- All conflicting resource pairs across every dispatch (equal key, same-namespace slash ancestor/descendant, or
+-- any global namespace). namespace = text before the first ':', key = the rest.
+CREATE VIEW resource_conflicts AS
+SELECT c.run_id AS a, o.run_id AS b
+FROM dispatch_resource c JOIN dispatch_resource o ON o.run_id <> c.run_id
+WHERE c.resource = o.resource
+   OR substr(c.resource, 1, instr(c.resource, ':') - 1) = 'global'
+   OR substr(o.resource, 1, instr(o.resource, ':') - 1) = 'global'
+   OR (substr(c.resource, 1, instr(c.resource, ':') - 1) = substr(o.resource, 1, instr(o.resource, ':') - 1)
+       AND (substr(c.resource, instr(c.resource, ':') + 1) = substr(o.resource, instr(o.resource, ':') + 1)
+            OR instr(substr(c.resource, instr(c.resource, ':') + 1), substr(o.resource, instr(o.resource, ':') + 1) || '/') = 1
+            OR instr(substr(o.resource, instr(o.resource, ':') + 1), substr(c.resource, instr(c.resource, ':') + 1) || '/') = 1));
+
+-- Atomic reserve: refuse when the cap (running + non-terminal launches), this pane, this route, a claimed resource
+-- would be shared, or the run has no claims at all. Route and resources are checked against claim_holders (which
+-- includes done/reconciled, so a route/resource is held until archive). Pane is blocked by ANY retained launch row on
+-- it (reserved/sent/uncertain, even on a terminal/archived dispatch: a terminal slot release frees capacity but a
+-- retained uncertain/sent row means the pane is not yet confirmed safe) or a running dispatch's executor pane. Raw
+-- sqlite3 cannot bypass.
+CREATE TRIGGER launch_reserve_guard BEFORE INSERT ON dispatch_launch
+WHEN (SELECT count(DISTINCT run_id) FROM launch_active) + 1 > (SELECT max_parallel FROM execution_policy WHERE id = 1)
+  OR EXISTS (SELECT 1 FROM dispatch_launch WHERE pane_id = NEW.pane_id)
+  OR EXISTS (SELECT 1 FROM dispatch WHERE executor_pane = NEW.pane_id AND state = 'executing')
+  OR ((SELECT route FROM dispatch WHERE run_id = NEW.run_id) IS NOT NULL
+      AND EXISTS (SELECT 1 FROM claim_holders WHERE route = (SELECT route FROM dispatch WHERE run_id = NEW.run_id)))
+  OR EXISTS (SELECT 1 FROM resource_conflicts rc WHERE rc.a = NEW.run_id
+             AND rc.b IN (SELECT run_id FROM claim_holders))
+  OR NOT EXISTS (SELECT 1 FROM dispatch_resource WHERE run_id = NEW.run_id)
+BEGIN SELECT RAISE(ABORT, 'launch conflicts with capacity, pane, route or a held resource, or the run has no claims'); END;
+
+-- staged -> executing re-checks the same rules for every run (legacy included, so a direct execute cannot bypass
+-- reserve), minus the self slot/claim the reservation already holds. A run with no claims cannot execute.
+CREATE TRIGGER dispatch_execute_guard BEFORE UPDATE OF state ON dispatch
+WHEN OLD.state = 'staged' AND NEW.state = 'executing' AND (
+  (SELECT count(DISTINCT run_id) FROM launch_active WHERE run_id <> NEW.run_id) + 1
+      > (SELECT max_parallel FROM execution_policy WHERE id = 1)
+  OR EXISTS (SELECT 1 FROM dispatch_launch WHERE pane_id = NEW.executor_pane AND run_id <> NEW.run_id)
+  OR EXISTS (SELECT 1 FROM dispatch WHERE executor_pane = NEW.executor_pane AND state = 'executing'
+             AND run_id <> NEW.run_id)
+  OR (NEW.route IS NOT NULL AND EXISTS (SELECT 1 FROM claim_holders WHERE route = NEW.route AND run_id <> NEW.run_id))
+  OR EXISTS (SELECT 1 FROM resource_conflicts rc WHERE rc.a = NEW.run_id
+             AND rc.b IN (SELECT run_id FROM claim_holders WHERE run_id <> NEW.run_id))
+  OR NOT EXISTS (SELECT 1 FROM dispatch_resource WHERE run_id = NEW.run_id))
+BEGIN SELECT RAISE(ABORT, 'execute conflicts with capacity, pane, route or a held resource, or the run has no claims'); END;
+
+-- A brief-backed dispatch enters executing only from its own reserved/sent launch pane; legacy (NULL brief_id)
+-- dispatches finish unchanged and are covered by dispatch_execute_guard alone.
+CREATE TRIGGER dispatch_execute_launch BEFORE UPDATE OF state ON dispatch
+WHEN OLD.state = 'staged' AND NEW.state = 'executing' AND NEW.brief_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM dispatch_launch WHERE run_id = NEW.run_id
+                 AND state IN ('reserved', 'sent') AND pane_id = NEW.executor_pane)
+BEGIN SELECT RAISE(ABORT, 'a brief-backed dispatch executes only from its reserved/sent launch pane'); END;
