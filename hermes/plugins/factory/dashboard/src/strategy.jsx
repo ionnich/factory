@@ -274,8 +274,8 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const save = async () => {
     const atOpen = open, atNav = NAV_TOKEN;
     const r = await call(`/strategy/${open}/revise`, { body: formToBody(edit), reason: reason.trim() || "edited draft" }, "save");
-    if (!applyGuarded(r, atNav)) return;
-    settleId(r, atOpen);
+    if (!r) return;
+    if (applyGuarded(r, atNav)) settleId(r, atOpen);
     onDone(r, null, `Saved draft #${r.id}`);
   };
 
@@ -290,8 +290,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     }
     const approved = await call(`/strategy/${target.id}/approve`, {}, "approve");
     if (!approved) return;
-    if (!applyGuarded(approved, atNav)) return;
-    settleId(approved, atOpen);
+    if (applyGuarded(approved, atNav)) settleId(approved, atOpen);
     onDone(approved, null, `Published #${approved.id} as approved intent (not execution)`);
   };
 
@@ -300,8 +299,8 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     if (!reason.trim()) return;
     const atOpen = open, atNav = NAV_TOKEN;
     const r = await call(`/strategy/${open}/revise`, { body: formToBody(edit), reason: reason.trim() }, "amend");
-    if (!applyGuarded(r, atNav)) return;
-    settleId(r, atOpen);
+    if (!r) return;
+    if (applyGuarded(r, atNav)) settleId(r, atOpen);
     onDone(r, null, `Amendment #${r.id} drafted; review and publish`);
   };
 
@@ -310,14 +309,16 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     if (!reason.trim()) return;
     const atOpen = open, atNav = NAV_TOKEN;
     const r = await call(`/strategy/${open}/hold`, { reason: reason.trim() }, "hold");
-    if (!applyGuarded(r, atNav)) return;
+    if (!r) return;
+    if (applyGuarded(r, atNav)) settleId(r, atOpen);
     onDone(r, null, `Held #${open}`);
   };
 
   const unhold = async () => {
     const atOpen = open, atNav = NAV_TOKEN;
     const r = await call(`/strategy/${open}/unhold`, {}, "unhold");
-    if (!applyGuarded(r, atNav)) return;
+    if (!r) return;
+    if (applyGuarded(r, atNav)) settleId(r, atOpen);
     onDone(r, null, `Unheld #${open}`);
   };
 
@@ -326,10 +327,12 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const stage = async () => {
     if (arm !== "stage") { setArm("stage"); return; }
     setArm(null);
+    const atNav = NAV_TOKEN;
     const r = await call(`/strategy/${open}/stage`, {}, "stage");
     if (!r) return;
     onDone(r, null, `Staged ${r.run_id || ""} for review`);
-    if (r.run_id && alive.current) onNavigate({ stage: "draft", run: r.run_id });
+    // Redirect only if the operator is still on this brief (nav token) and the tab is still mounted (lifecycle).
+    if (r.run_id && alive.current && NAV_TOKEN === atNav) onNavigate({ stage: "draft", run: r.run_id });
   };
 
   const refresh = async () => {
