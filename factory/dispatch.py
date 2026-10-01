@@ -279,14 +279,22 @@ PHASE = ("CASE WHEN state = 'draft' AND planned_at IS NOT NULL THEN 'review' "
          "WHEN state IN ('done', 'reconciled') THEN 'reconcile' ELSE 'archive' END")
 
 
+def _current_published_heads(conn) -> set[int]:
+    """The authoritative head-of-lineage ids from Strategy. Reused verbatim (lazy import preserves the
+    dispatch<->strategy cycle design); no local recursive query or head convention is duplicated here."""
+    from . import strategy
+    return set(strategy._current_published(conn))
+
+
 def _approved_unconsumed(conn) -> list:
-    """Approved, current (head-of-lineage), unconsumed briefs in stable approved order. A superseded version (one
-    with a published child) is never offered."""
+    """Approved, current (head-of-lineage), unconsumed briefs in stable approved order. Supersession is decided by
+    the authoritative Strategy heads: an intermediate DRAFT revision does not re-activate an approved ancestor, and
+    any later published descendant (even past a draft) supersedes it."""
+    heads = _current_published_heads(conn)
     return [dict(r) for r in conn.execute(
         "SELECT * FROM work_brief WHERE state='approved' AND "
-        "NOT EXISTS (SELECT 1 FROM dispatch d WHERE d.brief_id = work_brief.id) AND "
-        "NOT EXISTS (SELECT 1 FROM work_brief c WHERE c.parent_id = work_brief.id AND c.state IN ('approved','held')) "
-        "ORDER BY (approved_at IS NULL), approved_at, id")]
+        "NOT EXISTS (SELECT 1 FROM dispatch d WHERE d.brief_id = work_brief.id) "
+        "ORDER BY (approved_at IS NULL), approved_at, id") if r["id"] in heads]
 
 
 def _resolve_brief(conn, identifiers: list[str]) -> int:
@@ -307,8 +315,7 @@ def _load_approved_brief(conn, brief_id: int) -> dict:
     brief = _brief(conn, brief_id)
     if brief.get("state") != "approved":
         raise StageError(f"brief #{brief_id} is {brief.get('state', 'unknown')}, not approved")
-    if conn.execute("SELECT 1 FROM work_brief WHERE parent_id=? AND state IN ('approved','held')",
-                    (brief_id,)).fetchone():
+    if brief_id not in _current_published_heads(conn):  # superseded by any later published descendant
         raise StageError(f"brief #{brief_id} was superseded by a newer revision; use the current version")
     if consumed := conn.execute("SELECT run_id FROM dispatch WHERE brief_id=?", (brief_id,)).fetchone():
         raise StageError(f"brief #{brief_id} is already dispatched as {consumed['run_id']}")
@@ -332,15 +339,11 @@ def _brief_verdict(conn, brief_id: int, issue_id: str):
 
 
 def _dependency_status(conn, identifier: str) -> str:
-    """Dependencies count ready only on a recorded completed/accepted fact, never a title or model assertion."""
-    s = conn.execute("SELECT * FROM linear_latest WHERE identifier=?", (identifier,)).fetchone()
-    if s is None:
-        return "unknown"
-    if s["state_type"] == "completed":
-        return "ready"
-    v = conn.execute("SELECT kind FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
-                     (s["issue_id"],)).fetchone()
-    return "ready" if (v and v["kind"] == "already-done") else "unmet"
+    """Dependency readiness follows the authoritative Strategy rule (lazy import preserves the dispatch<->strategy
+    cycle design): ready only on a recorded completed state or a CURRENT-snapshot already-done verdict — a reopened
+    ticket's stale, still-unsuperseded already-done verdict is not readiness."""
+    from . import strategy
+    return strategy._dependency_status(conn, identifier)
 
 
 def _create_brief_draft(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool,
@@ -397,8 +400,7 @@ def _create_brief_draft(cfg: Config, conn, identifiers: list[str], actor: str, e
         row = conn.execute("SELECT state, body_json, sources_json FROM work_brief WHERE id=?", (brief_id,)).fetchone()
         if row is None or row["state"] != "approved":
             raise StageError(f"brief #{brief_id} changed while staging; nothing was written")
-        if conn.execute("SELECT 1 FROM work_brief c WHERE c.parent_id=? AND c.state IN ('approved','held')",
-                        (brief_id,)).fetchone():
+        if brief_id not in _current_published_heads(conn):
             raise StageError(f"brief #{brief_id} was superseded while staging; nothing was written")
         if conn.execute("SELECT 1 FROM dispatch WHERE brief_id=?", (brief_id,)).fetchone():
             raise StageError(f"brief #{brief_id} was consumed while staging; nothing was written")
@@ -959,11 +961,40 @@ def _target(cfg: Config, d) -> tuple[dict, str]:
     return _executor(cfg.raw.get("executor", {}).get("workspace", "factory")), "factory-primary"
 
 
-def _lead_busy(route: str) -> bool:
-    """The lead still supervises crews or holds decisions: a /new now would drop what it has not written down."""
+def _home_summary(route: str) -> dict | None:
+    """The supervising home's summary as positive proof, or None when the file is missing, unreadable, malformed,
+    or its proof fields are absent/wrong-typed. None is never proof of idle (terminal cleanup fails closed)."""
     f = FLEET_HOMES / route / "state" / "home-summary.json"
-    s = json.loads(f.read_text()) if f.exists() else {}
-    return bool(s.get("active_children") or s.get("decisions_open"))
+    try:
+        s = json.loads(f.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(s, dict) or not isinstance(s.get("active_children"), list) \
+            or not isinstance(s.get("decisions_open"), list):
+        return None
+    return s
+
+
+def _lead_busy(route: str) -> bool:
+    """The lead still supervises crews or holds decisions: a /new now would drop what it has not written down.
+    A missing/unreadable summary is not proof of activity here — handoff separately verifies the pane is idle."""
+    s = _home_summary(route)
+    return bool(s and (s["active_children"] or s["decisions_open"]))
+
+
+def _home_idle(route: str) -> bool:
+    """Positive proof the supervising home is idle: summary present, both proof fields lists, and both empty.
+    Missing, malformed, unreadable or wrong-typed is NOT proof of idle (fail closed)."""
+    s = _home_summary(route)
+    return s is not None and not s["active_children"] and not s["decisions_open"]
+
+
+def _launch_home(route: str | None, pane_id: str) -> str:
+    """The real supervising home for a launch's pane: the route lead only when its spawned herdr pane matches the
+    reserved pane, else the captain (handoff may have fallen back to the captain)."""
+    if route and _lead_pane_id(route) == pane_id:
+        return route
+    return "factory-primary"
 
 
 def _safety_check(cfg: Config, conn, run_id: str) -> None:
@@ -1042,11 +1073,15 @@ def resume(cfg: Config, conn, run_id: str) -> dict:
         if l is not None:  # sent/reserved -> uncertain: the durable restart marker (second resume refuses)
             conn.execute("UPDATE dispatch_launch SET state='uncertain', pane_id=?, owner_pid=? WHERE run_id=?",
                          (pane["pane_id"], os.getpid(), run_id))
-        else:  # legacy run bootstrap: no launch yet; claim the pane with the same guards
+            conn.execute("UPDATE dispatch SET executor_pane=?, last_actor='factory:resume' WHERE run_id=?",
+                         (pane["pane_id"], run_id))
+        else:
+            # Legacy run bootstrap (no launch yet): pin the replacement executor_pane first so the reserve-state
+            # pane match passes, then insert the launch in the same transaction (a failed insert rolls both back).
+            conn.execute("UPDATE dispatch SET executor_pane=?, last_actor='factory:resume' WHERE run_id=?",
+                         (pane["pane_id"], run_id))
             conn.execute("INSERT INTO dispatch_launch(run_id, pane_id, state, owner_pid, claimed_at) "
                          "VALUES (?,?,?,?,?)", (run_id, pane["pane_id"], "uncertain", os.getpid(), db.now()))
-        conn.execute("UPDATE dispatch SET executor_pane=?, last_actor='factory:resume' WHERE run_id=?",
-                     (pane["pane_id"], run_id))
     if pane.get("agent_status") not in ("idle", "done"):  # our own stuck executor, after the marker is durable
         _herdr("pane", "send-keys", pane["pane_id"], "esc")
         time.sleep(2)
@@ -1151,6 +1186,9 @@ def release_unsent(cfg: Config, conn, run_id: str, actor: str, reason: str) -> d
         raise StageError(f"pane {l['pane_id']} is unknown; refusing to release an unverified send")
     if pane.get("agent_status") not in ("idle", "done"):
         raise StageError(f"pane {l['pane_id']} is {pane.get('agent_status')}; not releasing a live executor")
+    route = conn.execute("SELECT route FROM dispatch WHERE run_id=?", (run_id,)).fetchone()["route"]
+    if not _home_idle(_launch_home(route, l["pane_id"])):  # busy/unknown supervising home: refuse (fail closed)
+        raise StageError("the supervising home is busy or its summary is unknown; not releasing an unverified send")
     with db.tx(conn):  # revalidate DB ownership/state under the lock; never release a changed/raced launch
         d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
         if d is None or d["state"] not in ("staged", "done", "reconciled", "archived"):
@@ -1166,8 +1204,8 @@ def release_unsent(cfg: Config, conn, run_id: str, actor: str, reason: str) -> d
 
 def release_safe_terminal(cfg: Config, conn) -> list[str]:
     """Conservative terminal cleanup (proposer surface): release a terminal dispatch's `sent`/`reserved` launch only
-    after its pane is proven idle and, for a routed lead, not supervising crews/decisions. An `uncertain` launch is
-    never auto-released. Returns the run ids released."""
+    when its pane is observed idle AND the real supervising home has positive proof of no children and no decisions.
+    A missing/malformed/busy summary or an `uncertain` launch is never auto-released. Returns the run ids released."""
     try:
         panes = {p["pane_id"]: p for p in _herdr("pane", "list")["result"]["panes"]}
     except (StageError, OSError, subprocess.TimeoutExpired):
@@ -1179,8 +1217,8 @@ def release_safe_terminal(cfg: Config, conn) -> list[str]:
         pane = panes.get(l["pane_id"])
         if pane is None or pane.get("agent_status") not in ("idle", "done"):
             continue  # busy/unknown pane: keep the reservation
-        if l["route"] and _lead_busy(l["route"]):
-            continue  # lead still supervising crews/decisions: keep
+        if not _home_idle(_launch_home(l["route"], l["pane_id"])):  # missing/malformed/busy home: fail closed, keep
+            continue
         with db.tx(conn):
             d2 = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (l["run_id"],)).fetchone()
             if d2 is None or d2["state"] not in ("done", "reconciled", "archived"):
@@ -1195,7 +1233,7 @@ def release_safe_terminal(cfg: Config, conn) -> list[str]:
 
 def archive(cfg: Config, conn, run_id: str) -> dict:
     """reconciled -> archived: unlock, move to _archived/, commit it to the factory repo, and release the resource
-    claims (the terminal done/reconciled states already freed the launch slot)."""
+    claims (terminal frees capacity via launch_active; the pane reservation is retained until release_safe_terminal)."""
     d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
     if d is None or d["state"] != "reconciled":
         raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not reconciled")
@@ -1209,7 +1247,8 @@ def archive(cfg: Config, conn, run_id: str) -> dict:
         conn.execute("UPDATE dispatch SET state='archived', archived_at=?, last_actor='factory:archive' WHERE run_id=?",
                      (db.now(), run_id))
         scheduler.release_claims(conn, run_id)  # archived: claims no longer conflict (claim_holders excludes it)
-        scheduler.release_terminal_launch(conn, run_id)  # reserved/sent only; uncertain retained for explicit recovery
+        # The pane reservation is retained through archive: release_safe_terminal releases it only after positive
+        # proof the pane is idle and its home free of children/decisions.
     return {"run_id": run_id, "path": str(dst), "committed": _commit_archived(cfg, run_id, f"archive dispatch {run_id}")}
 
 
@@ -1281,9 +1320,8 @@ def card(cfg: Config, conn, run_id: str, ident: str, kind: str, actor: str,
         if d["state"] != "executing":  # last card closed the dispatch: run-time questions no longer apply
             decide.void(conn, "run_id=? AND kind IN ('executor-gone','dispatch-stuck','ask')", (run_id,),
                         "the dispatch finished")
-            # Terminal frees capacity (launch_active), but a sent/reserved launch releases the pane slot only when
-            # positively safe; an uncertain launch is retained for explicit human recovery.
-            scheduler.release_terminal_launch(conn, run_id)
+            # Terminal frees capacity (launch_active) automatically; the pane reservation is retained until
+            # release_safe_terminal positively proves the pane idle and its home free of children/decisions.
     res = {"run_id": run_id, "identifier": ident, "event": kind,
            "card_status": conn.execute("SELECT card_status FROM dispatch_ticket WHERE run_id=? AND identifier=?",
                                        (run_id, ident)).fetchone()[0], "dispatch_state": d["state"]}
@@ -1360,7 +1398,8 @@ def propose(cfg: Config, conn) -> dict:
                 queued += 1
             except StageError as e:
                 result["blocked"].append({"brief_id": bid, "blocker": str(e)})
-    # Conservative terminal cleanup: release terminal sent/reserved launches whose pane is proven idle.
+    # Conservative terminal cleanup: release terminal sent/reserved launches whose pane is observed idle and whose
+    # real supervising home has positive proof of no children/decisions.
     result["released_terminal"] = release_safe_terminal(cfg, conn)
     return result
 

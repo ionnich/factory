@@ -25,6 +25,7 @@ class OwnedInScope(unittest.TestCase):
                       "created_by) VALUES (?,?,'r1','valid','r','[1]',?,'t')", (f"i{n}", SNAP, SNAP))
             c.execute("INSERT INTO dispatch_ticket(run_id,issue_id,identifier,snapshot_updated_at,verdict_id) "
                       "VALUES (?,?,?,?,?)", (run, f"i{n}", f"FIN-{n}", SNAP, n))
+        c.execute("INSERT INTO dispatch_resource(run_id, resource) VALUES ('d1','global:*')")  # pinned while draft
         c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' WHERE run_id='d1'")
         c.execute("UPDATE dispatch SET state='executing', last_actor='fm-main' WHERE run_id='d1'")
         cfg = SimpleNamespace(linear={"lead": "lead@x"})

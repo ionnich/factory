@@ -194,6 +194,8 @@ class Overview(unittest.TestCase):
         for run, states in runs.items():
             c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) "
                       "VALUES (?,'draft','[]','t',?)", (run, SNAP))
+            if "executing" in states:  # a run that executes needs a non-conflicting claim pinned while draft
+                c.execute("INSERT INTO dispatch_resource(run_id, resource) VALUES (?, ?)", (run, f"repo:{run}"))
             for state in states:
                 c.execute("UPDATE dispatch SET state=?, body_sha256='h', approved_by='u' WHERE run_id=?", (state, run))
         c.execute("UPDATE dispatch SET planning_requested_at=? WHERE run_id='plan'", (SNAP,))

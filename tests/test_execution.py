@@ -103,20 +103,29 @@ class Admission(unittest.TestCase):
         self.c.execute("UPDATE execution_policy SET max_parallel=1")
         self.staged("d1", {"repo:a", "route:fx-a"})
         self.staged("d2", {"repo:b", "route:fx-b"})
-        c2 = db.connect(self.path)
-        self.addCleanup(c2.close)
-        out = []
+        barrier = threading.Barrier(2)
+        results, errors = [], []
 
-        def worker(conn, run, pane):
-            out.append((run, scheduler.reserve_if_free(conn, run, pane, os.getpid())))
+        def worker(run, pane):
+            barrier.wait()  # both threads ready before either opens a connection
+            conn = None
+            try:
+                conn = db.connect(self.path)  # each worker owns its connection (sqlite forbids cross-thread sharing)
+                results.append((run, scheduler.reserve_if_free(conn, run, pane, os.getpid())))
+            except Exception as e:  # propagate thread failures, never swallow
+                errors.append(e)
+            finally:
+                if conn is not None:
+                    conn.close()
 
-        threads = [threading.Thread(target=worker, args=(conn, run, pane))
-                   for conn, run, pane in ((self.c, "d1", "p1"), (c2, "d2", "p2"))]
+        threads = [threading.Thread(target=worker, args=(run, pane)) for run, pane in (("d1", "p1"), ("d2", "p2"))]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-        self.assertEqual(len([r for r in out if r[1] is None]), 1)
+        self.assertEqual(errors, [])
+        self.assertEqual(len([r for r in results if r[1] is None]), 1)  # exactly one winner
+        self.assertEqual(len([r for r in results if r[1] is not None]), 1)  # the other rejected by capacity
         self.assertEqual(self.c.execute("SELECT count(*) FROM dispatch_launch").fetchone()[0], 1)
 
 
@@ -254,6 +263,14 @@ class UncertainSend(unittest.TestCase):
                        "WHERE run_id='d1'")
         self.cfg = SimpleNamespace(raw={})
         self.pane = {"pane_id": "w1:p1", "agent": "omp", "agent_status": "idle"}
+        # d1 has no route: its launch pane is supervised by the captain; prove the captain idle for release paths.
+        self.homes = Path(tmp.name) / "homes"
+        (self.homes / "factory-primary" / "state").mkdir(parents=True)
+        (self.homes / "factory-primary" / "state" / "home-summary.json").write_text(
+            json.dumps({"active_children": [], "decisions_open": []}))
+        self.patch_fh = mock.patch.object(dispatch, "FLEET_HOMES", self.homes)
+        self.patch_fh.start()
+        self.addCleanup(self.patch_fh.stop)
 
     def test_send_failure_marks_uncertain_and_is_not_replayed(self):
         with mock.patch.object(dispatch, "_safety_check"), \
@@ -322,21 +339,31 @@ class ExecuteGuard(unittest.TestCase):
         self.assertEqual(self.c.execute("SELECT state FROM dispatch").fetchone()[0], "executing")
 
     def test_resume_refuses_another_dispatchs_pane(self):
-        _helpers.seed_dispatch(self.c, "d1", "executing")
-        _helpers.seed_dispatch(self.c, "d2", "staged")
+        _helpers.seed_dispatch(self.c, "d1", "executing", resources={"repo:a", "route:fx-a"}, pane="pane-1")
+        _helpers.seed_dispatch(self.c, "d2", "staged", resources={"repo:b", "route:fx-b"})
         self.c.execute("INSERT INTO dispatch_launch(run_id,pane_id,state,claimed_at) VALUES ('d2','w1:p1','sent',?)",
                        (SNAP,))
         pane = {"pane_id": "w1:p1", "agent": "omp", "agent_status": "idle"}
         with mock.patch.object(dispatch, "_target", return_value=(pane, "factory-primary")), \
-                self.assertRaisesRegex(dispatch.StageError, "reserved for dispatch d2"):
+                mock.patch.object(dispatch, "_send") as send, \
+                mock.patch.object(dispatch, "_herdr") as herdr, \
+                self.assertRaises(dispatch.StageError):
             dispatch.resume(SimpleNamespace(raw={}), self.c, "d1")
+        send.assert_not_called()  # no reset, no steal of the other run's pane
+        herdr.assert_not_called()
+        self.assertEqual(self.c.execute("SELECT executor_pane FROM dispatch WHERE run_id='d1'").fetchone()[0],
+                         "pane-1")
 
     def test_resume_refuses_busy_fallback_pane(self):
-        _helpers.seed_dispatch(self.c, "d1", "executing")  # executor_pane is 'pane1', not the fallback
+        _helpers.seed_dispatch(self.c, "d1", "executing", resources={"repo:a", "route:fx-a"}, pane="pane-1")
         pane = {"pane_id": "w1:p1", "agent": "omp", "agent_status": "running"}
         with mock.patch.object(dispatch, "_target", return_value=(pane, "factory-primary")), \
-                self.assertRaisesRegex(dispatch.StageError, "unrelated work"):
+                mock.patch.object(dispatch, "_send") as send, \
+                mock.patch.object(dispatch, "_herdr") as herdr, \
+                self.assertRaises(dispatch.StageError):
             dispatch.resume(SimpleNamespace(raw={}), self.c, "d1")
+        send.assert_not_called()  # a busy fallback pane is never reset or sent to
+        herdr.assert_not_called()
 
 
 class PruneBacklogBrief(unittest.TestCase):
@@ -354,6 +381,270 @@ class PruneBacklogBrief(unittest.TestCase):
         items = {t["identifier"]: t for t in got["context"]["tickets"]}
         self.assertIn("FIN-1", items)
         self.assertIn("brief_id", items["FIN-1"])
+
+
+class IntentVersionLineage(unittest.TestCase):
+    """An approved ancestor superseded by a later approved descendant THROUGH an intermediate draft revision must
+    never be re-offered or accepted. Lineage: #1 APPROVED -> #2 DRAFT -> #3 APPROVED; authoritative head is #3."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tmp = Path(tmp.name)
+        self.c = db.connect(tmp / "t.db")
+        self.addCleanup(self.c.close)
+        _helpers.seed_project(self.c)
+        _helpers.seed_trunk(self.c)
+        _helpers.seed_snapshot(self.c, "i1", "FIN-1")
+        self.verdict = _helpers.seed_verdict(self.c, "i1")
+        self.cfg = _helpers.mkcfg(tmp)
+        from factory import strategy
+        self.b1 = strategy.approve(self.cfg, self.c,
+                                   strategy.create(self.cfg, self.c, ["FIN-1"], _helpers.HUMAN,
+                                                   body=_helpers.body(title="v1"))["id"], _helpers.HUMAN)
+        self.b2 = strategy.revise(self.cfg, self.c, self.b1["id"], _helpers.body(title="v2"),
+                                  "amend to a draft", _helpers.HUMAN)  # still a draft: does not supersede
+        self.b3 = strategy.approve(self.cfg, self.c,
+                                   strategy.revise(self.cfg, self.c, self.b2["id"], _helpers.body(title="v3"),
+                                                   "amend again", _helpers.HUMAN)["id"], _helpers.HUMAN)
+
+    def test_identifier_resolution_selects_current_head_not_ambiguous(self):
+        self.assertEqual([b["id"] for b in dispatch._approved_unconsumed(self.c)], [self.b3["id"]])
+        self.assertEqual(dispatch._resolve_brief(self.c, ["FIN-1"]), self.b3["id"])
+
+    def test_explicit_stage_of_superseded_ancestor_refuses(self):
+        with self.assertRaises(dispatch.StageError):
+            dispatch.stage_brief(self.cfg, self.c, self.b1["id"], "user")
+
+    def test_prune_put_superseded_ancestor_refuses_without_mutation(self):
+        before_verdicts = self.c.execute("SELECT count(*) FROM verdict").fetchone()[0]
+        before_links = self.c.execute("SELECT count(*) FROM brief_verdict").fetchone()[0]
+        with self.assertRaises(prune.VerdictError):
+            prune.put(self.cfg, self.c, "FIN-1", "valid", "r", [], brief_id=self.b1["id"])
+        self.assertEqual(self.c.execute("SELECT count(*) FROM verdict").fetchone()[0], before_verdicts)
+        self.assertEqual(self.c.execute("SELECT count(*) FROM brief_verdict").fetchone()[0], before_links)
+
+    def test_current_head_stages_once_its_own_version_is_verified(self):
+        _helpers.associate(self.c, self.b3["id"], "i1", self.verdict)
+        res = dispatch.stage_brief(self.cfg, self.c, self.b3["id"], "user")
+        self.assertEqual(res["brief_id"], self.b3["id"])
+
+    def test_writing_transaction_revalidates_supersession(self):
+        # Bypass the read gate (as a concurrent amend could) and drive the inner writer directly: its transaction
+        # re-validation must still refuse the superseded ancestor even though the ancestor is itself approved+verified.
+        _helpers.associate(self.c, self.b1["id"], "i1", self.verdict)
+        with self.assertRaises(dispatch.StageError):
+            dispatch._create_brief_draft(self.cfg, self.c, ["FIN-1"], "user", False, self.b1["id"],
+                                         dispatch._brief(self.c, self.b1["id"]))
+        self.assertEqual(self.c.execute("SELECT count(*) FROM dispatch").fetchone()[0], 0)
+
+
+class ReopenedDependency(unittest.TestCase):
+    """A dependency is ready only on a recorded completion fact for its CURRENT snapshot: a reopened ticket whose
+    old already-done verdict is still unsuperseded must not count as ready, and staging must refuse without writing."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tmp = Path(tmp.name)
+        self.c = db.connect(tmp / "t.db")
+        self.addCleanup(self.c.close)
+        _helpers.seed_project(self.c)
+        _helpers.seed_trunk(self.c)
+        _helpers.seed_snapshot(self.c, "i1", "FIN-1")  # the brief's source
+        _helpers.seed_verdict(self.c, "i1")
+        _helpers.seed_snapshot(self.c, "i2", "FIN-2")  # the dependency, currently at SNAP
+        # FIN-2 already-done at SNAP (unsuperseded), a real verdict row
+        self.c.execute("INSERT INTO verdict(issue_id,snapshot_updated_at,context,repo,kind,reason,evidence_json,"
+                       "evidence_paths_json,created_at,created_by) VALUES ('i2',?,?,?,?,?,?,?,?,?)",
+                       (SNAP, "api", "o/api", "already-done", "r", "[1]", "[]", db.now(), "t"))
+        self.cfg = _helpers.mkcfg(tmp)
+
+    def test_reopened_dependency_blocks_staging(self):
+        from factory import strategy
+        brief = strategy.approve(self.cfg, self.c,
+                                 strategy.create(self.cfg, self.c, ["FIN-1"], _helpers.HUMAN,
+                                                 body=_helpers.body(dependencies=["FIN-2"]))["id"], _helpers.HUMAN)
+        # the already-done verdict at the current snapshot is readiness, before the ticket reopens
+        self.assertTrue(next(b for b in strategy.ready(self.cfg, self.c) if b["id"] == brief["id"])["intent_ready"])
+        _helpers.seed_snapshot(self.c, "i2", "FIN-2", snap="2026-09-02T00:00:00Z")  # FIN-2 reopens; old verdict stays unsuperseded
+        item = next(b for b in strategy.ready(self.cfg, self.c) if b["id"] == brief["id"])
+        self.assertFalse(item["intent_ready"])
+        self.assertEqual(item["dependencies"], [{"identifier": "FIN-2", "status": "unmet"}])
+        before = self.c.execute("SELECT count(*) FROM dispatch").fetchone()[0]
+        with self.assertRaises(dispatch.StageError):
+            dispatch.stage_brief(self.cfg, self.c, brief["id"], "user")
+        self.assertEqual(self.c.execute("SELECT count(*) FROM dispatch").fetchone()[0], before)  # nothing staged
+
+
+class TerminalPaneRetention(unittest.TestCase):
+    """Terminal capacity frees via launch_active, but the pane reservation is retained through done/reconciled/
+    archived until release_safe_terminal positively proves the pane idle AND the real supervising home free of
+    children and decisions."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.c = db.connect(self.tmp / "t.db")
+        self.addCleanup(self.c.close)
+        self.homes = self.tmp / "homes"
+        (self.homes / "factory-primary" / "state").mkdir(parents=True)
+        (self.homes / "fx-api" / "state").mkdir(parents=True)
+        self.patch_fh = mock.patch.object(dispatch, "FLEET_HOMES", self.homes)
+        self.patch_fh.start()
+        self.addCleanup(self.patch_fh.stop)
+
+    def write_summary(self, home, children=(), decisions=(), text=None):
+        f = self.homes / home / "state" / "home-summary.json"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text if text is not None
+                     else json.dumps({"active_children": list(children), "decisions_open": list(decisions)}))
+
+    def sent_terminal(self, run_id, pane="pane-1", route=None):
+        """Reach a done dispatch that holds a sent launch (raw auto-done), without freeing the pane."""
+        _helpers.seed_snapshot(self.c, "i1", "FIN-1")
+        v = _helpers.seed_verdict(self.c, "i1")
+        _helpers.seed_dispatch(self.c, run_id, "draft", route=route)
+        _helpers.set_claims(self.c, run_id, {"repo:a", "route:fx-a"})
+        _helpers.seed_ticket(self.c, run_id, "i1", "FIN-1", v)
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' "
+                       "WHERE run_id=?", (run_id,))
+        scheduler.reserve_if_free(self.c, run_id, pane, os.getpid())
+        scheduler.mark_sent(self.c, run_id)
+        self.c.execute("UPDATE dispatch SET state='executing', executor_pane=?, executing_at=? WHERE run_id=?",
+                       (pane, SNAP, run_id))
+        self.c.execute("UPDATE dispatch_ticket SET card_status='blocked' WHERE run_id=?", (run_id,))  # auto-done
+        return run_id
+
+    def test_card_completion_retains_sent_launch(self):
+        _helpers.seed_snapshot(self.c, "i1", "FIN-1")
+        v = _helpers.seed_verdict(self.c, "i1")
+        _helpers.seed_dispatch(self.c, "d1", "draft")
+        _helpers.set_claims(self.c, "d1", {"repo:a", "route:fx-a"})
+        _helpers.seed_ticket(self.c, "d1", "i1", "FIN-1", v)
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' "
+                       "WHERE run_id='d1'")
+        scheduler.reserve_if_free(self.c, "d1", "pane-1", os.getpid())
+        scheduler.mark_sent(self.c, "d1")
+        self.c.execute("UPDATE dispatch SET state='executing', executor_pane='pane-1', executing_at=? WHERE run_id='d1'",
+                       (SNAP,))
+        dispatch.card(SimpleNamespace(kanban={"enabled": False}), self.c, "d1", "FIN-1", "block", "user",
+                      body="stuck", ask=False)
+        self.assertEqual(self.c.execute("SELECT state FROM dispatch WHERE run_id='d1'").fetchone()[0], "done")
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))  # pane reservation retained by card completion
+
+    def test_archive_retains_sent_launch(self):
+        self.sent_terminal("d1", pane="pane-1")
+        dispatches = self.tmp / "dispatches"
+        (dispatches / "d1").mkdir(parents=True)
+        (dispatches / "d1" / "dispatch.md").write_bytes(b"# d1\n")
+        self.c.execute("UPDATE dispatch SET state='reconciled', reconciled_at=? WHERE run_id='d1'", (SNAP,))
+        dispatch.archive(SimpleNamespace(raw={}, dispatches=dispatches), self.c, "d1")
+        self.assertEqual(self.c.execute("SELECT state FROM dispatch WHERE run_id='d1'").fetchone()[0], "archived")
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))  # pane reservation retained through archive
+
+    def test_safe_terminal_releases_only_idle_pane_and_idle_home(self):
+        self.sent_terminal("d1", pane="pane-1")  # no route: the captain supervises pane-1
+        self.write_summary("factory-primary")  # positive proof: no children, no decisions
+        panes = {"result": {"panes": [{"pane_id": "pane-1", "agent": "omp", "agent_status": "idle"}]}}
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), ["d1"])
+        self.assertIsNone(scheduler.launch(self.c, "d1"))
+
+    def test_safe_terminal_keeps_busy_or_unknown_pane(self):
+        self.sent_terminal("d1", pane="pane-1")
+        self.write_summary("factory-primary")
+        for panes in ({"result": {"panes": [{"pane_id": "pane-1", "agent": "omp", "agent_status": "running"}]}},
+                      {"result": {"panes": []}}):
+            with mock.patch.object(dispatch, "_herdr", return_value=panes):
+                self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), [])
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))
+
+    def test_safe_terminal_keeps_missing_or_malformed_summary(self):
+        self.sent_terminal("d1", pane="pane-1")
+        panes = {"result": {"panes": [{"pane_id": "pane-1", "agent": "omp", "agent_status": "idle"}]}}
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), [])  # no summary at all
+        self.write_summary("factory-primary", text="{not valid json")  # malformed
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), [])
+        self.write_summary("factory-primary", text=json.dumps({"active_children": "nope", "decisions_open": []}))  # wrong type
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), [])
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))
+
+    def test_safe_terminal_captain_children_blocks_fallback(self):
+        self.sent_terminal("d1", pane="pane-1", route="fx-api")
+        # the lead's spawned pane is elsewhere, so the captain owns pane-1; a busy captain must block even when the
+        # route lead's own summary looks idle.
+        (self.homes / "factory-primary" / "state" / "fx-api.meta").write_text(
+            "kind=secondmate\nherdr_pane_id=other-pane\n")
+        self.write_summary("fx-api")  # lead looks idle
+        self.write_summary("factory-primary", children=["fx-api"])  # captain still has a busy child
+        panes = {"result": {"panes": [{"pane_id": "pane-1", "agent": "omp", "agent_status": "idle"}]}}
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), [])
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))
+
+    def test_safe_terminal_keeps_uncertain(self):
+        self.sent_terminal("d1", pane="pane-1")
+        self.c.execute("UPDATE dispatch_launch SET state='uncertain' WHERE run_id='d1'")  # sent -> uncertain
+        self.write_summary("factory-primary")
+        panes = {"result": {"panes": [{"pane_id": "pane-1", "agent": "omp", "agent_status": "idle"}]}}
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), [])  # uncertain never auto
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))
+
+    def test_release_unsent_refuses_busy_or_unknown_home(self):
+        _helpers.seed_dispatch(self.c, "d1", "draft")
+        _helpers.set_claims(self.c, "d1", {"repo:a", "route:fx-a"})
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' "
+                       "WHERE run_id='d1'")
+        self.c.execute("INSERT INTO dispatch_launch(run_id, pane_id, state, claimed_at) VALUES ('d1','pane-1','reserved',?)",
+                       (SNAP,))
+        panes = {"result": {"panes": [{"pane_id": "pane-1", "agent": "omp", "agent_status": "idle"}]}}
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):  # no captain summary: unknown home -> refuse
+            with self.assertRaises(dispatch.StageError):
+                dispatch.release_unsent(SimpleNamespace(raw={}), self.c, "d1", "user:cli", "confirmed unsent")
+        self.write_summary("factory-primary", children=["fx-api"])  # busy captain -> refuse
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            with self.assertRaises(dispatch.StageError):
+                dispatch.release_unsent(SimpleNamespace(raw={}), self.c, "d1", "user:cli", "confirmed unsent")
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))
+
+
+class LegacyResumeBootstrap(unittest.TestCase):
+    """A legacy executing run with no dispatch_launch must still restart onto a replacement pane: the executor_pane
+    is pinned in the same transaction before the legacy launch INSERT so the reserve-state pane match passes."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tmp = Path(tmp.name)
+        self.c = db.connect(tmp / "t.db")
+        self.addCleanup(self.c.close)
+        _helpers.seed_dispatch(self.c, "d1", "draft")
+        _helpers.set_claims(self.c, "d1", {"repo:a", "route:fx-a"})
+        # legacy executing run with NO launch, on a pane that has since disappeared
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' "
+                       "WHERE run_id='d1'")
+        self.c.execute("UPDATE dispatch SET state='executing', executor_pane='old-pane', executing_at=? WHERE run_id='d1'",
+                       (SNAP,))
+
+    def test_resume_legacy_bootstrap_moves_to_replacement_pane(self):
+        replacement = {"pane_id": "w6M:p1", "agent": "omp", "agent_status": "idle"}
+        with mock.patch.object(dispatch, "_target", return_value=(replacement, "factory-primary")), \
+                mock.patch.object(dispatch, "_send") as send:
+            res = dispatch.resume(SimpleNamespace(), self.c, "d1")
+        self.assertEqual(res["executor_pane"], "w6M:p1")
+        self.assertEqual(self.c.execute("SELECT executor_pane FROM dispatch WHERE run_id='d1'").fetchone()[0],
+                         "w6M:p1")
+        launch = scheduler.launch(self.c, "d1")
+        self.assertIsNotNone(launch)
+        self.assertEqual(launch["pane_id"], "w6M:p1")
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[1], ["/new", "run dispatch-intake d1"])
 
 
 if __name__ == "__main__":

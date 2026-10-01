@@ -25,7 +25,10 @@ class ExecutorDelivery(unittest.TestCase):
         self.cfg = SimpleNamespace(raw={}, dispatches=Path(self.tmp.name))
         self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) "
                        "VALUES ('run','draft','[]','user',?)", (db.now(),))
+        self.c.execute("INSERT INTO dispatch_resource(run_id, resource) VALUES ('run','global:*')")  # pinned while draft
         self.c.execute("UPDATE dispatch SET state='staged', approved_by='user', body_sha256='frozen'")
+        self.c.execute("INSERT INTO dispatch_launch(run_id, pane_id, state, claimed_at) VALUES ('run','pane-1','reserved',?)",
+                       (db.now(),))  # a reserved matching pane before executing
         self.c.execute("UPDATE dispatch SET state='executing', executor_pane='pane-1'")
         self.options = [decide.option("wait", "Wait for the owner", "work pauses"),
                         decide.option("go", "Use the real engine", "the executor changes the engine", note="guidance")]

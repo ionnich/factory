@@ -14,10 +14,11 @@ it leaves draft), then held through executing/done/reconciled until the dispatch
 Launch reservations (``dispatch_launch``) are the capacity + pane slot: reserved atomically (``BEGIN IMMEDIATE``)
 before any external ``/new`` or intake send, then ``sent``, or ``uncertain`` if the send may have partially landed.
 Capacity counts distinct run ids (an executing dispatch and its own reservation count once), bounded by
-``execution_policy.max_parallel`` (default 2). A terminal dispatch releases its launch slot (capacity + pane) but
-keeps its resource claims until archived; a rejected draft releases its claims immediately. An uncertain launch is
-never auto-expired or replayed — only an explicit, confirmed-unsent release (``dispatch.release_unsent``) or a
-terminal state clears it.
+``execution_policy.max_parallel`` (default 2). A terminal dispatch frees its capacity automatically (launch_active)
+but the pane reservation is retained through done/reconciled/archived until ``dispatch.release_safe_terminal``
+positively proves the pane idle and its supervising home free of children/decisions; resource claims persist until
+archived; a rejected draft releases its claims immediately. An uncertain launch is never auto-expired or replayed —
+only the explicit human recovery (``dispatch.release_unsent``) clears it.
 """
 import sqlite3
 
@@ -166,17 +167,10 @@ def mark_uncertain(conn: sqlite3.Connection, run_id: str, error: str) -> None:
 
 
 def release_launch(conn: sqlite3.Connection, run_id: str) -> None:
-    """Release a launch row. Caller must ensure it is safe (definitely unsent, i.e. `reserved`, or a terminal
-    `sent`); the schema launch_release_guard blocks `uncertain` and nonterminal `sent`."""
+    """Delete a launch row that is definitely unsent (state `reserved`); the schema launch_release_guard blocks
+    `uncertain` and nonterminal `sent`. Used only by the explicit human recovery release_unsent (uncertain ->
+    reserved -> delete); terminal sent/reserved launches are released by release_safe_terminal after positive proof."""
     conn.execute("DELETE FROM dispatch_launch WHERE run_id=?", (run_id,))
-
-
-def release_terminal_launch(conn: sqlite3.Connection, run_id: str) -> None:
-    """Release a terminal dispatch's launch slot only when the reservation is positively safe (`reserved` or
-    `sent`). An `uncertain` launch is retained (the pane is not confirmed safe) for explicit human recovery."""
-    l = conn.execute("SELECT state FROM dispatch_launch WHERE run_id=?", (run_id,)).fetchone()
-    if l is not None and l["state"] in ("reserved", "sent"):
-        conn.execute("DELETE FROM dispatch_launch WHERE run_id=?", (run_id,))
 
 
 def release_claims(conn: sqlite3.Connection, run_id: str) -> None:
