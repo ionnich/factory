@@ -20,9 +20,10 @@ def out(obj) -> None:
 def ingest(cfg, conn, full=False, only: set[str] | None = None) -> dict:
     """Linear (incremental) and the trunk mirrors. `only`: just these repos and no project refresh, the fast path
     before drafting or approving (the cron keeps everything else fresh)."""
+    projects = linear.sync_projects(cfg, conn) if only is None else None
     res = linear.ingest(cfg, conn, full=full)
     if only is None:
-        res["projects"] = linear.sync_projects(cfg, conn)
+        res["projects"] = projects
     res["trunks"] = {r: sha[:12] for r, sha in repos.sync_all(cfg, conn, only).items()}
     return res
 
