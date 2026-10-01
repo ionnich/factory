@@ -49,6 +49,10 @@ One-time, by hand:
   flat theme-derived surfaces and lavender selection accents. Buttons retain 6px corners, 44px targets,
   visible keyboard focus and readable labels. Phone fields use 16px text; reduced motion is respected.
   Styles stay scoped to Factory; SDK components, decision safeguards and railway/configurator behavior remain.
+  **Wispr Flow** is selectable from the dashboard's existing theme picker after installation:
+  cream canvas, ink text, forest-green actions and lavender/purple accents. The theme lives in
+  `hermes/dashboard-themes/wispr-flow.yaml`, installed into `~/.hermes/dashboard-themes/`.
+  Installation adds the theme without changing the operator's current theme or font preference.
   Stage-local decision cards show options, consequences and ★. Executor answers and options that start or stop
   work or write Linear require a second tap; some require a reason. Lightweight ★ accepts a right swipe;
   left postpones. Canceled gestures do nothing. Refused choices return with their error.
@@ -280,6 +284,15 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
   `user:dashboard` / an explicit CLI user); agents can never approve or silence-publish a brief. Approving a brief
   authorizes verification and planning from it, not execution. Dispatching still passes the existing review
   decision; a brief is consumed (frozen to a dispatch) at stage.
+  The UI names these steps **Save draft**, **Approve brief** (then **Confirm approval**), and
+  **Create draft dispatch**. Creating a draft dispatch remains disabled until the current approved version is
+  ready; it does not authorize execution. The `global:*` resource warning sits beside Resources, not approval.
+- **Blocked-brief recovery:** expandable readiness groups distinguish completed/canceled sources, human review,
+  ownership/routing, source drift, dependencies, holds and verification. Waiting for verification cannot clear
+  source eligibility blockers. **Review replacement sources** explicitly replaces current picks with the
+  remaining eligible sources and lists exclusions, then uses the normal relationship-review/grooming flow.
+  If none remain, **Browse other work** opens browsing with no picks; empty grooming is unavailable.
+  The original approved brief remains immutable, and replacement creation, approval and execution stay separate.
 - **Immutable versions & amendments:** published briefs are immutable. An amendment creates a new draft revision
   with a parent link and reason. A dispatch already staged on a version is never silently changed; if a captured
   source changed since capture, the brief is flagged **needs-amendment** before any new dispatch — an executing

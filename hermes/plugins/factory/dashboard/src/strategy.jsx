@@ -326,12 +326,7 @@ function FactRows({ rows }) {
 // Structured backend facts keep safety detail scannable without parsing or flattening refusal strings.
 function ReadinessPanel({ summary }) {
   const facts = summary?.readiness_facts;
-  if (!facts) {
-    if (!summary?.blockers?.length) return null;
-    return <FxDetails summary={<span className="fx-k">Readiness details ({summary.blockers.length})</span>}>
-      <FactRows rows={summary.blockers.map((reason) => ({ reason }))} />
-    </FxDetails>;
-  }
+  if (!facts) return null;
   const sourceGroups = Object.entries(READINESS_GROUPS).map(([category, meta]) => ({
     category, meta, rows: (facts.sources || []).filter((row) => row.category === category),
   })).filter((group) => group.rows.length);
@@ -353,8 +348,11 @@ function ReadinessPanel({ summary }) {
   return (
     <div className="fx-stack-v" role="region" aria-label="Dispatch readiness">
       <div className="fx-k">What blocks a draft dispatch</div>
+      {groups.some((group) => group.category !== "verification") ? (
+        <div className="fx-hint">Resolve these blockers first. Waiting for verification alone will not make this brief ready.</div>
+      ) : null}
       {groups.map((group) => (
-        <details className="fx-sec fx-fold" key={group.category} open>
+        <details className="fx-fold" key={group.category}>
           <summary>{group.meta[0]} ({group.rows.length})</summary>
           <div className="fx-hint">{group.meta[1]}</div>
           <FactRows rows={group.rows} />
@@ -1126,8 +1124,8 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
                     <Field label={label} kind={kind} value={edit[key]} disabled={!!busy}
                            onChange={(v) => editField(key, v)} />
                     {key === "resources" && (edit.resources || "").split("\n").map((x) => x.trim()).includes("global:*") ? (
-                      <div className="fx-err">Unreviewed <code>global:*</code> serializes this work against every other dispatch.
-                        Replace it with reviewed specific claims when the scope allows.</div>
+                      <div className="fx-note"><code>global:*</code> reserves all execution resources, so this work runs alone.
+                        Use narrower claims only after reviewing them.</div>
                     ) : null}
                   </Fragment>
                 ))}

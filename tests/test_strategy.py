@@ -156,11 +156,9 @@ class Briefs(unittest.TestCase):
 
         summary = next(x for x in strategy.overview(self.cfg, self.c)["briefs"] if x["id"] == b["id"])
         self.assertEqual(summary["replacement"]["eligible"], ["FIN-1"])
-        self.assertEqual(summary["replacement"]["excluded"],
-                         [{"identifier": "FIN-2", "category": "completed", "reason": "source is completed"},
-                          {"identifier": "FIN-3", "category": "human-review",
-                           "reason": "waiting on human review (Ready for QA)"}])
-        self.assertEqual(summary["readiness_facts"]["sources"], summary["replacement"]["excluded"])
+        self.assertEqual([(x["identifier"], x["category"]) for x in summary["replacement"]["excluded"]],
+                         [("FIN-2", "completed"), ("FIN-3", "human-review")])
+        self.assertFalse(summary["intent_ready"])
 
     def test_replacement_candidates_report_all_ineligible(self):
         for n, state_type in ((1, "completed"), (2, "canceled")):

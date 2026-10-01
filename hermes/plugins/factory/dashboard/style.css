@@ -3,21 +3,21 @@
    Surfaces are flat and theme-relative so the same hierarchy works in both the host's dark and light modes. */
 .fx {
   --fx-canvas: var(--background-base, #282828);
-  --fx-fg: var(--color-card-foreground, var(--theme-terminal-foreground, var(--midground-base, #ebdbb2)));
+  --fx-fg: var(--theme-terminal-foreground, var(--midground-base, #ebdbb2));
   --fx-panel: var(--color-card, color-mix(in srgb, var(--midground-base, #ebdbb2) 5%, var(--background-base, #282828)));
   --fx-panel-2: var(--color-popover, var(--fx-panel));
-  --fx-muted: var(--color-muted-foreground, color-mix(in srgb, var(--fx-fg) 78%, var(--fx-canvas)));
+  --fx-muted: color-mix(in srgb, var(--fx-fg) 78%, var(--fx-canvas));
   --fx-dim: var(--fx-muted);
-  --fx-disabled: color-mix(in srgb, var(--fx-muted) 72%, var(--fx-canvas));
+  --fx-disabled: var(--fx-muted);
   --fx-ink: #161616;
   --fx-border: var(--color-border, color-mix(in srgb, var(--midground-base, #ebdbb2) 18%, transparent));
   --fx-line: color-mix(in srgb, var(--fx-border) 68%, transparent);
-  --fx-fill: var(--color-muted, color-mix(in srgb, var(--midground-base, #ebdbb2) 7%, transparent));
+  --fx-fill: color-mix(in srgb, var(--midground-base, #ebdbb2) 7%, transparent);
   --fx-inset: color-mix(in srgb, var(--fx-panel) 72%, var(--fx-canvas));
-  --a: color-mix(in srgb, var(--fx-amber, var(--color-warning, #f59e0b)) 68%, var(--fx-fg));
-  --g: color-mix(in srgb, var(--fx-green, var(--color-success, #10b981)) 72%, var(--fx-fg));
+  --a: color-mix(in srgb, var(--fx-amber, var(--color-warning, #f59e0b)) 50%, var(--fx-fg));
+  --g: color-mix(in srgb, var(--fx-green, var(--color-success, #10b981)) 50%, var(--fx-fg));
   --b: var(--fx-blue, var(--color-ring, #a78bfa));
-  --r: color-mix(in srgb, var(--fx-red, var(--color-destructive, #ef4444)) 76%, var(--fx-fg));
+  --r: color-mix(in srgb, var(--fx-red, var(--color-destructive, #ef4444)) 60%, var(--fx-fg));
   --n: var(--fx-gray, #8b8b8b);
   --e: var(--fx-edge, var(--color-border, #504945));
   --fx-lavender: var(--b);

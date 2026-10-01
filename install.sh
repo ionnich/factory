@@ -33,6 +33,8 @@ done
 # Dashboard bundle: JSX -> one IIFE; React is external (the dashboard's SDK provides it), so no node_modules.
 dash="$here/hermes/plugins/factory/dashboard"
 (cd "$dash" && bun build src/index.jsx --format iife --outfile dist/index.js >/dev/null)
+mkdir -p "$hermes_home/dashboard-themes"
+install -m 0644 "$here/hermes/dashboard-themes/wispr-flow.yaml" "$hermes_home/dashboard-themes/wispr-flow.yaml"
 # Plugin: default profile serves the dashboard tab; the `factory` chat profile gets the tool (profile config:
 # plugins.enabled [factory], platform_toolsets.cli [factory], deepseek) — created once by hand, see README.md.
 for dest in "$hermes_home" "$hermes_home/profiles/factory"; do
