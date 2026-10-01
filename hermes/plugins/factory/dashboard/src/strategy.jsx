@@ -102,8 +102,9 @@ function SourceRow({ s, checked, onToggle }) {
 }
 
 // One brief summary: state, title/revision, its readiness blockers, and its downstream dispatch (if dispatched).
-function BriefRow({ b, superseded, selected, onSelect, onDispatch }) {
+function BriefRow({ b, selected, onSelect, onDispatch }) {
   const blockers = b.blockers || [];
+  const superseded = b.readiness === "superseded";
   return (
     <div id={`fx-brief-${b.id}`} className={`fx-trow${selected ? " picked" : ""}`} role="button" tabIndex={0}
          aria-current={selected ? "true" : undefined} onClick={onSelect}
@@ -198,10 +199,6 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const capMax = sched.max_parallel ?? 2;
   const capUsed = sched.capacity_used ?? 0;
   const summary = open != null ? briefs.find((b) => b.id === open) : null;
-  // A version with any child is superseded (approve refuses a draft with a child). Derived truthfully from the
-  // overview's parent_id, never a fabricated readiness.
-  const supersededIds = useMemo(() => new Set(briefs.filter((b) => b.parent_id != null).map((b) => b.parent_id)),
-                                 [briefs]);
 
   // The open brief's full body + captured sources + compiled render, from GET /strategy/{id} (a pure read).
   // `mut` bumps on every successful write so the detail (and its render) refetch even for a same-id mutation.
@@ -370,7 +367,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
       <div className="fx-k">{plural(briefs.length, "brief")}</div>
       <div className="fx-list">
         {briefs.length ? briefs.map((b) => (
-          <BriefRow key={b.id} b={b} superseded={supersededIds.has(b.id)} selected={open === b.id}
+          <BriefRow key={b.id} b={b} selected={open === b.id}
                     onSelect={() => openBrief(b.id)} onDispatch={openDispatch} />
         )) : <div className="fx-empty">No briefs yet. Groom a source, or create one from the CLI.</div>}
       </div>
@@ -384,7 +381,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
             <div className="fx-row">
               <span className="fx-id">#{current.id}</span><span className="fx-hint">revision {current.revision}</span>
               <Tone tone={STATE_TONE[current.state] || "gray"}>{stateLabel(current)}</Tone>
-              {supersededIds.has(current.id) ? <Tone tone="gray">superseded</Tone> : null}
+              {summary?.readiness === "superseded" ? <Tone tone="gray">superseded</Tone> : null}
               {summary?.source_changed?.length ? <Tone tone="red">needs amendment</Tone> : null}
             </div>
             <div className="fx-hint">{current.created_by} · {ago(current.created_at)}
@@ -392,8 +389,8 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
           </div>
           {current.amendment_reason ? <div className="fx-why">Amended: {current.amendment_reason}</div> : null}
           {current.hold_reason ? <div className="fx-why">Hold: {current.hold_reason}</div> : null}
-          {supersededIds.has(current.id) ? (
-            <div className="fx-err">Superseded — this version has a newer revision; a draft with a child cannot be published.</div>
+          {summary?.readiness === "superseded" ? (
+            <div className="fx-err">Superseded — a newer revision exists; a draft with a child cannot be published.</div>
           ) : null}
           {summary?.source_changed?.length ? (
             <div className="fx-err">A source changed since this brief was captured: {summary.source_changed.join(", ")}. Amend to re-capture, or review the discrepancy before dispatching.</div>
@@ -425,7 +422,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
               <>
                 <div className="fx-row">
                   <Button size="sm" disabled={!!busy || !dirty} onClick={save}>{busy === "save" ? "Saving…" : "Save draft"}</Button>
-                  {!supersededIds.has(current.id)
+                  {summary?.readiness !== "superseded"
                     ? <Button size="sm" disabled={!!busy} onClick={publish}>{busy === "publish" ? "Publishing…" : arm === "publish" ? "Confirm publish" : "Publish"}</Button>
                     : null}
                 </div>
