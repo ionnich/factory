@@ -36,6 +36,18 @@ def _repos_of(cfg, conn, identifiers) -> set[str]:
     return found
 
 
+def _json_body(src: str) -> dict:
+    """A brief body as a JSON object: inline JSON, a file path, or - for stdin (the verdict_put pattern)."""
+    src = src.strip()
+    try:
+        body = json.loads(src if src[:1] in "{[" else sys.stdin.read() if src == "-" else open(src).read())
+    except (json.JSONDecodeError, OSError) as e:
+        raise dispatch.StageError(f"body: {e}") from None
+    if not isinstance(body, dict):
+        raise dispatch.StageError("body must be a JSON object")
+    return body
+
+
 def cmd_ingest(cfg, conn, a):
     out(ingest(cfg, conn, a.full))
 
@@ -45,6 +57,13 @@ def cmd_candidates(cfg, conn, a):
 
 
 def cmd_stage(cfg, conn, a):
+    if a.brief_id is not None:  # an approved brief staged directly: no Linear re-read, evidence is refreshed later
+        if a.identifiers:
+            raise dispatch.StageError("stage --brief takes one brief id, not ticket identifiers")
+        out(dispatch.stage_brief(cfg, conn, a.brief_id, a.actor))
+        return
+    if not a.identifiers:
+        raise dispatch.StageError("name at least one ticket, or --brief <id>")
     ingest(cfg, conn, only=_repos_of(cfg, conn, a.identifiers))  # stage against Linear and trunk as they are now
     out(dispatch.stage(cfg, conn, a.identifiers, a.actor))
 
@@ -603,6 +622,32 @@ def cmd_witness(cfg, conn, a):
     return 0 if res["ok"] else 1
 
 
+# ---- strategy: source grooming and approved, versioned work briefs -------------------------------------------
+# `factory.strategy` (the briefs slice, a sibling worktree) owns the invariants and raises `dispatch.StageError`
+# for refusals; this CLI only wires each command to it. `show --render` returns the brief plus its compiled
+# Markdown intent/provenance. Grooming runs real DeepSeek in `strategy.groom` (long, no fake fields).
+def cmd_strategy(cfg, conn, a):
+    from . import strategy  # lazy: the briefs slice lands in a sibling worktree, so the CLI loads without it
+    if a.scmd == "list":
+        return out(strategy.overview(cfg, conn))
+    if a.scmd == "show":
+        brief = strategy.get(conn, a.brief_id)
+        return out({"brief": brief, "render": strategy.render(conn, a.brief_id)} if a.render else brief)
+    if a.scmd == "groom":
+        return out(strategy.groom(cfg, conn, a.identifiers, a.actor))
+    if a.scmd == "create":
+        return out(strategy.create(cfg, conn, a.identifiers, a.actor, body=_json_body(a.body) if a.body else None))
+    if a.scmd == "revise":
+        return out(strategy.revise(cfg, conn, a.brief_id, _json_body(a.body), a.reason, a.actor))
+    if a.scmd == "approve":
+        return out(strategy.approve(cfg, conn, a.brief_id, a.actor))
+    if a.scmd == "hold":
+        return out(strategy.hold(cfg, conn, a.brief_id, a.reason, a.actor))
+    if a.scmd == "unhold":
+        return out(strategy.unhold(cfg, conn, a.brief_id, a.actor))
+    raise SystemExit(f"unknown strategy command {a.scmd}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="factory")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -631,7 +676,9 @@ def main(argv=None):
     sub.add_parser("candidates", help="stageable tickets (JSON), and why the rest are not").set_defaults(
         fn=cmd_candidates)
     s = sub.add_parser("stage", help="ingest, then draft a dispatch for review (nothing starts until approved)")
-    s.add_argument("identifiers", nargs="+")
+    s.add_argument("identifiers", nargs="*")
+    s.add_argument("--brief", type=int, dest="brief_id", help="stage the approved brief with this id (no Linear "
+                   "re-read; evidence is refreshed at review)")
     s.add_argument("--actor", default="user")
     s.set_defaults(fn=cmd_stage)
     s = sub.add_parser("handoff", help="reset the executor's omp session (/new) and tell it to run the dispatch")
@@ -757,6 +804,42 @@ def main(argv=None):
     s2 = s.add_parser("sync", help="re-judge open plan/ask/review decisions and proposed learnings' relations "
                                    "(propose ticks do both)")
     s2.set_defaults(fn=cmd_jev)
+    st = sub.add_parser("strategy", help="source grooming and approved, versioned work briefs (a supporting "
+                        "workspace, separate from the lifecycle stages)").add_subparsers(dest="scmd", required=True)
+    s = st.add_parser("list", help="briefs, source list, queue and capacity (JSON; no model or network)")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("show", help="one brief: full body and captured sources")
+    s.add_argument("brief_id", type=int)
+    s.add_argument("--render", action="store_true", help="also return the compiled Markdown intent/provenance")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("groom", help="run DeepSeek over the named sources into an editable draft brief")
+    s.add_argument("identifiers", nargs="+")
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("create", help="draft a brief from the named sources (deterministic; optional body)")
+    s.add_argument("identifiers", nargs="+")
+    s.add_argument("--body", help="brief JSON object (inline, a file path, or - for stdin)")
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("revise", help="a new draft revision (immutable versions; an amendment needs its reason)")
+    s.add_argument("brief_id", type=int)
+    s.add_argument("--body", required=True, help="brief JSON object (inline, a file path, or - for stdin)")
+    s.add_argument("--reason", required=True)
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("approve", help="approve the draft as intent (not execution; verification may stay pending)")
+    s.add_argument("brief_id", type=int)
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("hold", help="hold an approved brief (explicit readiness change)")
+    s.add_argument("brief_id", type=int)
+    s.add_argument("--reason", required=True)
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("unhold", help="release a hold (explicit readiness change)")
+    s.add_argument("brief_id", type=int)
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
 
     a = p.parse_args(argv)
     try:

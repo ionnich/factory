@@ -20,6 +20,7 @@ import { Learnings } from "./learn.jsx";
 import { Plan, Quick } from "./plan.jsx";
 import { Jev } from "./jev.jsx";
 import { TicketsTab } from "./tickets.jsx";
+import { StrategyTab } from "./strategy.jsx";
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect, useCallback, useRef, useMemo } = SDK.hooks;
@@ -393,7 +394,7 @@ const Writes = ({ writes }) => (writes.length ? <ul className="fx-writes">{write
 // ---- lifecycle: one workspace per stage, dispatches as rows in an engineering table -------------------------------
 const STAGES = [["tickets", "Tickets"], ["verify", "Verify"], ["draft", "Draft"], ["plan", "Plan"], ["review", "Review"],
                 ["run", "Run"], ["reconcile", "Reconcile"], ["archive", "Archive"]];
-const SIDE = [["learn", "Learn"], ["costs", "Costs"]];  // supporting views beside the stages, not stages
+const SIDE = [["strategy", "Strategy"], ["learn", "Learn"], ["costs", "Costs"]];  // supporting views beside the stages, not stages
 const LABEL = Object.fromEntries([...STAGES, ...SIDE]);
 const IDS = new Set(Object.keys(LABEL));
 const TICKET_MODES = ["tickets", "verify", "draft"];  // tickets.jsx workspaces, each with its view kept by the page
@@ -408,18 +409,19 @@ const HEAD = { draft: "not offered to a planner yet", plan: "waiting on a plan",
                run: "staged or executing", reconcile: "done or written back", archive: "archived, newest first" };
 
 // Where the page is, in the URL: ?stage=<view>, run=<run_id> (the selected dispatch), decision=<id> (what a link points
-// at), ticket=<ID> (its open sheet); the host's own parameters (profile) stay. Older links still land:
-// ?view=review&run=<run_id> is Review with that dispatch, ?ticket=<ID> alone Tickets with that sheet.
+// at), ticket=<ID> (its open sheet), brief=<id> (Strategy's open brief); the host's own parameters (profile) stay.
+// Older links still land: ?view=review&run=<run_id> is Review with that dispatch, ?ticket=<ID> alone Tickets with that sheet.
 function readLoc() {
   const p = new URLSearchParams(location.search);
   return { stage: IDS.has(p.get("stage")) ? p.get("stage") : p.get("view") === "review" ? "review" : "tickets",
-           run: p.get("run") || null, decision: Number(p.get("decision")) || null, ticket: p.get("ticket")?.toUpperCase() || null };
+           run: p.get("run") || null, decision: Number(p.get("decision")) || null,
+           ticket: p.get("ticket")?.toUpperCase() || null, brief: Number(p.get("brief")) || null };
 }
 function locUrl(l) {
   const u = new URL(location.href);
   u.searchParams.delete("view");
   u.searchParams.set("stage", l.stage);
-  ["run", "decision", "ticket"].forEach((k) => (l[k] ? u.searchParams.set(k, l[k]) : u.searchParams.delete(k)));
+  ["run", "decision", "ticket", "brief"].forEach((k) => (l[k] ? u.searchParams.set(k, l[k]) : u.searchParams.delete(k)));
   return u.href;
 }
 
@@ -488,6 +490,20 @@ function Runtime({ r }) {
       <dt>Next</dt>
       <dd>{r.next_step}</dd>
     </dl>
+  );
+}
+
+// Run, beside the selected dispatch: the pinned Strategy brief (when the run came from an approved brief), linking
+// back to Strategy, and any capacity/resource blockers the server records — not just a single-run assumption.
+function BriefLink({ d, onGo }) {
+  const b = d.brief_id, blockers = d.blockers || d.resource_blockers || [];
+  if (!b && !blockers.length) return null;
+  return (
+    <div className="fx-stack-v fx-line">
+      {b ? <div className="fx-row"><span className="fx-hint">Pinned brief</span>
+        <button className="fx-link-btn" onClick={() => onGo({ stage: "strategy", brief: b }, { jump: true })}>#{b} ›</button></div> : null}
+      {blockers.length ? <div className="fx-err">Blocked: {blockers.join("; ")}</div> : null}
+    </div>
   );
 }
 
@@ -703,6 +719,12 @@ function FactoryPage() {
   // one stable React-style setter per workspace (a next view or an updater): a late reply patches its own mode's view
   const setView = useMemo(() => Object.fromEntries(TICKET_MODES.map((m) => [m, (next) =>
     setViews((vs) => ({ ...vs, [m]: typeof next === "function" ? next(vs[m]) : next }))])), []);
+  // Strategy's own view, kept here so it outlives leaving the tab (a pending groom or its error included)
+  const [strat, setStrat] = useState(() => {
+    const l = readLoc();
+    return { q: "", picked: [], open: l.stage === "strategy" ? l.brief : null, busy: null, err: null };
+  });
+  const setStrategy = (next) => setStrat((s) => ({ ...s, ...(typeof next === "function" ? next(s) : next) }));
   const [arch, setArch] = useState({ rows: null, err: null });  // GET /archive, kept while elsewhere
   const root = useRef(null);
   const strip = useRef(null);
@@ -710,7 +732,7 @@ function FactoryPage() {
   const after = useRef({ focus: true });  // what the next navigation's render does: focus its target, restore a scroll
   const canon = useRef(false);
   const latest = useRef(null);            // this render's state, for handlers that run later (Back, a late reply)
-  latest.current = { loc, views, data, arch };
+  latest.current = { loc, views, data, arch, strat };
   const [, tick] = useState(0);
   const inflight = useRef(false);
   const again = useRef(false);
@@ -743,6 +765,7 @@ function FactoryPage() {
       mem.current[cur.stage] = { run: cur.run, scroll: root.current ? scroller(root.current).scrollTop : 0 };
       const l = readLoc();
       if (TICKET_MODES.includes(l.stage)) setViews((vs) => ({ ...vs, [l.stage]: { ...vs[l.stage], open: l.ticket } }));
+      if (l.stage === "strategy") setStrat((s) => ({ ...s, open: l.brief }));
       setLoc(l);
       setNav((n) => n + 1);
       after.current = { scroll: history.state?.fx?.scroll ?? mem.current[l.stage]?.scroll ?? 0 };
@@ -772,7 +795,8 @@ function FactoryPage() {
     after.current = null;
     if (a.focus && a.scroll != null) scroller(root.current).scrollTop = a.scroll;
     const el = a.focus && ((loc.decision && document.getElementById(`fx-d-${loc.decision}`))
-      || (loc.run && document.getElementById(`fx-run-${loc.run}`)));
+      || (loc.run && document.getElementById(`fx-run-${loc.run}`))
+      || (loc.brief && document.getElementById(`fx-brief-${loc.brief}`)));
     if (el) return void el.focus();
     if (a.scroll != null) return settle(root.current, a.scroll);
   }, [nav, !data]);
@@ -792,7 +816,7 @@ function FactoryPage() {
   // history is the user's to pick from).
   const go = (to, { jump = false } = {}) => {
     if (!IDS.has(to.stage)) return;  // a stage this page doesn't have: stay put
-    const { loc: cur, views: vs, data: dt, arch: ar } = latest.current;
+    const { loc: cur, views: vs, data: dt, arch: ar, strat: st } = latest.current;
     const y = root.current ? scroller(root.current).scrollTop : 0, same = to.stage === cur.stage;
     mem.current[cur.stage] = { run: cur.run, scroll: y };
     const first = to.stage !== "archive" && stageRows(dt, ar, to.stage)?.[0];
@@ -801,6 +825,7 @@ function FactoryPage() {
       run: to.run !== undefined ? to.run : same ? cur.run : mem.current[to.stage]?.run || first?.run_id || null,
       decision: to.decision || null,
       ticket: to.ticket !== undefined ? to.ticket?.toUpperCase() || null : vs[to.stage]?.open || null,
+      brief: to.stage === "strategy" ? (to.brief !== undefined ? to.brief || null : st.open || null) : null,
     };
     const url = locUrl(next);
     if (url !== location.href) {  // this entry keeps its scroll for Back; the router's own state rides along
@@ -808,6 +833,8 @@ function FactoryPage() {
       history.pushState({ ...history.state, fx: null }, "", url);
     }
     if (to.ticket !== undefined && vs[to.stage]) setView[to.stage]((v) => ({ ...v, open: next.ticket }));
+    if (to.brief !== undefined) setStrategy({ open: to.brief });
+    if (to.sources) setStrategy((s) => ({ ...s, picked: to.sources, q: "" }));  // a Draft handoff pre-selects sources
     setLoc(next);
     setNav((n) => n + 1);
     after.current = jump ? { focus: true, scroll: same ? null : 0 } : same ? null : { scroll: mem.current[to.stage]?.scroll || 0 };
@@ -886,7 +913,8 @@ function FactoryPage() {
     plan: () => <><JobLine jobs={data.jobs} name="[bot:planner] Plan drafts" of="draft" />{table("plan", planning)}</>,
     review: () => table("review", plan),
     run: () => <>{deckOf("run")}<ExecutorDeliveries items={deliveries} onDone={done} />
-      {table("run", (d) => <><Runtime r={d.runtime} />{plan(d)}</>)}</>,
+      {table("run", (d) => <><Runtime r={d.runtime} /><BriefLink d={d} onGo={go} />{plan(d)}</>)}</>,
+    strategy: () => <StrategyTab data={data} view={strat} onViewChange={setStrategy} onDone={done} onNavigate={go} />,
     reconcile: () => <><JobLine jobs={data.jobs} name="factory-reconcile" of="dispatch" />{deckOf("reconcile")}
       <Writebacks rows={data.writebacks || []} onGo={go} />{table("reconcile", plan)}</>,
     archive: () => (arch.rows ? <>

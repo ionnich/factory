@@ -344,3 +344,14 @@
 .fx-rel { margin: .6rem 0 0; padding: .45rem .6rem; border: 1px solid var(--color-border); border-radius: 12px; }
 .fx-rel > summary { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-bottom: .3rem; }
 .fx-rel-conflict { color: var(--r); font-size: .78rem; font-weight: 650; }
+
+/* strategy: source grooming into approved, versioned work briefs (a supporting workspace) */
+.fx-field { display: grid; gap: .2rem; min-width: 0; }
+.fx-ta { width: 100%; box-sizing: border-box; min-height: 3.2rem; resize: vertical; font: inherit; font-size: .88rem;
+         line-height: 1.45; padding: .45rem .6rem; border-radius: 10px; border: 1px solid var(--color-border);
+         background: var(--color-card); color: var(--color-foreground); overflow-wrap: anywhere; }
+.fx-ta:focus { outline: 2px solid var(--b); outline-offset: -1px; border-color: var(--b); }
+.fx-ta:disabled { opacity: .6; cursor: default; }
+.fx-src { list-style: none; margin: 0; padding: 0; display: grid; gap: .35rem; }
+.fx-src li { padding: .45rem .6rem; border: 1px solid var(--color-border); border-radius: 10px;
+             background: var(--color-card); }

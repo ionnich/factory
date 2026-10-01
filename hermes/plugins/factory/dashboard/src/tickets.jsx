@@ -1,20 +1,21 @@
 // Ticket workspaces: Tickets (the whole ledger) and its Verify and Draft slices. `GET /tickets` lists every ticket in
 // scope or ever touched, fetched while the workspace is active and again on each overview refresh. The server's `phase`
 // decides the slice (mode verify: phase verify, mode draft: phase draft, mode tickets: every row); filters narrow it by
-// the server's `group`, newest activity first. Only Draft picks ready tickets into a draft. A row opens a bottom sheet
-// with the ticket's current verdict and evidence, and its timeline (`/tickets/{id}/timeline`): everything the factory
-// saw and did, oldest first.
+// the server's `group`, newest activity first. Only Draft picks ready tickets. A row opens a bottom sheet with the
+// ticket's current verdict and evidence, and its timeline (`/tickets/{id}/timeline`): everything the factory saw and
+// did, oldest first.
+//
+// Draft no longer stages a dispatch itself: picking tickets hands them to Strategy (?stage=strategy) pre-selected,
+// where grooming (real DeepSeek) turns them into a published, approved brief before anything can be staged. The ticket
+// audit stays here.
 //
 // <TicketsTab data mode active view onViewChange onDone onNavigate />: data is the overview; mode tickets|verify|draft;
-//   active false = no fetch and no sheet (default true). view {q, filter, picked, open, busy, err} is the parent's, one
-//   per mode, so a workspace keeps it while unmounted, a pending or failed draft included (missing keys: "", "all", [],
-//   null, false, null). onViewChange is that mode's React-style setter; this file only passes updaters (latest view) =>
-//   next view, so a draft that lands after its workspace moved on or unmounted patches only busy, err and picked. A late
-//   call must still reach the view of the mode it was rendered for. busy and err are live state, not location: restoring
-//   a view from the URL or history keeps them. onDone(stageResult, null, toast) after a draft, mounted or not.
-//   onNavigate({stage, run?, ticket?}): the parent owns history and the pane. A row opens with {stage: mode, ticket},
-//   the sheet closes with {stage: mode, ticket: null}, a new draft goes to {stage: "draft", run} unless Draft was left
-//   while it was pending.
+//   active false = no fetch and no sheet (default true). view {q, filter, picked, open} is the parent's, one per mode,
+//   so a workspace keeps it while unmounted. onViewChange is that mode's React-style setter; this file only passes
+//   updaters (latest view) => next view, so a call that lands after its workspace moved on or unmounted patches only
+//   picked. onNavigate({stage, run?, ticket?, sources?}): the parent owns history and the pane. A row opens with
+//   {stage: mode, ticket}, the sheet closes with {stage: mode, ticket: null}, and a Draft handoff goes to
+//   {stage: "strategy", sources} with the picked identifiers.
 //
 // ticket row: {identifier, title, url, phase (tickets|verify|draft, or its live dispatch's phase), group: ready|answer|
 //   stale|dispatch|done|not, domain?, assignee?, linear_state, state_type, in_scope?, in_review?, owned?, context?,
@@ -23,7 +24,7 @@
 // timeline event: {at, kind: linear|own-write|verdict|dispatch|note|decision|card|writeback, actor, summary, detail?}.
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
-const { useState, useEffect, useRef } = SDK.hooks;
+const { useState, useEffect } = SDK.hooks;
 const { Button, Badge, Card, CardContent, Input } = SDK.components;
 const h = React.createElement;
 const Fragment = React.Fragment;
@@ -182,16 +183,7 @@ export function TicketsTab({ data, mode, active = true, view, onViewChange, onDo
   const filters = FILTERS[mode];
   const q = view?.q || "", picked = view?.picked || [], open = view?.open || null;
   const filter = filters.some(([k]) => k === view?.filter) ? view.filter : "all";
-  const busy = !!view?.busy, err = view?.err || null;
   const update = (patch) => onViewChange((v) => ({ ...v, ...patch }));  // lands on the view as it is by then
-  // One token per stay in Draft (mounted, active, mode draft): leaving or unmounting ends it, coming back starts a new
-  // one. A draft that lands later may move the page only while the stay it was clicked in goes on.
-  const inDraft = useRef(null);
-  useEffect(() => {
-    if (!active || mode !== "draft") return;
-    inDraft.current = {};
-    return () => { inDraft.current = null; };
-  }, [active, mode]);
   const [all, setAll] = useState(null);
   const [loadErr, setLoadErr] = useState(null);
   useEffect(() => {  // while active: now and on each overview refresh (`data` is a new object every time)
@@ -217,16 +209,11 @@ export function TicketsTab({ data, mode, active = true, view, onViewChange, onDo
   // A search looks through this whole workspace, whatever the filter, and never past it.
   const list = needle ? rows.filter(({ t }) => `${t.identifier} ${t.title || ""}`.toLowerCase().includes(needle)) : within(filter);
   const suggest = mode === "draft" && !needle && filter !== "dispatch" && suggested.length > 0;  // Next dispatch card
-  const draft = (ids) => {
-    const stay = inDraft.current;
-    update({ busy: true, err: null });
-    SDK.fetchJSON(`${API}/stage`, { method: "POST", headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ identifiers: ids }) })
-      .then((r) => {  // {run_id, state: "draft", tickets}: a draft row; the plan gate offers it to a planner later
-        update({ busy: false, picked: [] });  // mounted or not, so no drafted ticket stays picked
-        onDone(r, null, `Drafted ${r.run_id}; it waits in Draft until the plan gate offers it to a planner`);
-        if (stay && inDraft.current === stay) onNavigate({ stage: "draft", run: r.run_id });
-      }, (e) => update({ busy: false, err: errText(e) }));
+  // Draft no longer creates an unreviewed dispatch: raw candidates go to Strategy, where grooming (DeepSeek) turns
+  // them into a published, approved brief before anything is staged. The selection is handed over pre-picked.
+  const handoff = (ids) => {
+    update({ picked: [] });
+    onNavigate({ stage: "strategy", sources: ids });
   };
   // History first, then the view: the entry the sheet opened from keeps its own URL.
   const setOpen = (id) => { onNavigate({ stage: mode, ticket: id }); update({ open: id }); };
@@ -245,10 +232,9 @@ export function TicketsTab({ data, mode, active = true, view, onViewChange, onDo
         <Card className="fx-card fx-suggest"><CardContent className="fx-stack-v">
           <div className="fx-row between"><span className="fx-k">Next dispatch</span><span className="fx-hint">★ recommended</span></div>
           <div>{suggested.map((i) => <div key={i} className="fx-ttitle clamp"><span className="fx-id">{i}</span> {titles[i]}</div>)}</div>
-          <div className="fx-hint">The factory would group these next: same Domain, then same repo. Once the plan gate offers the draft, a planner shapes it into one plan; you review that before anything runs.</div>
-          <div className="fx-row"><Button size="sm" disabled={busy} onClick={() => draft(suggested)}>{busy ? "Drafting…" : `★ Draft these ${suggested.length}`}</Button>
+          <div className="fx-hint">The factory would group these next: same Domain, then same repo. They are groomed into an approved brief in Strategy before anything is drafted; you review that before anything runs.</div>
+          <div className="fx-row"><Button size="sm" onClick={() => handoff(suggested)}>★ Groom these {suggested.length} in Strategy</Button>
             <span className="fx-hint">or tick your own below</span></div>
-          {err ? <div className="fx-err" role="alert">{err}</div> : null}
         </CardContent></Card>
       ) : null}
       {loadErr ? <div className="fx-err" role="alert">{all ? `Refreshing tickets failed: ${loadErr}. Showing the last loaded list.` : `Tickets did not load: ${loadErr}`}</div> : null}
@@ -269,10 +255,9 @@ export function TicketsTab({ data, mode, active = true, view, onViewChange, onDo
         <div className="fx-draftbar">
           <span><b>{sel.length}</b> {sel.length === 1 ? "ticket" : "tickets"} picked</span><span className="fx-grow" />
           <Button size="sm" ghost onClick={() => update({ picked: [] })}>Clear</Button>
-          <Button size="sm" disabled={busy} onClick={() => draft(sel)}>{busy ? "Drafting…" : "Draft dispatch"}</Button>
+          <Button size="sm" onClick={() => handoff(sel)}>Groom in Strategy</Button>
         </div>
       ) : null}
-      {mode === "draft" && err && (sel.length || !suggest) ? <div className="fx-err" role="alert">{err}</div> : null}
       {active && current ? <Sheet key={current.identifier} t={current} onClose={() => setOpen(null)} /> : null}
     </>
   );
