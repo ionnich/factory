@@ -8,7 +8,7 @@ from .config import Config, secret
 API = "https://api.linear.app/graphql"
 
 ISSUE_FIELDS = """
-  id identifier title description url priority createdAt updatedAt archivedAt
+  id identifier title description url priority createdAt updatedAt archivedAt dueDate
   state { id name type }
   assignee { id email }
   team { id key }
@@ -121,6 +121,12 @@ def ingest(cfg: Config, conn, full: bool = False) -> dict:
                 (issue["id"], issue["identifier"], issue["updatedAt"], fetched_at, issue["state"]["type"],
                  int(in_scope(cfg, issue)), json.dumps(issue, sort_keys=True)))
             inserted += cur.rowcount
+            # The due sidecar is version-keyed and idempotent: populate it even when the snapshot itself was
+            # ignored (unchanged), and never touch the append-only raw_json. A NULL due_date records an actual
+            # due removal on this version.
+            conn.execute(
+                "INSERT OR IGNORE INTO linear_due(issue_id, snapshot_updated_at, due_date) VALUES (?,?,?)",
+                (issue["id"], issue["updatedAt"], issue.get("dueDate")))
             if max_updated is None or issue["updatedAt"] > max_updated:
                 max_updated = issue["updatedAt"]
         conn.execute(

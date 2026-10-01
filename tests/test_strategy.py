@@ -387,6 +387,45 @@ class Briefs(unittest.TestCase):
         self.assertFalse(row["ready"])
         self.assertTrue(any("assigned to" in blk for blk in row["blockers"]))
 
+    def test_source_metadata_serialization_and_missing_dates(self):
+        # a source with a real createdAt + due sidecar round-trips its metadata through sources_json
+        raw3 = json.loads(_raw(ident="FIN-3"))
+        raw3["createdAt"] = "2026-08-01T00:00:00Z"
+        self.c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,'unstarted',1,?)",
+                       ("fin-3", "FIN-3", SNAP, SNAP, json.dumps(raw3)))
+        self.c.execute("INSERT INTO linear_due(issue_id, snapshot_updated_at, due_date) VALUES (?,?,?)",
+                       ("fin-3", SNAP, "2026-10-15"))
+        src = strategy.create(self.cfg, self.c, ["FIN-3"], "user:cli", _body())["sources"][0]
+        self.assertEqual(src["created_at"], "2026-08-01T00:00:00Z")
+        self.assertEqual(src["updated_at"], SNAP)          # the snapshot row's updated_at, never fetched_at
+        self.assertEqual(src["due_date"], "2026-10-15")    # the exact ingested version's due, not inferred
+        self.assertIsNone(src["verdict_at"])               # no verdict for this source yet
+        # missing dates stay null: FIN-1 has no createdAt, no due sidecar, but a current verdict
+        s1 = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body())["sources"][0]
+        self.assertIsNone(s1["created_at"])
+        self.assertIsNone(s1["due_date"])
+        self.assertEqual(s1["updated_at"], SNAP)
+        self.assertEqual(s1["verdict_at"], SNAP)           # the current verdict's created_at
+
+    def test_unmapped_changed_source_verdict_freshness(self):
+        # an owned ticket with no mapped context still reports _stale_db freshness for its existing verdict
+        self.c.execute("INSERT INTO linear_project VALUES ('p2','other-domain','Other Domain','me@example.com',?)",
+                       (SNAP,))
+        raw = json.loads(_raw(ident="FIN-4"))
+        raw["description"] = "Domain: Other Domain\n"
+        self.c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,'unstarted',1,?)",
+                       ("fin-4", "FIN-4", "2026-09-02T00:00:00Z", "2026-09-02T00:00:00Z", json.dumps(raw)))
+        # a verdict captured at the older snapshot; the ticket has since changed -> stale
+        self.c.execute("INSERT INTO verdict(issue_id,snapshot_updated_at,context,repo,kind,reason,evidence_json,"
+                       "created_at,created_by) VALUES ('fin-4',?,NULL,'Finks-ai/finks-ddd','valid','r','[\"e\"]',?,"
+                       "'t')", (SNAP, SNAP))
+        fin4 = next(t for t in strategy.overview(self.cfg, self.c)["tickets"] if t["identifier"] == "FIN-4")
+        self.assertIsNone(fin4["context"])                  # unmapped: no context for "Other Domain"
+        self.assertEqual(fin4["verdict"], "valid")
+        self.assertEqual(fin4["verdict_at"], SNAP)
+        self.assertEqual(fin4["stale"], "ticket-changed")   # freshness computed even though unmapped
+        self.assertEqual(fin4["reason"], "unmapped")        # execution blocker stays the context mapping
+
     def test_repo_only_opt_out_and_explicit_global(self):
         # a human can opt out of global:* with a repo/route-only list (no invented extra key)
         b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli",

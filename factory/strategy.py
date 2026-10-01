@@ -57,6 +57,8 @@ def _sources_for(cfg: Config, conn, identifiers: list[str]) -> list[dict]:
         context = (v["context"] if v else None) or (ctx.name if ctx else None)
         route = ctx.owner(prune.issue_fields(s)[0]) if ctx else None
         trunk = conn.execute("SELECT sha FROM repo_trunk WHERE repo=?", (repo,)).fetchone() if repo else None
+        due = conn.execute("SELECT due_date FROM linear_due WHERE issue_id=? AND snapshot_updated_at=?",
+                           (s["issue_id"], s["updated_at"])).fetchone()
         sources.append({
             "issue_id": s["issue_id"],
             "identifier": ident,
@@ -73,6 +75,10 @@ def _sources_for(cfg: Config, conn, identifiers: list[str]) -> list[dict]:
             "evidence": json.loads(v["evidence_json"]) if v else [],
             "evidence_paths": json.loads(v["evidence_paths_json"]) if v else [],
             "trunk_sha": trunk["sha"] if trunk else None,
+            "created_at": raw.get("createdAt"),        # Linear createdAt, or null when absent
+            "updated_at": s["updated_at"],             # the snapshot row's updated_at, never fetched_at
+            "due_date": due["due_date"] if due else None,  # exact snapshot version's ingested due, never inferred
+            "verdict_at": v["created_at"] if v else None,
         })
     return sources
 
@@ -743,13 +749,18 @@ def _ticket_list(cfg: Config, conn) -> list[dict]:
                   else f"verdict {v['kind']}" if v["kind"] != "valid"
                   else f"verdict stale ({r})" if (r := _stale_db(conn, s, ctx))
                   else None)
+        due = conn.execute("SELECT due_date FROM linear_due WHERE issue_id=? AND snapshot_updated_at=?",
+                           (s["issue_id"], s["updated_at"])).fetchone()
         out.append({"identifier": ident, "title": raw["title"], "url": raw["url"],
                     "state": state_name, "state_type": s["state_type"],
                     "assignee": assignee, "lead": lead,
                     "repo": (v["repo"] if v else None) or (ctx.repo if ctx else None),
                     "context": (v["context"] if v else None) or (ctx.name if ctx else None),
                     "route": owner, "priority": raw["priority"],
+                    "created_at": raw.get("createdAt"), "updated_at": s["updated_at"],
+                    "due_date": due["due_date"] if due else None,
                     "verdict": v["kind"] if v else None, "verdict_reason": v["reason"] if v else None,
-                    "stale": _stale_db(conn, s, ctx) if ctx and v else None, "reason": reason})
+                    "verdict_at": v["created_at"] if v else None,
+                    "stale": _stale_db(conn, s, ctx) if v else None, "reason": reason})
     out.sort(key=lambda t: (t["priority"] or 5, t["repo"] or "", t["identifier"]))
     return out

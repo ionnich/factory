@@ -18,6 +18,16 @@ BEGIN SELECT RAISE(ABORT, 'linear_snapshot is append-only'); END;
 CREATE TRIGGER linear_snapshot_no_delete BEFORE DELETE ON linear_snapshot
 BEGIN SELECT RAISE(ABORT, 'linear_snapshot is append-only'); END;
 
+-- Per-version due date (Linear dueDate, YYYY-MM-DD). Version-keyed: a due removal lands as a NEW snapshot
+-- version with a NULL row, so the exact snapshot version stays authoritative and a prior version is untouched.
+CREATE TABLE linear_due (
+  issue_id            TEXT NOT NULL,
+  snapshot_updated_at TEXT NOT NULL,
+  due_date            TEXT,                  -- Linear dueDate (YYYY-MM-DD); NULL when unset at this version
+  PRIMARY KEY (issue_id, snapshot_updated_at),
+  FOREIGN KEY (issue_id, snapshot_updated_at) REFERENCES linear_snapshot(issue_id, updated_at)
+);
+
 CREATE VIEW linear_latest AS
 SELECT s.* FROM linear_snapshot s
 WHERE s.updated_at = (SELECT max(updated_at) FROM linear_snapshot m WHERE m.issue_id = s.issue_id);
