@@ -462,6 +462,12 @@ ul.fx-ev { margin: 0 0 0 1rem; font-size: .78rem; color: var(--fx-muted); overfl
 .fx-trow[data-depth] { margin-left: calc(min(var(--fx-depth, 0), 3) * 14px); }
 .fx-cycle-warn { color: var(--r); font-size: .82rem; font-weight: 650; overflow-wrap: anywhere; }
 .fx-edge-sec { display: grid; gap: .3rem; padding-top: .15rem; min-width: 0; }
+.fx-edge-sec > summary { cursor: pointer; list-style: none; min-height: 44px; display: flex; align-items: center;
+                         flex-wrap: wrap; gap: .4rem; }
+.fx-edge-sec > summary::-webkit-details-marker { display: none; }
+.fx-edge-sec > summary::before { content: "▸"; display: inline-block; margin-right: .4rem; color: var(--fx-muted);
+                                 transition: transform .15s; }
+.fx-edge-sec[open] > summary::before { transform: rotate(90deg); }
 .fx-edge { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; font-size: .82rem; min-width: 0; }
 .fx-edge .fx-hint { overflow-wrap: anywhere; }
 .fx-ctx-list { display: grid; gap: .3rem; }
