@@ -507,11 +507,12 @@ function BriefLink({ d, onGo }) {
   );
 }
 
-// The launch reservation (reserved|sent|uncertain), visible so an uncertain send is never silently replayed. Release
-// is allowed exactly where the backend allows it: a staged dispatch with reserved|uncertain (never staged+sent), or a
-// terminal done/reconciled/archived dispatch still holding reserved|sent|uncertain (a leftover reservation).
-// Executing is never releasable. A staged release is framed as "unsent"; a terminal one as a completed-run leftover
-// reservation — never claimed unsent, never a restart. Backend verifies reason, confirmation and an idle matching pane.
+// The launch reservation (reserved|sent|uncertain), visible so an uncertain send is never silently replayed. Manual
+// release is allowed exactly where the backend allows it: a staged or terminal done/reconciled/archived dispatch
+// whose launch is reserved|uncertain. Executing and sent are always refused here — a terminal sent reservation is
+// cleaned up automatically by the backend (release_safe_terminal), never by this manual action. A staged release is
+// framed as "unsent"; a terminal one as a completed-run leftover reservation — never claimed unsent, never a restart.
+// Backend verifies reason, confirmation and an idle matching pane.
 function LaunchRecovery({ d, onDone }) {
   const l = d.launch;
   const [reason, setReason] = useState("");
@@ -521,8 +522,7 @@ function LaunchRecovery({ d, onDone }) {
   if (!l) return null;
   const uncertain = l.state === "uncertain";
   const terminal = d.state === "done" || d.state === "reconciled" || d.state === "archived";
-  const releasable = (d.state === "staged" && (l.state === "reserved" || l.state === "uncertain"))
-    || (terminal && (l.state === "reserved" || l.state === "sent" || l.state === "uncertain"));
+  const releasable = (d.state === "staged" || terminal) && (l.state === "reserved" || l.state === "uncertain");
   const go = async () => {
     if (!armed) { setArmed(true); return; }
     if (!reason.trim()) return;
