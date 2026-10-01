@@ -25,11 +25,14 @@ The prompt starts with the gate's JSON: `context.tickets[]`, each with
 evidence-changed | aged), `context`, `repo`, `mirror` (a checkout of trunk),
 `trunk_sha`, and `witnesses` (read-only data sources mapped to this context).
 
-A subject staged from an approved Strategy brief carries the compiled brief
-narrative (outcome, acceptance, scope, decisions, evidence) instead of the raw
-Linear description, and may be a Backlog source. Verify against that brief; do
-not re-read the source ticket narrative. Source-domain/assignee/mapping
+A subject staged from an approved Strategy brief carries `brief_id` (the exact
+immutable brief version) and `brief` (the compiled narrative: outcome,
+acceptance, scope, decisions, evidence) instead of the raw Linear description,
+and may be a Backlog source. Verify against that exact brief; do not re-read the
+source ticket narrative. Its `verdict put` must carry `--brief <that brief_id>`;
+never use a different or "latest" brief id. Source-domain/assignee/mapping
 protections still apply, and verdict evidence must be observed in this run.
+A subject with no `brief_id` is a legacy ticket and is written without `--brief`.
 A re-check (`why` evidence-changed or aged) also carries `prior` (the current
 verdict: kind, target, reason, evidence, its trunk_sha) and `cited_diff` (the
 git diff of only the files that verdict cited, prior trunk → current trunk).
@@ -77,12 +80,25 @@ shell does not have `~/.local/bin` on PATH). Below, `factory` means that path.
      exist. `--target "<what is missing>"`.
    - `needs-clarification`: you cannot decide from code and data alone.
    Contexts with no witness accept only `valid` or `needs-clarification`.
-4. Record it:
+4. Record it. A legacy subject (no `brief_id`) is written without `--brief`:
 
    ```bash
    ~/.local/bin/factory verdict put FIN-123 --kind valid --reason "one or two sentences" \
      --evidence '[{"type":"file","path":"finks_dagster/defs/x.py","note":"asset x exists; lacks the retry policy the ticket asks for"},{"type":"dagster","witness_log_id":42,"note":"last 3 runs of x failed with timeout"}]'
    ```
+
+   A brief-backed subject (the gate subject carries `brief_id`) MUST add
+   `--brief <that exact brief_id>` to the same command:
+
+   ```bash
+   ~/.local/bin/factory verdict put FIN-123 --kind valid --reason "one or two sentences" \
+     --evidence '[{"type":"file","path":"finks_dagster/defs/x.py","note":"..."}]' --brief 7
+   ```
+
+   The id is exactly the `brief_id` from the gate subject — never a discovered
+   "latest" id and never a retarget to a different brief version. Omitting
+   `--brief` on a brief-backed subject writes a generic verdict with no
+   exact-version association and is wrong: the gate requires the brief verdict.
 
    Pass evidence inline as one single-quoted JSON list. Do not use heredocs,
    pipes or `$(...)`: the terminal's security scan blocks them.
@@ -92,6 +108,11 @@ shell does not have `~/.local/bin` on PATH). Below, `factory` means that path.
 
 5. If `factory verdict put` refuses, read the message, fix the evidence or
    choose the kind the rule allows, and retry. Never retry the same payload.
+   A brief-backed refusal naming the brief (no such brief, not approved, held,
+   superseded by a newer revision, or "changed since capture") is not a payload
+   bug: stop, do not write a verdict against another brief version, and report
+   that the gate/source amendment workflow is required. Never silently retarget
+   to the latest brief.
 
 ## Rules
 
@@ -105,4 +126,10 @@ shell does not have `~/.local/bin` on PATH). Below, `factory` means that path.
   belongs elsewhere, use `needs-clarification` and say where it seems to belong.
 - One verdict per ticket per run. Skip nothing: an unfinished ticket gets
   `needs-clarification` stating what blocked you.
+- A brief-backed subject's verdict is bound to its exact `brief_id` only. Never
+  discover or substitute a newer/latest brief, and never write evidence against
+  a different version; a superseded, held or source-drifted brief is rejected
+  and needs the amendment workflow. Brief-backed subjects verify the compiled
+  `brief` narrative, never the raw Linear description — there is no raw-narrative
+  fallback.
 - Finish with a one-line summary per ticket: `IDENT kind — reason`.
