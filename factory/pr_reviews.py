@@ -4,10 +4,12 @@ The inbox contains only open, non-draft pull requests whose current review reque
 team the viewer belongs to. Factory dispatch links come only from exact PR URLs already recorded on a dispatch card.
 """
 import json
+import os
 import shutil
 import subprocess
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 from . import dispatch
 
@@ -47,7 +49,9 @@ def _problem(stderr: str, fallback: str) -> str:
 
 
 def _run_gh(args: list[str], timeout: float):
-    gh = shutil.which("gh")
+    gh = shutil.which("gh") or shutil.which("gh", path=os.pathsep.join(
+        [f"/etc/profiles/per-user/{os.environ.get('USER', '')}/bin", "/run/current-system/sw/bin",
+         "/opt/homebrew/bin", str(Path.home() / ".local" / "bin")]))
     if not gh:
         raise FileNotFoundError("gh is not installed or is not on PATH")
     return subprocess.run([gh, *args], capture_output=True, text=True, timeout=max(1, timeout))
@@ -262,5 +266,5 @@ def list_reviews(conn, runner=_run_gh) -> dict:
     partial = partial or bool(item_warnings)
     if truncated:
         warnings.append(f"Some review searches had more results; showing at most the newest {MAX_ITEMS} matches.")
-    return {"items": items, "count": None if partial else len(items), "fetched_at": fetched_at,
+    return {"items": items, "count": None if partial or truncated else len(items), "fetched_at": fetched_at,
             "warnings": warnings, "partial": partial, "truncated": truncated, "error": None}

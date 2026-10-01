@@ -775,16 +775,17 @@ function Tabs({ label, items, current, onPick }) {
 // stay a separate inbox: an unavailable fetch is unknown, never displayed as zero.
 function NeedsYou({ items, decisions, answers, prs, prLoading, prError, open, onToggle, onGo }) {
   const prKnown = prs != null;
-  const hasPRInbox = (prKnown && prs > 0) || prError;
   const hasAnything = items.length || answers || (prKnown && prs) || prError;
+  const knownCount = decisions + answers + (prKnown ? prs : 0);
+  const count = prKnown ? knownCount : knownCount ? `${knownCount}+` : "?";
   const prSummary = prError ? "PRs unknown" : prKnown ? plural(prs, "PR") : prLoading ? "PRs loading" : "PRs unknown";
   return (
     <details className="fx-needs fx-needs-menu" open={open} onToggle={(e) => onToggle(e.currentTarget.open)}>
       <summary className={`fx-hello fx-needs-summary${hasAnything ? " you" : ""}`}>
-        <span>Needs you</span>
-        <span className="fx-hint">{plural(decisions, "decision")} · {plural(answers, "Linear-ticket answer")} · {prSummary}</span>
+        <span>Needs you · {count}</span>
       </summary>
       <ul className="fx-needs-list">
+        <li className="fx-hint">{plural(decisions, "decision")} · {plural(answers, "Linear-ticket answer")} · {prSummary}</li>
         {items.map((t) => (
           <li key={t.key}><button type="button" className="fx-need" onClick={() => onGo(t)}>
             <span className="fx-row"><Tone tone={t.tone}>{t.kind}</Tone><span className="fx-hint">{LABEL[t.stage]} ›</span></span>
@@ -797,13 +798,11 @@ function NeedsYou({ items, decisions, answers, prs, prLoading, prError, open, on
             <span>{plural(answers, "ticket")} waiting on an answer in Linear</span>
           </button></li>
         ) : null}
-        {hasPRInbox ? (
           <li><button type="button" className="fx-need" onClick={() => onGo({ stage: "prs" })}>
             <span className="fx-row"><Tone tone={prError ? "red" : "amber"}>PR reviews</Tone><span className="fx-hint">Inbox ›</span></span>
-            <span>{prError ? "Pull-request reviews could not be loaded" : `${plural(prs, "pull request")} waiting for your review`}</span>
+            <span>{prError ? "Pull-request reviews could not be loaded" : !prKnown ? (prLoading ? "Checking review requests from GitHub…" : "Review requests · total unknown") : `${plural(prs, "pull request")} waiting for your review`}</span>
           </button></li>
-        ) : null}
-        {!hasAnything ? <li className="fx-hint">Nothing waits on you. A new question shows up here and in its stage.</li>
+        {prKnown && !hasAnything ? <li className="fx-hint">Nothing waits on you. A new question shows up here and in its stage.</li>
           : prLoading && !items.length && !answers ? <li className="fx-hint">Checking pull-request reviews…</li> : null}
       </ul>
     </details>
@@ -1077,7 +1076,7 @@ function FactoryPage() {
       <Toast toast={toast} />
       <header className="fx-head">
         <NeedsYou items={targets} decisions={waiting.length} answers={data.ticket_counts?.answer || 0}
-          prs={prState.error ? null : prState.data?.count} prLoading={prState.loading} prError={prState.error}
+          prs={prState.error ? null : prState.data?.count} prLoading={prState.loading} prError={prState.error || prState.data?.error}
           open={needsOpen} onToggle={setNeedsOpen} onGo={jumpTo} />
         <div className="fx-row fx-hint"><Health jobs={data.jobs} /><span>·</span>{connection}</div>
       </header>

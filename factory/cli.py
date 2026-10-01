@@ -3,6 +3,7 @@ import argparse
 import collections
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import statistics
@@ -43,6 +44,11 @@ def _json_body(src: str) -> dict:
 
 
 def cmd_pr_reviews(cfg, conn, a):
+    if not (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
+        try:
+            os.environ["GITHUB_TOKEN"] = config.secret(cfg, "GITHUB_TOKEN")
+        except config.ConfigError:
+            pass  # Without Factory's optional token, gh can use its own authenticated session.
     out(pr_reviews.list_reviews(conn))
 
 

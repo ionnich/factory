@@ -357,7 +357,7 @@ function GroupSummary({ d }) {
       </div>
       <div className="fx-group-meta">
         <span>{meta.type}</span>
-        <span>{n !== m ? `${n} matching / ${m} members` : plural(m, "member")}</span>
+        <span>{n !== m ? `${n}/${m} sources` : plural(m, "source")}</span>
         <span>{readiness}</span>
         {d.earliestDue ? <span>Due {d.earliestDue}</span> : null}
         {d.g.continued ? <span>Continuation</span> : null}
@@ -597,8 +597,8 @@ function RelationshipStatus({ relationships, missingIds }) {
   const incomplete = !relationships.complete;
   const nMissing = missingIds.size;
   return (
-    <div className="fx-rel-status">
-      <div className="fx-hint">Relationship snapshot {relationships.observed_at ? `observed ${ago(relationships.observed_at)}` : "not yet observed"}</div>
+    <div className={`fx-rel-status${!incomplete && !nMissing ? " complete" : ""}`}>
+      <div className="fx-hint">Links {relationships.observed_at ? `observed ${ago(relationships.observed_at)}` : "not yet observed"}</div>
       {incomplete ? <div className="fx-err">Relationships incomplete — some recorded links may be missing.</div> : null}
       {nMissing ? <div className="fx-hint">{nMissing} source{nMissing === 1 ? "" : "s"} without a relationship snapshot</div> : null}
     </div>
@@ -983,7 +983,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
       <header className="fx-strategy-heading">
         <div>
           <h2>Strategy</h2>
-          <div className="fx-hint">Groom sources into approved intent. Publishing never starts work.</div>
+          <div className="fx-hint">Choose work worth doing.</div>
         </div>
         {briefsOpen && open == null
           ? <Button size="sm" ghost onClick={showSources}>Back to sources</Button>
@@ -1139,8 +1139,6 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
                 </select>
               </div>
             </details>
-            <label className="fx-row">
-              <span className="fx-k">Sort</span>
               <select className="fx-select" value={sort} aria-label="Source sort"
                       onChange={(e) => changeFilter({ sort: e.target.value })}>
                 <option value="priority">Priority</option>
@@ -1149,12 +1147,12 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
                 <option value="newest">Newest created</option>
                 <option value="updated">Recently updated</option>
               </select>
-            </label>
-            <div className="fx-seg fx-mode" role="group" aria-label="Source view">
-              <button className={sourceMode === "groups" ? "on" : ""} aria-pressed={sourceMode === "groups"} title="Grouped outline" onClick={() => changeFilter({ sourceMode: "groups" })}>Groups</button>
-              <button className={sourceMode === "flat" ? "on" : ""} aria-pressed={sourceMode === "flat"} title="Flat list" onClick={() => changeFilter({ sourceMode: "flat" })}>Flat</button>
-              <button className={sourceMode === "dag" ? "on" : ""} aria-pressed={sourceMode === "dag"} title="Dependency DAG (desktop)" onClick={() => changeFilter({ sourceMode: "dag" })}>DAG</button>
-            </div>
+            <select className="fx-select fx-mode" aria-label="Source view" value={sourceMode}
+                    onChange={(e) => changeFilter({ sourceMode: e.target.value })}>
+              <option value="groups">Groups</option>
+              <option value="flat">Flat list</option>
+              <option value="dag">Dependency DAG</option>
+            </select>
             <Button size="sm" ghost disabled={!!busy} onClick={refresh}>{busy === "refresh" ? "Refreshing…" : "Refresh"}</Button>
           </div>
 
@@ -1173,8 +1171,8 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
 
           <div className="fx-hint">
             {sourceMode === "flat"
-              ? `Showing ${shownCount} of ${matching} matching · ${total} total`
-              : `Showing ${shownCount} of ${visibleGroups.length} groups · ${matching} matching sources · ${total} total`}
+              ? `${shownCount} of ${matching} sources${filteredActive ? ` · ${total} total` : ""}`
+              : `${shownCount} of ${visibleGroups.length} groups · ${filteredActive ? `${matching}/${total}` : total} sources`}
           </div>
           {sourceMode === "flat" ? (
             <div className="fx-list">

@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from factory import db
 from factory.pr_reviews import list_reviews
@@ -51,7 +52,10 @@ def search(nodes, more=False, cursor=None):
 
 class PRReviews(unittest.TestCase):
     def setUp(self):
-        self.conn = db.connect(Path(tempfile.mkdtemp()) / "factory.db")
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.conn = db.connect(Path(directory.name) / "factory.db")
+        self.addCleanup(self.conn.close)
 
     def associate(self, url):
         seed_snapshot(self.conn, "i1", "FIN-1")
@@ -127,7 +131,16 @@ class PRReviews(unittest.TestCase):
 
         self.assertEqual(inbox["count"], 2)
         self.assertFalse(inbox["truncated"])
-        self.assertIn('after: "page-2"', runner.calls[2][-1])
+        self.assertEqual([item["url"] for item in inbox["items"]], [first["url"], second["url"]])
+
+    def test_truncated_results_never_claim_a_complete_count(self):
+        first = pr("https://github.com/acme/repo/pull/9", reviewers=[reviewer_user()])
+        payload = {"data": {"viewer": {"login": "nich"}, "direct": search([first], True, "more")}}
+        with patch("factory.pr_reviews.MAX_ITEMS", 1):
+            inbox = list_reviews(self.conn, Runner(result(""), result(json.dumps(payload))))
+        self.assertEqual([item["url"] for item in inbox["items"]], [first["url"]])
+        self.assertTrue(inbox["truncated"])
+        self.assertIsNone(inbox["count"])
 
 
 if __name__ == "__main__":

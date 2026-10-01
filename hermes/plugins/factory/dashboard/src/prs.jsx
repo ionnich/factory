@@ -4,6 +4,7 @@ const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect, useCallback, useRef } = SDK.hooks;
 const { Button } = SDK.components;
+const h = React.createElement;
 const API = "/api/plugins/factory";
 
 const errText = (e) => String(e && e.message ? e.message : e);
@@ -40,7 +41,7 @@ export function usePRReviews() {
 function Checks({ state }) {
   const label = { passed: "Checks passed", failed: "Checks failed", pending: "Checks pending", unknown: "Checks unknown" }[state]
     || "Checks unknown";
-  return <span className={`fx-pr-check fx-pr-check-${state || "unknown"}`}>{label}</span>;
+  return <span className="fx-pr-checks" data-state={state || "unknown"}>{label}</span>;
 }
 
 function ReviewRow({ item, onNavigate }) {
@@ -48,13 +49,13 @@ function ReviewRow({ item, onNavigate }) {
   return (
     <div className="fx-trow fx-pr-row">
       <div className="fx-grow">
+        <div className="fx-row-title fx-pr-title">{item.title}</div>
         <div className="fx-row fx-row-meta">
           <span className="fx-id">{item.repository}#{item.number}</span>
           <span>{item.author ? `by ${item.author}` : "author unknown"}</span>
           <span className="fx-grow" />
           <span>updated {ago(item.updated_at)}</span>
         </div>
-        <div className="fx-row-title fx-pr-title">{item.title}</div>
         <div className="fx-row fx-row-status">
           <Checks state={item.checks} />
           <span className="fx-hint">{item.request_context}</span>
@@ -98,7 +99,7 @@ export function PRReviews({ state, onNavigate, onBack }) {
         <ul className="fx-pr-warnings" role="status">{data.warnings.map((warning, i) => <li key={i}>{warning}</li>)}</ul>
       ) : null}
       {!data && loading ? <div className="fx-hint">Loading review requests…</div>
-        : !items.length && !data?.error && !error ? <div className="fx-empty">No open, non-draft pull requests currently request your review.</div>
+        : !items.length && !data?.error && !error ? <div className="fx-empty">{incomplete ? "No matching reviews in the available results. The inbox is incomplete." : "No open, non-draft pull requests currently request your review."}</div>
         : <div className="fx-list fx-pr-list">{items.map((item) => <ReviewRow key={item.url} item={item} onNavigate={onNavigate} />)}</div>}
     </section>
   );

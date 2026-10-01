@@ -37,17 +37,18 @@ One-time, by hand:
 
 ## Use
 
-- Dashboard: Hermes dashboard, **Factory** tab, phone first, eight lifecycle workspaces. Only the selected
-  workspace is mounted; its decisions, plans and actions stay inside it. The shared header has health,
-  refresh and a compact **Needs you** menu. Each menu item opens its owning stage and focuses the actual
-  decision or plan question; an executor question belongs in Run, never Tickets or Review.
+- Dashboard: Hermes dashboard, **Factory** tab, phone first. Primary workspaces are **Assembly**, **Strategy**,
+  **Learn** and **Costs**. Only Assembly shows the connected lifecycle track: Tickets, Verify, Draft, Plan,
+  Review, Run, Reconcile, Archive. Returning to Assembly restores its last stage; existing stage and legacy
+  deep links still open the right workspace. Lifecycle counts appear in the selected stage heading, not every tab.
+  **Needs you** starts folded on every full page load and opens only by manual toggle. Refreshes, new decisions,
+  PR results and workspace switches preserve its current toggle state; opening it never acknowledges anything.
+  Decision and Linear-answer entries open their owning stage; executor questions belong in Run.
   `factory.db` changes refresh data over `/stream` without polling, changing tabs or opening panels.
-  The shared visual system uses theme-derived warm surfaces: subtly raised major panels, flat dense rows,
-  inset fields and pressed selections with visible accents. Ticket titles lead; repo, assignee and dates stay
-  quiet metadata. Buttons and selects use 6px corners rather than pills. Controls have 44px targets,
-  visible keyboard focus and readable disabled labels; phone
-  fields use 16px text and reduced-motion preferences are respected. Styles stay scoped to Factory; SDK
-  components, decision safeguards and the railway/configurator workflow are unchanged.
+  Wispr-inspired hierarchy uses serif workspace headings, readable sans-serif work rows, quiet metadata,
+  flat theme-derived surfaces and lavender selection accents. Buttons retain 6px corners, 44px targets,
+  visible keyboard focus and readable labels. Phone fields use 16px text; reduced motion is respected.
+  Styles stay scoped to Factory; SDK components, decision safeguards and railway/configurator behavior remain.
   Stage-local decision cards show options, consequences and ★. Executor answers and options that start or stop
   work or write Linear require a second tap; some require a reason. Lightweight ★ accepts a right swipe;
   left postpones. Canceled gestures do nothing. Refused choices return with their error.
@@ -99,6 +100,13 @@ One-time, by hand:
   `index.jsx` owns workspaces, `plan.jsx` the configurator, `railway.jsx` its desktop map, `tickets.jsx` ticket views,
   `why.jsx` explanation threads and `learn.jsx` learnings. React/components come from the dashboard SDK;
   `./install.sh` bundles with `bun build` into gitignored `dist/` and copies the plugin.
+- **PR reviews:** open the read-only inbox from Needs you. `factory pr-reviews` and GET `/pr-reviews`
+  list open, non-draft GitHub PRs currently requesting your review directly or through an accessible team.
+  Auth uses the existing `gh` session or configured GitHub token. The list loads once per page mount;
+  Refresh checks again independently of Factory's event stream. Titles open GitHub; metadata shows author,
+  repository, update time, request context and checks. A dispatch link appears only for an exact recorded PR.
+  Unrelated PRs never enter dispatch context or block work. Failures and partial results show unknown counts,
+  never a false empty inbox. Reads are bounded to 20 teams, 250 results and 50 seconds, with explicit warnings.
 - Chat: `hermes -p factory`, also on the iPhone through Hermex (Bot Mode, factory profile; the web dashboard has
   no Bot Mode yet, so digests and pushes are read and answered there or in the Factory tab). It shows drafts,
   takes notes ("note FIN-3788/2: …") and answers decisions (weighty ones through the Hermes approval prompt);
@@ -223,8 +231,8 @@ One-time, by hand:
 
 ## Strategy vs Factory
 
-**Strategy** is a separate supporting workspace (`/factory?stage=strategy`) that owns source grooming and intent;
-**Factory** owns verification, implementation planning and execution proof. The eight lifecycle workspaces
+**Strategy** is a primary workspace (`/factory?stage=strategy`) that owns source grooming and intent;
+**Assembly** owns verification, implementation planning and execution proof. Its eight lifecycle stages
 (Tickets, Verify, Draft, Plan, Review, Run, Reconcile, Archive) are unchanged. Linear snapshots are source and
 provenance plus reconciliation ids, not the runtime instruction source for a brief-backed dispatch.
 
@@ -232,13 +240,18 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
   then explicitly organizational project/context buckets. Related links never form transitive mega-groups;
   a source with only outside related links stays in its project bucket with those links retained as context.
   Each source appears once, with at most 12 sources per group; larger families/chains have labelled continuations.
-  Summaries show matching ticket count, highest priority, earliest due date, readiness and independent validity counts,
-  plus cross-assignee/repo counts. Group order follows the chosen source sort; prerequisites precede dependents inside
-  a dependency group, with the chosen sort breaking ties. Parent families retain their outline.
+  Collapsed summaries show title, relationship kind, source count, readiness and earliest due date.
+  Detailed priority, independent validity, ownership and repository counts stay inside expansion.
+  Group order follows the chosen source sort; prerequisites precede dependents inside dependency groups,
+  with the chosen sort breaking ties. Parent families retain their outline.
   **Flat** keeps the paged ticket list; **DAG** adds a desktop blocks-only graph to each opened group.
   Cycles remain explicit edge lists, never fabricated DAGs. Typed links and outside-filter/source context expand
   separately; context is read-only and never silently selected. **Select matching** selects only matching group members.
   Source view, group expansion and picks survive workspace switches; hidden picks remain visible in the count.
+  Search stays visible; **Filters** folds state/context/assignee controls. Sort and source view use selects.
+  A bottom selection bar keeps selected/hidden counts, Clear and Groom together. Relationship review remains
+  visible before grooming. **View briefs** opens the brief index; choosing a brief replaces browsing with focused
+  editing. **Back to sources** restores browsing state. Capacity and scheduling sit below source browsing, folded.
 - **Recorded relationships:** schema v23 caches each owned source's parent, children, blocks, related and duplicate
   links, including descriptive metadata for outside endpoints. Normal ingest refreshes the complete paginated graph
   even when issue timestamps do not change. Refresh is atomic; failures keep the previous graph and report the error.
