@@ -85,13 +85,13 @@ function sortSources(rows, sort) {
 }
 
 // Group kind: the backend enum is exactly parent/dependency/related/project/context. An unknown kind keeps a truthful
-// fallback label (its raw kind), never an invented relationship.
+// fallback label (its raw kind), never an invented relationship. `type` is the single type/reason shown in a summary.
 const GROUP_KIND = {
-  parent: { label: "Parent family", reason: "parent/child links" },
-  dependency: { label: "Dependency chain", reason: "blocking links" },
-  related: { label: "Related candidate", reason: "one-hop related links", candidate: true },
-  project: { label: "Project bucket", reason: "organizational", organizational: true },
-  context: { label: "Context bucket", reason: "organizational", organizational: true },
+  parent: { type: "Parent family · parent/child links" },
+  dependency: { type: "Dependency chain · blocking links" },
+  related: { type: "Related candidate · one-hop related links" },
+  project: { type: "Project bucket (organizational)" },
+  context: { type: "Context bucket (organizational)" },
 };
 const GROUP_KINDS = new Set(Object.keys(GROUP_KIND));
 function groupKind(g) {
@@ -104,14 +104,14 @@ function isUnresolvedPrereq(t) {
   return !!(t && t.state_type && ["backlog", "unstarted", "started"].includes(t.state_type));
 }
 // ticket.reason (strategy.py _ticket_list) is a single readiness blocker: null = ready, "no verdict" = not checked,
-// "verdict stale …" = outdated, anything else = an execution blocker (completed, in QA, live dispatch, unmapped, no
-// owner, assigned elsewhere, non-valid verdict). This is the truthful source for the summary counts.
+// "verdict stale …" = outdated, anything else = not ready (completed, in QA, live dispatch, unmapped, no owner,
+// assigned elsewhere, non-valid verdict). This is the truthful source for the summary counts.
 function reasonState(t) {
   const r = t.reason;
   if (!r) return "ready";
   if (r === "no verdict") return "notchecked";
   if (r.startsWith("verdict stale")) return "outdated";
-  return "blocked";
+  return "notready";
 }
 // True when the recorded edges form a cycle (used to refuse pretending a cyclic graph is a DAG).
 function hasCycle(edges) {
@@ -150,6 +150,34 @@ function parentHierarchy(d) {
   };
   for (const id of roots) visit(id, 0, null);
   for (const id of order) if (!seen.has(id)) visit(id, 0, null);
+  return out;
+}
+// Topological order of matching members by literal blocks edges (prerequisite before dependent), with the active sort
+// as the tie-break among ready peers. Excluded members are traversed as intermediate nodes so true ordering survives
+// filtering. Cycles fall back deterministically (lowest sort rank first) — no dropped or re-emitted members.
+function dependencyOrder(matchingMembers, allMembers, blocks, sort) {
+  const allIds = allMembers.map((t) => t.identifier);
+  const idSet = new Set(allIds);
+  const edges = blocks.filter((e) => idSet.has(e.source) && idSet.has(e.target));
+  const adj = {}; const indeg = {};
+  allIds.forEach((id) => { adj[id] = []; indeg[id] = 0; });
+  for (const e of edges) { adj[e.source].push(e.target); indeg[e.target]++; }
+  const byId = new Map(allMembers.map((t) => [t.identifier, t]));
+  const rank = new Map(sortSources(allMembers, sort).map((t, i) => [t.identifier, i]));
+  const matchingIds = new Set(matchingMembers.map((t) => t.identifier));
+  const remaining = new Set(allIds);
+  const deg = { ...indeg };
+  const ready = allIds.filter((id) => deg[id] === 0).sort((a, b) => (rank.get(a) ?? 0) - (rank.get(b) ?? 0));
+  const out = [];
+  while (remaining.size) {
+    let pick;
+    if (ready.length) pick = ready.shift();
+    else pick = [...remaining].sort((a, b) => (rank.get(a) ?? 0) - (rank.get(b) ?? 0))[0];
+    remaining.delete(pick);
+    if (matchingIds.has(pick)) out.push(byId.get(pick));
+    for (const m of adj[pick]) if (--deg[m] === 0) ready.push(m);
+    ready.sort((a, b) => (rank.get(a) ?? 0) - (rank.get(b) ?? 0));
+  }
   return out;
 }
 const BADGE = { amber: "warning", green: "success", blue: "secondary", gray: "outline", red: "destructive" };
@@ -313,28 +341,24 @@ function Preview({ md, err, busy }) {
 }
 
 // ---- grouped source browsing ----------------------------------------------------------------------------------
-// A group's one-line summary: title, type/reason, count (N matching / M in group when filtered), highest priority,
-// earliest real due date, execution-blocked / dependency-blocked / not-checked / outdated counts, and cross-assignee
-// / cross-repo labels. Context nodes are never counted as selectable work.
+// A group's one-line summary: actual title, a single type/reason, count (N matching / M in group when filtered),
+// highest priority, earliest real due date, readiness counts (not ready / linked prerequisite / dependency-blocked /
+// not checked / outdated), and cross-assignee / cross-repo labels. Context nodes are never counted as selectable work.
 function GroupSummary({ d }) {
-  const meta = GROUP_KIND[d.kind] || { label: String(d.g.kind || "Group"), reason: "unclassified" };
+  const meta = GROUP_KIND[d.kind] || { type: String(d.g.kind || "Group") };
   const n = d.matchingMembers.length, m = d.memberTickets.length;
   const [pLabel, pTone] = d.highestPriority;
   return (
     <div className="fx-group-summary">
       <div className="fx-group-head">
-        <span className="fx-k">{meta.label}</span>
         <span className="fx-ttitle clamp">{d.g.title || d.g.id || "Untitled group"}</span>
       </div>
       <div className="fx-group-meta">
-        <span className="fx-id">{d.g.id}</span>
-        <span className="fx-hint">{meta.reason}</span>
-        {meta.candidate ? <Tone tone="amber">candidate</Tone> : null}
-        {meta.organizational ? <Tone tone="gray">organizational</Tone> : null}
+        <span className="fx-k">{meta.type}</span>
         <Tone tone={pTone}>{pLabel}</Tone>
         {d.earliestDue ? <span className="fx-hint">due {d.earliestDue}</span> : null}
         <span className="fx-count">{n !== m ? `${n} matching / ${m} in group` : m}</span>
-        {d.blocked ? <Tone tone="red">{d.blocked} blocked</Tone> : null}
+        {d.notReady ? <Tone tone="red">{d.notReady} not ready</Tone> : null}
         {d.linkedPrereq ? <Tone tone="gray">{d.linkedPrereq} linked prerequisite</Tone> : null}
         {d.depBlocked ? <Tone tone="amber">{d.depBlocked} dependency-blocked</Tone> : null}
         {d.notChecked ? <Tone tone="gray">{d.notChecked} not checked</Tone> : null}
@@ -359,19 +383,34 @@ function EdgeLine({ e, nodeInfo, reasonOf }) {
     </>
   );
   const open = e.kind === "blocks" && isUnresolvedPrereq(nodeInfo(e.source));
+  const sep = e.kind === "related" ? "↔" : "→";
   return (
     <div className="fx-edge">
       <span className="fx-id">{e.kind}</span>
       {endpoint(s, e.source)}
-      <span className="fx-hint">→</span>
+      <span className="fx-hint">{sep}</span>
       {endpoint(t, e.target)}
       {open ? <Tone tone="amber">open prerequisite</Tone> : null}
     </div>
   );
 }
 
-// The group's typed recorded links as separate, labelled, readable sections (blocks/parent/related/duplicate). In DAG
-// mode the blocks section is visualised above (desktop only); these lists stay the accessible form everywhere.
+// A native collapsed <details> whose contents render lazily only while open — keeps a group's 100+ recorded edges and
+// context rows from being materialized until the operator asks for them.
+function FxDetails({ summary, children }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <details className="fx-edge-sec" open={open}
+             onToggle={(e) => { if (e.target !== e.currentTarget) return; setOpen(e.target.open); }}>
+      <summary>{summary}</summary>
+      {open ? children : null}
+    </details>
+  );
+}
+
+// The group's typed recorded links as separate, labelled, collapsed sections (blocks/parent/related/duplicate + any
+// unknown kinds). In DAG mode the blocks section is visualised above (desktop only); these lists stay the accessible
+// form everywhere.
 function EdgeSections({ d, nodeInfo, reasonOf }) {
   const sections = [
     ["blocks", "Dependency (blocks)", d.blocks],
@@ -385,16 +424,14 @@ function EdgeSections({ d, nodeInfo, reasonOf }) {
   return (
     <>
       {present.map(([k, label, es]) => (
-        <div className="fx-edge-sec" key={k}>
-          <div className="fx-k">{label} ({es.length})</div>
+        <FxDetails key={k} summary={<span className="fx-k">{label} ({es.length})</span>}>
           {es.map((e, i) => <EdgeLine key={`${k}-${e.source}-${e.target}-${i}`} e={e} nodeInfo={nodeInfo} reasonOf={reasonOf} />)}
-        </div>
+        </FxDetails>
       ))}
       {others.map((k) => (
-        <div className="fx-edge-sec" key={`other-${k}`}>
-          <div className="fx-k">{k} ({d.otherByKind[k].length})</div>
+        <FxDetails key={`other-${k}`} summary={<span className="fx-k">{k} ({d.otherByKind[k].length})</span>}>
           {d.otherByKind[k].map((e, i) => <EdgeLine key={`${k}-${e.source}-${e.target}-${i}`} e={e} nodeInfo={nodeInfo} reasonOf={reasonOf} />)}
-        </div>
+        </FxDetails>
       ))}
     </>
   );
@@ -417,8 +454,7 @@ function ReadOnlyContext({ d, nodeInfo, reasonOf }) {
   }
   if (!rows.length) return null;
   return (
-    <div className="fx-edge-sec">
-      <div className="fx-k">Linked context & excluded (read-only)</div>
+    <FxDetails summary={<span className="fx-k">Linked context & excluded (read-only) ({rows.length})</span>}>
       <div className="fx-ctx-list">
         {rows.map(({ id, n, reason }) => (
           <div className="fx-ctx-row" key={id}>
@@ -431,7 +467,7 @@ function ReadOnlyContext({ d, nodeInfo, reasonOf }) {
           </div>
         ))}
       </div>
-    </div>
+    </FxDetails>
   );
 }
 
@@ -817,14 +853,12 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   }, [groups]);
   const missingIds = useMemo(() => new Set(relationships?.missing || []), [relationships]);
   const pickedSet = useMemo(() => new Set(picked), [picked]);
-  // A display record: cached context metadata merged with the ticket, so context-only fields (state_type, project) are
-  // retained even when the ticket lacks them; non-null ticket fields win.
+  // A display record: cached context metadata merged under the ticket. Ticket fields (including authoritative nulls)
+  // win over context; context-only fields (state_type, project) survive when the ticket lacks them entirely.
   const nodeInfo = (id) => {
     const t = ticketById[id], c = contextById[id];
     if (!t && !c) return null;
-    const out = { ...(c || {}) };
-    if (t) for (const k in t) if (t[k] != null) out[k] = t[k];
-    return out;
+    return { ...(c || {}), ...(t || {}) };
   };
   const reasonOf = (id) => {
     const t = ticketById[id];
@@ -853,7 +887,6 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     const kind = groupKind(g);
     const memberTickets = (g.members || []).map((id) => ticketById[id]).filter(Boolean);
     const matchingMembers = memberTickets.filter(matches);
-    const orderedMembers = sortSources(matchingMembers, sort);
     const edges = g.edges || [];  // exact edge kinds preserved; only literal "blocks" is a dependency link
     const blocks = edges.filter((e) => e.kind === "blocks");
     const parentEdges = edges.filter((e) => e.kind === "parent");
@@ -861,11 +894,17 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     const duplicate = edges.filter((e) => e.kind === "duplicate");
     const otherByKind = {};
     for (const e of edges) if (!["blocks", "parent", "related", "duplicate"].includes(e.kind)) (otherByKind[e.kind] ||= []).push(e);
+    // Dependency chains keep the actual prerequisite order (topological by blocks edges, excluded members as transit
+    // nodes); every other group uses the active sort. Ready peers in a chain keep the active sort as their tie-break.
+    const orderedMembers = kind === "dependency"
+      ? dependencyOrder(matchingMembers, memberTickets, blocks, sort)
+      : sortSources(matchingMembers, sort);
     const mm = matchingMembers;
-    // Execution readiness straight from ticket.reason (see reasonState): blocked is independent of not-checked/outdated.
-    const notChecked = mm.filter((t) => reasonState(t) === "notchecked").length;
-    const outdated = mm.filter((t) => reasonState(t) === "outdated").length;
-    const blocked = mm.filter((t) => reasonState(t) === "blocked").length;
+    // Readiness: not-checked/outdated come from verdict/stale directly (validity, independent of reasonState); not-ready
+    // is the remaining readiness reason from ticket.reason (completed is not ready, never dependency-blocked).
+    const notChecked = mm.filter((t) => !t.verdict).length;
+    const outdated = mm.filter((t) => !!t.verdict && !!t.stale).length;
+    const notReady = mm.filter((t) => reasonState(t) === "notready").length;
     const highestPriority = priorityOf(mm.reduce((best, t) => Math.min(best, pRank(t.priority)), 5));
     const dueDates = mm.map((t) => (isDue(t.due_date) ? t.due_date : null)).filter(Boolean).sort();
     const earliestDue = dueDates[0] || null;
@@ -880,7 +919,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     const cycleIds = new Set(g.cycles || []);
     const hasBlockCycle = hasCycle(blocks);
     return { g, kind, memberTickets, matchingMembers, orderedMembers, edges, blocks, parentEdges, related, duplicate,
-             otherByKind, notChecked, outdated, blocked, linkedPrereq, depBlocked, highestPriority, earliestDue,
+             otherByKind, notChecked, outdated, notReady, linkedPrereq, depBlocked, highestPriority, earliestDue,
              assigneeCount, repoCount, excludedMembers, contextNodes, cycleIds, hasBlockCycle };
   });
 
