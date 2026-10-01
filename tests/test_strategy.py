@@ -143,6 +143,40 @@ class Briefs(unittest.TestCase):
         self.assertFalse(row["intent_ready"])
         self.assertIn("source changed since capture: FIN-1", row["blockers"])
 
+    def test_replacement_candidates_keep_only_remaining_eligible_sources(self):
+        self.cfg.raw["linear"]["team"]["TEAM"] = {"review_state": "Ready for QA"}
+        self.c.execute("INSERT INTO linear_snapshot VALUES ('fin-2','FIN-2',?,?,'completed',1,?)",
+                       ("2026-09-02T00:00:00Z", "2026-09-02T00:00:00Z",
+                        _raw(ident="FIN-2", state="Done")))
+        self.c.execute("INSERT INTO linear_snapshot VALUES ('fin-3','FIN-3',?,?,'started',1,?)",
+                       ("2026-09-02T00:00:00Z", "2026-09-02T00:00:00Z",
+                        _raw(ident="FIN-3", state="Ready for QA")))
+        b = strategy.create(self.cfg, self.c, ["FIN-1", "FIN-2", "FIN-3"], "user:cli", _body())
+        strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")
+
+        summary = next(x for x in strategy.overview(self.cfg, self.c)["briefs"] if x["id"] == b["id"])
+        self.assertEqual(summary["replacement"]["eligible"], ["FIN-1"])
+        self.assertEqual(summary["replacement"]["excluded"],
+                         [{"identifier": "FIN-2", "category": "completed", "reason": "source is completed"},
+                          {"identifier": "FIN-3", "category": "human-review",
+                           "reason": "waiting on human review (Ready for QA)"}])
+        self.assertEqual(summary["readiness_facts"]["sources"], summary["replacement"]["excluded"])
+
+    def test_replacement_candidates_report_all_ineligible(self):
+        for n, state_type in ((1, "completed"), (2, "canceled")):
+            ident = f"FIN-{n}"
+            stamp = f"2026-09-0{n + 1}T00:00:00Z"
+            self.c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,?,1,?)",
+                           (ident.lower(), ident, stamp, stamp, state_type,
+                            _raw(ident=ident, state=state_type)))
+        b = strategy.create(self.cfg, self.c, ["FIN-1", "FIN-2"], "user:cli", _body())
+        strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")
+
+        summary = next(x for x in strategy.overview(self.cfg, self.c)["briefs"] if x["id"] == b["id"])
+        self.assertEqual(summary["replacement"]["eligible"], [])
+        self.assertEqual([(x["identifier"], x["category"]) for x in summary["replacement"]["excluded"]],
+                         [("FIN-1", "completed"), ("FIN-2", "canceled")])
+
     def test_ready_excludes_consumed_brief(self):
         b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body())
         strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")

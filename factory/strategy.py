@@ -440,13 +440,14 @@ def overview(cfg: Config, conn) -> dict:
             blockers = item["blockers"]
             intent_ready = item["intent_ready"]
             deps = item["dependencies"]
+            facts, replacement = item["readiness_facts"], item["replacement"]
         elif row["state"] == "draft":
             readiness = "superseded" if row["id"] in children else "draft"
-            blockers, intent_ready, deps = [], False, []
+            blockers, intent_ready, deps, facts, replacement = [], False, [], None, None
         elif row["id"] in current:  # current published but already dispatched
-            readiness, blockers, intent_ready, deps = "dispatched", [], None, []
+            readiness, blockers, intent_ready, deps, facts, replacement = "dispatched", [], None, [], None, None
         else:  # historical published version superseded by a newer one
-            readiness, blockers, intent_ready, deps = "superseded", [], False, []
+            readiness, blockers, intent_ready, deps, facts, replacement = "superseded", [], False, [], None, None
         briefs.append({"id": row["id"], "revision": row["revision"], "parent_id": row["parent_id"],
                        "state": row["state"], "title": body["title"],
                        "sources": [s["identifier"] for s in sources],
@@ -455,6 +456,7 @@ def overview(cfg: Config, conn) -> dict:
                        "approved_at": row["approved_at"], "intent_ready": intent_ready,
                        "source_changed": changed, "verified": verified, "readiness": readiness,
                        "blockers": blockers, "dependencies": deps,
+                       "readiness_facts": facts, "replacement": replacement,
                        "dispatch": {"run_id": link["run_id"], "state": link["state"], "phase": link["phase"]}
                        if link else None})
     tickets = _ticket_list(cfg, conn)
@@ -706,38 +708,48 @@ def _dependency_status(conn, identifier: str) -> str:
     return "ready" if (v and v["kind"] == "already-done" and v["snapshot_updated_at"] == s["updated_at"]) else "unmet"
 
 
-def _source_safety(cfg: Config, conn, s: dict) -> str | None:
-    """DB-only source safeguards for an approved brief: completed, foreign domain, unmapped, no route, foreign
-    assignee, QA review. Backlog (owned, mapped, routed) is explicitly publishable and not blocked here."""
+def _source_safety(cfg: Config, conn, s: dict) -> dict | None:
+    """Structured DB-only source safeguard shared by readiness and replacement review.
+
+    These are current cached facts, not parsed refusal prose. Verification and brief-relative drift are separate:
+    either may be repaired by recapture/re-verification, while an ineligible current source must not be silently
+    carried into a replacement.
+    """
+    ident = s["identifier"]
     cur = conn.execute("SELECT * FROM linear_latest WHERE issue_id=?", (s["issue_id"],)).fetchone()
     if cur is None:
-        return None
+        return {"identifier": ident, "category": "source", "reason": "current source snapshot is missing"}
     raw = json.loads(cur["raw_json"])
-    if cur["state_type"] == "completed":
-        return f"source {s['identifier']} is completed"
-    ctx, _ = prune.map_context(cfg, cur)
+    if cur["state_type"] in ("completed", "canceled"):
+        return {"identifier": ident, "category": cur["state_type"],
+                "reason": f"source is {cur['state_type']}"}
+    review = {k: t.get("review_state") for k, t in cfg.linear.get("team", {}).items()}
+    if raw["state"]["name"] == review.get(raw["team"]["key"]):
+        return {"identifier": ident, "category": "human-review",
+                "reason": f"waiting on human review ({raw['state']['name']})"}
+    ctx, why = prune.map_context(cfg, cur)
     if ctx is None:
-        return f"source {s['identifier']} is unmapped (no bounded context)"
+        return {"identifier": ident, "category": "ownership", "reason": why or "unmapped (no bounded context)"}
     if not prune.owned(cfg, conn, cur):
-        return f"source {s['identifier']} is not owned (foreign domain)"
+        return {"identifier": ident, "category": "ownership", "reason": "not owned (foreign domain)"}
     if ctx.owner(prune.issue_fields(cur)[0]) is None:
-        return f"source {s['identifier']} has no factory-fleet owner (route)"
+        return {"identifier": ident, "category": "ownership", "reason": "no factory-fleet owner (route)"}
     lead = cfg.linear["lead"]
     assignee = (raw["assignee"] or {}).get("email")
     if assignee not in (None, lead):
-        return f"source {s['identifier']} is assigned to {assignee}"
-    review = {k: t.get("review_state") for k, t in cfg.linear.get("team", {}).items()}
-    if raw["state"]["name"] == review.get(raw["team"]["key"]):
-        return f"source {s['identifier']} is in QA review"
+        return {"identifier": ident, "category": "ownership", "reason": f"assigned to {assignee}"}
+    if conn.execute("SELECT 1 FROM dispatch_ticket t JOIN dispatch d USING (run_id) WHERE t.issue_id=? "
+                    "AND d.state <> 'archived'", (cur["issue_id"],)).fetchone():
+        return {"identifier": ident, "category": "source", "reason": "already in a live dispatch"}
     return None
 
 
 def ready(cfg: Config, conn) -> list[dict]:
-    """The current published (approved|held) unconsumed brief, one per lineage, with intent-ready vs verified-ready.
+    """The current published (approved|held) unconsumed brief, one per lineage, with structured cached readiness.
 
-    intent_ready = approved, not held, no source drift, dependencies met (the prune slice may now verify it).
+    intent_ready = approved, not held, no source drift, dependencies met, and every current source eligible.
     verified = every source has a current valid verdict bound to THIS version via brief_verdict.
-    ready = intent_ready AND verified (the stage slice may now stage it). Pure read: no mutation/network.
+    ready = intent_ready AND verified. Pure read: no mutation/network.
     """
     out = []
     for bid in _current_published(conn):
@@ -745,24 +757,40 @@ def ready(cfg: Config, conn) -> list[dict]:
         if conn.execute("SELECT 1 FROM dispatch WHERE brief_id=?", (bid,)).fetchone():
             continue  # consumed: a dispatch already pins this version
         b = _brief(conn, row)
-        intent_blockers, changed = [], []
+        source_facts, changed = [], []
         for s in b["sources"]:
+            if (fact := _source_safety(cfg, conn, s)):
+                source_facts.append(fact)
             if _source_changed(conn, s):
                 changed.append(s["identifier"])
-            elif (why := _source_safety(cfg, conn, s)):
-                intent_blockers.append(why)
+        deps = [{"identifier": d, "status": _dependency_status(conn, d)} for d in b["body"]["dependencies"]]
+        unmet = [d for d in deps if d["status"] != "ready"]
+        held = row["hold_reason"] or "no reason" if row["state"] == "held" else None
+        intent_blockers = [f"source {f['identifier']} {f['reason']}" for f in source_facts]
         if changed:
             intent_blockers.append(f"source changed since capture: {', '.join(changed)}")
-        deps = [{"identifier": d, "status": _dependency_status(conn, d)} for d in b["body"]["dependencies"]]
-        intent_blockers += [f"dependency {d['identifier']} is {d['status']}" for d in deps if d["status"] != "ready"]
-        if row["state"] == "held":
-            intent_blockers.append(f"held: {row['hold_reason'] or 'no reason'}")
+        intent_blockers += [f"dependency {d['identifier']} is {d['status']}" for d in unmet]
+        if held is not None:
+            intent_blockers.append(f"held: {held}")
         intent_ready = row["state"] == "approved" and not intent_blockers
         verified, verdicts, vblockers = _verdicts(conn, bid, b["sources"])
+        verification_pending = [
+            {"identifier": v["identifier"], "reason": v["why"] or "verification pending"}
+            for v in verdicts if not v["valid"]
+        ]
+        eligible_ids = [s["identifier"] for s in b["sources"]
+                        if not any(f["identifier"] == s["identifier"] for f in source_facts)]
+        facts = {"sources": source_facts,
+                 "drift": [{"identifier": ident, "reason": "changed since this brief was captured"}
+                           for ident in changed],
+                 "dependencies": unmet,
+                 "held": held,
+                 "verification": verification_pending}
         item = dict(b)
         item.update(ready=(intent_ready and verified), intent_ready=intent_ready, verified=verified,
                     blockers=intent_blockers + vblockers, source_changed=changed,
-                    dependencies=deps, verdicts=verdicts)
+                    dependencies=deps, verdicts=verdicts, readiness_facts=facts,
+                    replacement={"eligible": eligible_ids, "excluded": source_facts})
         out.append(item)
     return out
 
@@ -827,7 +855,7 @@ def _ticket_list(cfg: Config, conn) -> list[dict]:
         assignee = (raw["assignee"] or {}).get("email")
         owner = ctx.owner(prune.issue_fields(s)[0]) if ctx else None
         state_name = raw["state"]["name"]
-        reason = ("completed" if s["state_type"] == "completed"
+        reason = (s["state_type"] if s["state_type"] in ("completed", "canceled")
                   else "in QA review" if state_name == review.get(raw["team"]["key"])
                   else "in a live dispatch" if s["issue_id"] in live
                   else "unmapped" if ctx is None
