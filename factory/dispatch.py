@@ -346,6 +346,15 @@ def _dependency_status(conn, identifier: str) -> str:
     return strategy._dependency_status(conn, identifier)
 
 
+def _source_changed(conn, source: dict) -> bool:
+    """Source drift follows the authoritative Strategy rule (lazy import preserves the dispatch<->strategy cycle
+    design): the captured Linear timestamp AND — when the source carries a relationship capture — the relationships
+    semantic fingerprint / current completeness. An observed_at refresh alone is never drift, and a legacy source
+    without relationship capture keeps the timestamp-only rule."""
+    from . import strategy
+    return strategy._source_changed(conn, source)
+
+
 def _create_brief_draft(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool,
                         brief_id: int, brief: dict) -> dict:
     """Verify the brief's sources against the pinned capture (no Linear re-read), the exact-version verification
@@ -361,8 +370,8 @@ def _create_brief_draft(cfg: Config, conn, identifiers: list[str], actor: str, e
     rows, owners = [], set()
     for ident in identifiers:
         src = sources[ident]
-        s = prune.latest(conn, ident)
-        if s["updated_at"] != src.get("snapshot_updated_at"):
+        s = prune.latest(conn, ident)  # raises VerdictError when the source itself is missing
+        if _source_changed(conn, src):
             raise StageError(f"{ident} changed since the brief was captured; amend the brief before staging")
         if not prune.owned(cfg, conn, s):
             raise StageError(f"{ident}: not the factory's concern (its Domain project is not led by {cfg.linear['lead']})")
@@ -405,9 +414,7 @@ def _create_brief_draft(cfg: Config, conn, identifiers: list[str], actor: str, e
         if conn.execute("SELECT 1 FROM dispatch WHERE brief_id=?", (brief_id,)).fetchone():
             raise StageError(f"brief #{brief_id} was consumed while staging; nothing was written")
         for src in json.loads(row["sources_json"]):
-            cur = conn.execute("SELECT updated_at FROM linear_latest WHERE issue_id=?",
-                               (src["issue_id"],)).fetchone()
-            if cur is not None and cur["updated_at"] != src["snapshot_updated_at"]:
+            if _source_changed(conn, src):
                 raise StageError(f"{src['identifier']} changed while staging; nothing was written")
         for dep in json.loads(row["body_json"]).get("dependencies", []):
             if _dependency_status(conn, dep) != "ready":
@@ -777,9 +784,15 @@ def _tickets_for_render(cfg: Config, conn, run_id: str, check: bool) -> tuple[li
     """Ticket data as drafted (snapshot + verdict pinned in dispatch_ticket). A brief-backed dispatch uses the
     brief's compiled intent as the ticket description/title (never the raw Linear prose, which live source wording
     must not override); the pinned snapshot/verdict still supply url/repo/context/evidence. check=True refuses when
-    the ticket or its verdict moved during review: the reviewed plan would no longer match."""
+    the ticket or its verdict moved during review (or a brief source's relationship fingerprint drifted): the
+    reviewed plan would no longer match. check=False is the pinned historical render and never re-checks drift."""
     d = conn.execute("SELECT brief_id FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
     brief_id = d["brief_id"] if d else None
+    brief_sources = {}
+    if check and brief_id:
+        row = conn.execute("SELECT sources_json FROM work_brief WHERE id=?", (brief_id,)).fetchone()
+        if row is not None:
+            brief_sources = {s["identifier"]: s for s in json.loads(row["sources_json"])}
     tickets, bad = [], []
     for r in conn.execute("SELECT * FROM dispatch_ticket WHERE run_id=? ORDER BY rowid", (run_id,)).fetchall():
         s = conn.execute("SELECT * FROM linear_snapshot WHERE issue_id=? AND updated_at=?",
@@ -789,7 +802,9 @@ def _tickets_for_render(cfg: Config, conn, run_id: str, check: bool) -> tuple[li
         if check:
             latest = prune.latest(conn, r["identifier"])
             ctx, _ = prune.map_context(cfg, latest)
-            if v["superseded_at"] or prune.staleness(cfg, conn, latest, ctx):
+            src = brief_sources.get(r["identifier"])
+            if v["superseded_at"] or prune.staleness(cfg, conn, latest, ctx) \
+                    or (src is not None and _source_changed(conn, src)):
                 bad.append(r["identifier"])
         t = {"identifier": r["identifier"], "issue_id": r["issue_id"], "title": raw["title"],
              "url": raw["url"], "state": raw["state"]["name"],

@@ -195,6 +195,75 @@ class StageBrief(unittest.TestCase):
             dispatch.stage(self.cfg, self.c, ["FIN-1"], "user")
 
 
+class RelationshipDrift(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tmp = Path(tmp.name)
+        self.c = db.connect(tmp / "t.db")
+        self.addCleanup(self.c.close)
+        _helpers.seed_project(self.c)
+        _helpers.seed_trunk(self.c)
+        _helpers.seed_snapshot(self.c, "i1", "FIN-1")
+        self.verdict = _helpers.seed_verdict(self.c, "i1")
+        self.cfg = _helpers.mkcfg(tmp)
+        self.graph = {"complete": True, "observed_at": SNAP, "edges": [], "nodes": [], "fingerprint": "fp-1"}
+        patch = mock.patch("factory.relationships.snapshot", side_effect=lambda *_: dict(self.graph))
+        self.snapshot = patch.start()
+        self.addCleanup(patch.stop)
+
+    def publish(self):
+        brief = _helpers.publish_brief(self.cfg, self.c, ["FIN-1"])
+        _helpers.associate(self.c, brief["id"], "i1", self.verdict)
+        return brief
+
+    def test_observation_refresh_stages_but_semantic_change_refuses(self):
+        brief = self.publish()
+        self.graph["observed_at"] = "2026-09-03T00:00:00Z"
+        run = dispatch.stage_brief(self.cfg, self.c, brief["id"], "user")["run_id"]
+        pinned = dispatch._tickets_for_render(self.cfg, self.c, run, check=False)
+        self.graph["fingerprint"] = "fp-2"
+        with self.assertRaisesRegex(dispatch.StageError, "changed since the draft"):
+            dispatch.approve(self.cfg, self.c, run, "user")
+        self.assertEqual(self.c.execute("SELECT state FROM dispatch WHERE run_id=?", (run,)).fetchone()[0], "draft")
+        self.assertFalse((self.cfg.dispatches / run / "dispatch.md").exists())
+        self.assertEqual(dispatch._tickets_for_render(self.cfg, self.c, run, check=False), pinned)
+
+    def test_relation_change_and_lost_completeness_refuse_stage(self):
+        brief = self.publish()
+        for update in ({"fingerprint": "fp-2"}, {"fingerprint": "fp-1", "complete": False}):
+            with self.subTest(update=update):
+                self.graph.update(update)
+                with self.assertRaisesRegex(dispatch.StageError, "changed since the brief was captured"):
+                    dispatch.stage_brief(self.cfg, self.c, brief["id"], "user")
+                self.assertEqual(self.c.execute("SELECT count(*) FROM dispatch").fetchone()[0], 0)
+
+    def test_relation_change_refuses_handoff_without_changing_frozen_file(self):
+        run = dispatch.stage_brief(self.cfg, self.c, self.publish()["id"], "user")["run_id"]
+        # File immutability is covered by dispatch tests; avoid OS-specific flags in this drift regression.
+        with mock.patch.object(dispatch.os, "chflags", create=True):
+            dispatch.approve(self.cfg, self.c, run, "user")
+        path = self.cfg.dispatches / run / "dispatch.md"
+        frozen = path.read_bytes()
+        self.graph["fingerprint"] = "fp-2"
+        with mock.patch.object(dispatch.repos, "sync_all"), \
+                mock.patch.object(dispatch, "_target") as target, \
+                mock.patch.object(dispatch, "_send") as send, \
+                self.assertRaisesRegex(dispatch.StageError, "changed since the draft"):
+            dispatch.handoff(self.cfg, self.c, run)
+        target.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(path.read_bytes(), frozen)
+        self.assertEqual(self.c.execute("SELECT state FROM dispatch WHERE run_id=?", (run,)).fetchone()[0], "staged")
+
+    def test_transaction_revalidates_relationship_drift(self):
+        brief = self.publish()
+        self.snapshot.side_effect = [dict(self.graph), dict(self.graph, fingerprint="fp-2")]
+        with self.assertRaisesRegex(dispatch.StageError, "changed while staging"):
+            dispatch._create_brief_draft(self.cfg, self.c, ["FIN-1"], "user", False, brief["id"], brief)
+        self.assertEqual(self.c.execute("SELECT count(*) FROM dispatch").fetchone()[0], 0)
+
+
 class Propose(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
