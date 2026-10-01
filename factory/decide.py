@@ -630,8 +630,9 @@ def notify(cfg, conn, swept: list | None = None, now: datetime | None = None, *,
             push += ["Factory · needs you now", *(_line(conn, d, None, now) for d in urgent),
                      f'Reply "ok" to take ★, or "#{urgent[0]["id"]} <option>". {url}'.rstrip()]
             pushed_ids += [d["id"] for d in urgent]
-        # A factory draft's review goes out once its plan is written, not at the next digest: only one dispatch runs
-        # at a time, so a review waiting overnight idles the factory. Not counted against interrupts_per_day.
+        # A factory draft's review goes out once its plan is written, not at the next digest: a draft cannot enter
+        # queued preparation or execution until its review is decided, so it should not wait for a digest slot.
+        # Not counted against interrupts_per_day.
         ready = [d for d in rows(conn) if d["kind"] == "review" and not d["notified_at"]
                  and d["id"] not in prepared and _silent(conn, d)]
         if ready:

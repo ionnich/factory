@@ -259,6 +259,13 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
   `FACTORY_PRIMARY_THINKING`); set `FACTORY_PRIMARY_MODEL` to override the default.
 - The cron agent jobs (planner/prune/reconcile) are created by `install.sh` with
   `--provider "${FACTORY_PROVIDER:-deepseek}" --model "${FACTORY_MODEL:-deepseek-v4-pro}"`.
+- Crews and secondmates are spawned by the firstmate toolchain's `bin/fm-spawn.sh` (in each
+  `~/.local/share/factory-fleet/homes/*` home, not this repo), which takes concrete `--harness`/`--model`/`--effort`
+  axes and never parses natural-language rules. The default crew coder model is pinned in the home's
+  `config/crew-dispatch.json` (`"default": {"harness": "omp", "model": "deepseek/deepseek-v4-flash", "effort":
+  "high"}`). Resolution order: a per-task/captain `--model <provider>/<id>` wins, then the `crew-dispatch.json`
+  profile, then `model=default` (the worker `omp` home default). The model is passed to `omp --model <provider>/<id>`;
+  `fm-spawn.sh` validates it against `omp models --json` and refuses one not listed for its provider.
 - Prose never selects a model. This implementation's code is DeepSeek; no credentials or providers are changed here.
 
 ## Invariants (in code: `factory/schema.sql` triggers + CLI checks)

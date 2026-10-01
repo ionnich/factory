@@ -1,6 +1,8 @@
 """`factory` tool for the Hermes `factory` chat profile. The only surface that agent gets.
 
-Reads are free. `stage` makes a draft dispatch (a planner adds a plan and a review decision; nothing runs yet).
+Reads are free. Strategy `list`/`show` read briefs; `groom` (DeepSeek draft) and `amend` (a new draft version)
+stay unpublished. `publish` (approve intent) and `hold` are gated through Hermes's approval prompt (once per
+call) and act as the human; `stage` passes an approved brief only and never bypasses brief approval.
 `note` only touches drafts. `decide` answers a decision (every choice the factory needs from the user: review a
 draft, a planner or executor question, a blocked ticket, a stuck executor, a held Linear write); `ok` takes the
 recommendation on several (the user's "ok" to a digest). Choices that start or stop real work, write Linear or
@@ -22,7 +24,12 @@ SCHEMA = {
     "description": (
         "Operate the software factory. Actions: status [run_id] (overview or one dispatch); tickets (owned tickets "
         "with verdicts); candidates (what can be staged, and why the rest cannot); ticket <identifier>; "
-        "stage <identifiers> (a cohort of related tickets, up to 8, into a draft dispatch; a planner adds a plan; nothing runs yet); "
+        "list (Strategy briefs and their state/readiness); show <brief_id> (one brief's body, sources and "
+        "provenance); groom <identifiers> (DeepSeek drafts a brief from those tickets; a draft only, never "
+        "published); amend <brief_id> (draft a new brief version from a body JSON and a reason; never overwrites "
+        "the approved version); publish <brief_id> (approve a brief's intent; the human confirms — it does not "
+        "approve execution); hold <brief_id> (mark a brief held, with a reason); "
+        "stage <brief_id> (stage an approved Strategy brief into a draft dispatch; a planner adds a plan; nothing runs yet); "
         "draft <run_id> (one dispatch: review state, plan tree with node ids, steps, dependencies, notes, its "
         "decisions and Linear writes); note <run_id> <node> <body> (add the user's note to a draft; node ids look "
         "like `root` (whole dispatch), `FIN-3788` (a ticket), `FIN-3788/2` (a step); the executor reads it "
@@ -36,11 +43,13 @@ SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["status", "tickets", "candidates", "ticket", "stage", "draft",
-                                                  "note", "decisions", "decide", "resend", "ok", "followup"]},
+            "action": {"type": "string", "enum": ["status", "tickets", "candidates", "ticket", "list", "show",
+                                                  "groom", "amend", "publish", "hold", "stage", "draft", "note",
+                                                  "decisions", "decide", "resend", "ok", "followup"]},
             "run_id": {"type": "string", "description": "dispatch run id for status/draft/note/decisions"},
+            "brief_id": {"type": "integer", "description": "Strategy brief version id for show/amend/publish/hold/stage"},
             "identifier": {"type": "string", "description": "ticket id for `ticket`, e.g. FIN-3481"},
-            "identifiers": {"type": "array", "items": {"type": "string"}, "description": "tickets for `stage`"},
+            "identifiers": {"type": "array", "items": {"type": "string"}, "description": "ticket ids for `groom`"},
             "node": {"type": "string", "description": "plan node id for `note`, from the `draft` tree: `root` (whole "
                                                      "dispatch), `FIN-3788` (a ticket), `FIN-3788/2` or `FIN-3788/2.1` (a step)"},
             "decision_id": {"type": "integer", "description": "decision id for `decide` or `resend`"},
@@ -48,8 +57,10 @@ SCHEMA = {
                              "description": "for `ok`: the #ids of the digest or push the user said ok to"},
             "option": {"type": "string", "description": "the option id the user chose, for `decide`"},
             "note": {"type": "string", "description": "text the chosen option asks for (a reason, guidance)"},
+            "reason": {"type": "string", "description": "amendment reason for `amend`; hold reason for `hold`"},
             "title": {"type": "string", "description": "new ticket title, for `followup`"},
-            "body": {"type": "string", "description": "note text for `note`; new ticket body (markdown) for `followup`"},
+            "body": {"type": "string", "description": "note text for `note`; new ticket body (markdown) for `followup`; "
+                                                     "JSON brief body for `amend`"},
             "repo": {"type": "string", "description": "optional repo the new ticket maps to, for `followup`"},
         },
         "required": ["action"],
@@ -101,9 +112,45 @@ def handle(params: dict, **_) -> str:
     if action in READS:
         arg = params.get("identifier") if action == "ticket" else run_id if action == "status" else None
         return _run(action, *([arg] if arg else []))
-    if action == "stage":
+    if action == "list":
+        return _run("strategy", "list")
+    if action == "show":
+        bid = params.get("brief_id")
+        return _run("strategy", "show", str(bid)) if bid else '{"ok": false, "error": "brief_id required"}'
+    if action == "groom":
         ids = [i.strip().upper() for i in params.get("identifiers") or [] if i.strip()]
-        return _run("stage", *ids, "--actor", "agent:factory-chat") if ids else '{"ok": false, "error": "no identifiers"}'
+        if not ids:
+            return '{"ok": false, "error": "no identifiers to groom"}'
+        return _run("strategy", "groom", *ids, "--actor", "agent:factory-chat")
+    if action == "amend":
+        bid = params.get("brief_id")
+        body = (params.get("body") or "").strip()
+        reason = (params.get("reason") or "").strip()
+        if not (bid and body and reason):
+            return '{"ok": false, "error": "brief_id, body and reason required"}'
+        return _run("strategy", "revise", str(bid), "--body", body, "--reason", reason, "--actor", "agent:factory-chat")
+    if action == "publish":
+        bid = params.get("brief_id")
+        if not bid:
+            return '{"ok": false, "error": "brief_id required"}'
+        command = f"factory strategy approve {bid}"
+        why = _approve(command, f"Publish brief {bid}: approve its intent for verification and planning. "
+                                "It does not approve execution, answer questions, or mutate Linear.")
+        return _refused(why, command) if why else _run("strategy", "approve", str(bid), "--actor", "user:factory-chat")
+    if action == "hold":
+        bid = params.get("brief_id")
+        reason = (params.get("reason") or "").strip()
+        if not (bid and reason):
+            return '{"ok": false, "error": "brief_id and reason required"}'
+        command = f"factory strategy hold {bid}"
+        why = _approve(command, f"Hold brief {bid}: {reason}")
+        return _refused(why, command) if why else _run("strategy", "hold", str(bid), "--reason", reason,
+                                                       "--actor", "user:factory-chat")
+    if action == "stage":
+        bid = params.get("brief_id")
+        if not bid:
+            return '{"ok": false, "error": "brief_id required (stage only an approved brief)"}'
+        return _run("stage", "--brief", str(bid), "--actor", "agent:factory-chat")
     if action == "decisions":
         return _run("decide", "list", *([run_id, "--all"] if run_id else []))
     if action == "decide":

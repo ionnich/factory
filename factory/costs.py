@@ -93,10 +93,13 @@ def sync(conn, home: Path, sessions: Path = OMP_SESSIONS) -> int:
             rows.append((key, stage if r else "other", run, started, mtime, inp, out, cached, usd))
     with db.tx(conn):
         conn.executemany("INSERT OR REPLACE INTO cost_session VALUES (?,?,?,?,?,?,?,?,?)", rows)
-        # Execution sessions that name no dispatch belong to the one executing when they started.
+        # Execution sessions that name no dispatch are attributed only when exactly one dispatch overlaps the
+        # session's window. Under bounded parallel execution several can overlap; leave the run_id NULL rather than
+        # fabricate an attribution onto the latest one (the stage spend stays visible in by_stage/per_week).
         conn.execute("""UPDATE cost_session SET run_id = (
-            SELECT d.run_id FROM dispatch d WHERE d.executing_at IS NOT NULL AND d.executing_at <= cost_session.started_at
-              AND coalesce(d.done_at, '9999') >= cost_session.started_at ORDER BY d.executing_at DESC LIMIT 1)
+            SELECT CASE WHEN count(*) = 1 THEN min(d.run_id) END FROM dispatch d
+              WHERE d.executing_at IS NOT NULL AND d.executing_at <= cost_session.started_at
+                AND coalesce(d.done_at, '9999') >= cost_session.started_at)
             WHERE run_id IS NULL AND stage IN ('captain', 'secondmate', 'crew')""")
     return len(rows)
 
