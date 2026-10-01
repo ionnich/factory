@@ -68,8 +68,8 @@ SCHEMA = {
 }
 
 
-def _run(*args: str) -> str:
-    r = subprocess.run([FACTORY, *args], capture_output=True, text=True, timeout=600, env=ENV)
+def _run(*args: str, timeout: int = 600) -> str:
+    r = subprocess.run([FACTORY, *args], capture_output=True, text=True, timeout=timeout, env=ENV)
     if r.returncode:
         return json.dumps({"ok": False, "exit": r.returncode, "error": (r.stderr or r.stdout).strip()[-1500:]})
     return r.stdout[-60000:]
@@ -121,7 +121,9 @@ def handle(params: dict, **_) -> str:
         ids = [i.strip().upper() for i in params.get("identifiers") or [] if i.strip()]
         if not ids:
             return '{"ok": false, "error": "no identifiers to groom"}'
-        return _run("strategy", "groom", *ids, "--actor", "agent:factory-chat")
+        # The strategy groom model call is bounded to 600 s inside the CLI; give the subprocess 660 s so the
+        # adapter's own deadline never kills the CLI before its child omp process can clean up.
+        return _run("strategy", "groom", *ids, "--actor", "agent:factory-chat", timeout=660)
     if action == "amend":
         bid = params.get("brief_id")
         body = (params.get("body") or "").strip()
