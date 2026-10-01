@@ -20,7 +20,7 @@ import { Learnings } from "./learn.jsx";
 import { Plan, Quick } from "./plan.jsx";
 import { Jev } from "./jev.jsx";
 import { TicketsTab } from "./tickets.jsx";
-import { StrategyTab } from "./strategy.jsx";
+import { StrategyTab, bumpNavToken } from "./strategy.jsx";
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect, useCallback, useRef, useMemo } = SDK.hooks;
@@ -867,6 +867,7 @@ function FactoryPage() {
       if (l.stage === "strategy") setStrat((s) => ({ ...s, open: l.brief }));
       setLoc(l);
       setNav((n) => n + 1);
+      bumpNavToken();  // a synchronous generation so a late Strategy reply sees this move
       after.current = { scroll: history.state?.fx?.scroll ?? mem.current[l.stage]?.scroll ?? 0 };
     };
     addEventListener("popstate", pop);
@@ -939,6 +940,7 @@ function FactoryPage() {
     if (to.sources) setStrategy((s) => ({ ...s, picked: to.sources, q: "" }));  // a Draft handoff pre-selects sources
     setLoc(next);
     setNav((n) => n + 1);
+    bumpNavToken();  // a synchronous generation so a late Strategy reply sees this move
     after.current = jump ? { focus: true, scroll: same ? null : 0 } : same ? null : { scroll: mem.current[to.stage]?.scroll || 0 };
   };
   const jumpTo = (t) => {  // a Needs you line; the Linear answers line opens Verify on that filter

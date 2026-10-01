@@ -703,7 +703,7 @@ def main(argv=None):
     s.add_argument("run_id")
     s.add_argument("--confirm-unsent", action="store_true", help="a human attests the send never landed (no auto replay)")
     s.add_argument("--reason", required=True, help="why the send is known unsent")
-    s.add_argument("--actor", default="user")
+    s.add_argument("--actor", default="user:cli")  # release_unsent requires a human user:... actor
     s.set_defaults(fn=cmd_recover_launch)
     s = sub.add_parser("propose", help="cron: draft the top `auto` candidate, hand off approved dispatches, take ★ on "
                                         "decisions whose time came, and tell the user (push / digest)")
