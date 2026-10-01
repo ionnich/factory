@@ -256,8 +256,9 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
   re-verifies the pane idle and the supervising home idle before deleting. Never an automatic re-send or
   re-release; a fallback captain cannot reset busy work, and reservations are never TTL-stolen from a live or
   unknown executor.
-- **Legacy & migration:** the v20 → v21 migration keeps every operator answer and the historical record (it runs
-  against the automatic `factory-pre-v21.db` backup and integrity-checks). Historical legacy dispatches — draft,
+- **Legacy & migration:** the v20 → v21 migration first writes the automatic, integrity-checked
+  `factory-pre-v21.db` backup as a pre-migration safeguard, then applies the migration and keeps every operator
+  answer and the historical record. Historical legacy dispatches — draft,
   staged, executing, done, reconciled — stay NULL-brief and receive a conservative `global:*` claim held until
   archive, so a legacy executing dispatch still bootstraps its reservation even at `max_parallel = 1` (its own
   backfilled `global:*` claim does not conflict with itself) while a NEW staged dispatch is refused by the same
@@ -265,11 +266,12 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
   bypass: new dispatches require an approved brief. Execution does not trigger a fresh Linear fetch solely to
   reconstruct a narrative.
 
-Exercised (behavioral smoke, not a full-suite claim): real DeepSeek grooming from cached Backlog intake; immutable
-published versions with a stable version URL and full amendment history; intent-only publish; refusal to publish a
-source-drifted draft and to stage a brief with an unmapped source; hold/unhold as explicit readiness changes; the
-chat `list` folding a full overview (briefs plus the whole source list) into a compact, valid briefs+scheduler
-summary; and a refused `hold` paste command carrying its shell-quoted reason.
+Exercised (behavioral smoke, not a full-suite claim): real DeepSeek grooming of a source; cached source intake
+that includes Backlog; immutable published versions with a stable version URL and full amendment history;
+intent-only publish; refusal to publish a stale/superseded version (409) and to stage a brief with an unmapped
+source; hold/unhold as explicit readiness changes; the chat `list` folding a full overview (briefs plus the whole
+source list) into a compact, valid briefs+scheduler summary; and a refused `hold` paste command carrying its
+shell-quoted reason.
 
 ## Runtime coder model selector
 
