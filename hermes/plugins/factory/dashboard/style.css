@@ -1,29 +1,29 @@
 /* Factory dashboard skin. Every selector stays under `.fx`; host fonts and theme colors remain authoritative.
-   Lavender marks selection and primary action, aqua/violet separate structure, amber asks for attention, red is error.
+   The host's primary token drives actions; its ring/accent token marks selection. Semantic status tokens stay distinct.
    Surfaces are flat and theme-relative so the same hierarchy works in both the host's dark and light modes. */
 .fx {
   --fx-canvas: var(--background-base, #282828);
-  --fx-fg: var(--theme-terminal-foreground, var(--midground-base, #ebdbb2));
+  --fx-fg: var(--color-card-foreground, var(--theme-terminal-foreground, var(--midground-base, #ebdbb2)));
   --fx-panel: var(--color-card, color-mix(in srgb, var(--midground-base, #ebdbb2) 5%, var(--background-base, #282828)));
   --fx-panel-2: var(--color-popover, var(--fx-panel));
-  --fx-muted: color-mix(in srgb, var(--fx-fg) 78%, var(--fx-canvas));
+  --fx-muted: var(--color-muted-foreground, color-mix(in srgb, var(--fx-fg) 78%, var(--fx-canvas)));
   --fx-dim: var(--fx-muted);
-  --fx-disabled: var(--fx-muted);
+  --fx-disabled: color-mix(in srgb, var(--fx-muted) 72%, var(--fx-canvas));
   --fx-ink: #161616;
   --fx-border: var(--color-border, color-mix(in srgb, var(--midground-base, #ebdbb2) 18%, transparent));
   --fx-line: color-mix(in srgb, var(--fx-border) 68%, transparent);
-  --fx-fill: color-mix(in srgb, var(--midground-base, #ebdbb2) 7%, transparent);
+  --fx-fill: var(--color-muted, color-mix(in srgb, var(--midground-base, #ebdbb2) 7%, transparent));
   --fx-inset: color-mix(in srgb, var(--fx-panel) 72%, var(--fx-canvas));
-  --a: color-mix(in srgb, var(--fx-amber, var(--color-warning, #f59e0b)) 50%, var(--fx-fg));
-  --g: color-mix(in srgb, var(--fx-green, var(--color-success, #10b981)) 50%, var(--fx-fg));
+  --a: color-mix(in srgb, var(--fx-amber, var(--color-warning, #f59e0b)) 68%, var(--fx-fg));
+  --g: color-mix(in srgb, var(--fx-green, var(--color-success, #10b981)) 72%, var(--fx-fg));
   --b: var(--fx-blue, var(--color-ring, #a78bfa));
-  --r: color-mix(in srgb, var(--fx-red, var(--color-destructive, #ef4444)) 60%, var(--fx-fg));
+  --r: color-mix(in srgb, var(--fx-red, var(--color-destructive, #ef4444)) 76%, var(--fx-fg));
   --n: var(--fx-gray, #8b8b8b);
   --e: var(--fx-edge, var(--color-border, #504945));
-  --fx-lavender: color-mix(in srgb, var(--b) 74%, #c4b5fd);
+  --fx-lavender: var(--b);
   --fx-aqua: color-mix(in srgb, var(--g) 55%, var(--b));
-  --fx-primary: color-mix(in srgb, var(--fx-lavender) 82%, var(--fx-panel));
-  --fx-primary-ink: var(--fx-ink);
+  --fx-primary: var(--color-primary, color-mix(in srgb, var(--fx-lavender) 82%, var(--fx-panel)));
+  --fx-primary-ink: var(--color-primary-foreground, var(--fx-ink));
   --fx-raised: 0 1px 2px color-mix(in srgb, #000 18%, transparent);
   --fx-pressed: none;
   --fx-r-sm: 6px; --fx-r: 8px; --fx-r-lg: 10px; --fx-r-xl: 12px; --fx-r-full: 999px;
@@ -53,8 +53,8 @@
 .fx-k { color: var(--fx-dim); font-size: .72rem; text-transform: uppercase; letter-spacing: .075em; }
 .fx-err { color: var(--r); font-size: .875rem; line-height: 1.45; }
 .fx-empty { color: var(--fx-muted); font-size: .9rem; padding: .9rem .25rem; }
-.fx-title { font-family: Georgia, "Times New Roman", serif; font-size: 1.45rem; font-weight: 600; line-height: 1.18; letter-spacing: -.015em; overflow-wrap: anywhere; }
-.fx-title.small { font-family: inherit; font-size: .95rem; font-weight: 600; line-height: 1.35; }
+.fx-title { font-family: var(--theme-font-display, Georgia, "Times New Roman", serif); font-size: 1.45rem; font-weight: 600; line-height: 1.18; letter-spacing: -.015em; overflow-wrap: anywhere; }
+.fx-title.small { font-family: var(--theme-font-sans, inherit); font-size: .95rem; font-weight: 600; line-height: 1.35; }
 .fx-id { font-family: var(--font-mono, ui-monospace, monospace); font-size: .74rem; color: var(--fx-muted);
          border: 1px solid var(--fx-line); border-radius: var(--fx-r-sm); padding: 0 .35rem; white-space: nowrap; }
 .fx-link { color: inherit; text-decoration: underline; text-underline-offset: 2px; font-size: .84rem; overflow-wrap: anywhere; }
@@ -75,7 +75,7 @@
   border-color: color-mix(in srgb, var(--fx-lavender) 72%, var(--fx-border));
   color: var(--fx-primary-ink);
 }
-.fx button.bg-midground:hover:not(:disabled) { background-color: color-mix(in srgb, var(--fx-lavender) 90%, var(--fx-panel)); }
+.fx button.bg-midground:hover:not(:disabled) { background-color: color-mix(in srgb, var(--fx-primary) 88%, var(--fx-fg)); }
 .fx button:disabled { box-shadow: none; cursor: not-allowed; }
 .fx button:active { filter: none; }
 .fx .arc-border { display: none; }
@@ -190,7 +190,7 @@
 }
 .fx-workspace-heading { display: block; }
 .fx-workspace-heading h1, .fx-strategy-heading h2 {
-  margin: 0; font-family: Georgia, "Times New Roman", serif; font-size: clamp(22px, 3vw, 26px);
+  margin: 0; font-family: var(--theme-font-display, Georgia, "Times New Roman", serif); font-size: clamp(22px, 3vw, 26px);
   font-weight: 600; line-height: 1.15; letter-spacing: -.02em;
 }
 .fx-workspaces, .fx-lifecycle {
@@ -482,7 +482,7 @@ ul.fx-ev { margin: 0 0 0 1rem; font-size: .78rem; color: var(--fx-muted); overfl
 .fx-brief-fields { display: grid; gap: .8rem; min-width: 0; }
 .fx-brief-section { display: grid; gap: .65rem; padding: .85rem 0; border-top: 1px solid var(--fx-line); min-width: 0; }
 .fx-brief-section > :is(h2, h3, .fx-title):first-child {
-  margin: 0; font-family: Georgia, "Times New Roman", serif; font-size: 1.2rem; line-height: 1.25;
+  margin: 0; font-family: var(--theme-font-display, Georgia, "Times New Roman", serif); font-size: 1.2rem; line-height: 1.25;
 }
 .fx-src { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; }
 .fx-src li { padding: .55rem .25rem; border: 0; border-bottom: 1px solid var(--fx-line); border-radius: 0; background: transparent; }

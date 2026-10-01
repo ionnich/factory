@@ -1,0 +1,69 @@
+name: wispr-flow
+label: Wispr Flow
+description: Warm editorial cream with forest structure and lavender accents
+
+palette:
+  background:
+    hex: "#FFFFEB"
+    alpha: 1.0
+  midground:
+    hex: "#1A1A1A"
+    alpha: 1.0
+  foreground:
+    hex: "#F0D7FF"
+    alpha: 0.38
+  warmGlow: "rgba(255, 169, 70, 0.16)"
+  noiseOpacity: 0.18
+
+typography:
+  fontSans: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+  fontMono: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+  fontDisplay: "Georgia, 'Times New Roman', serif"
+  baseSize: "15px"
+  lineHeight: "1.55"
+  letterSpacing: "-0.005em"
+
+layout:
+  radius: "0.75rem"
+  density: comfortable
+
+layoutVariant: standard
+
+colorOverrides:
+  card: "#FFFEF2"
+  cardForeground: "#1A1A1A"
+  popover: "#FFFEF2"
+  popoverForeground: "#1A1A1A"
+  primary: "#034F46"
+  primaryForeground: "#FFFFEB"
+  secondary: "#F0D7FF"
+  secondaryForeground: "#1A1A1A"
+  muted: "#F1ECD9"
+  mutedForeground: "#5E5A4D"
+  accent: "#E4C1F9"
+  accentForeground: "#1A1A1A"
+  destructive: "#7F1C34"
+  destructiveForeground: "#FFFFEB"
+  success: "#036B4F"
+  warning: "#8A4A00"
+  border: "#AAA58E"
+  input: "#8F8A76"
+  ring: "#7232A6"
+
+componentStyles:
+  card:
+    boxShadow: "0 1px 2px rgba(26, 26, 26, 0.08)"
+  header:
+    background: "rgba(255, 255, 235, 0.94)"
+  footer:
+    background: "rgba(255, 255, 235, 0.96)"
+
+terminalBackground: "#FFFFEB"
+terminalForeground: "#1A1A1A"
+
+customCSS: |
+  /* Current dashboard YAML normalization omits terminal colors. Keep Factory readable
+     until the host forwards terminalForeground from user themes. */
+  .fx {
+    --theme-terminal-foreground: #1A1A1A;
+  }
