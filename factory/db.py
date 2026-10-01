@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -626,6 +626,14 @@ BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;""",
   due_date TEXT,
   PRIMARY KEY (issue_id, snapshot_updated_at),
   FOREIGN KEY (issue_id, snapshot_updated_at) REFERENCES linear_snapshot(issue_id, updated_at));""",
+    # v23: explicit Linear relationship snapshots, one complete row per owned source. Absence
+    # means unknown (never fetched); a known-empty graph is a row with edges_json='[]'.
+    23: """CREATE TABLE linear_relationship (
+  identifier  TEXT PRIMARY KEY,
+  observed_at TEXT NOT NULL,
+  edges_json  TEXT NOT NULL CHECK (json_valid(edges_json) AND json_type(edges_json) = 'array'),
+  nodes_json  TEXT NOT NULL CHECK (json_valid(nodes_json) AND json_type(nodes_json) = 'array'),
+  fingerprint TEXT NOT NULL CHECK (length(fingerprint) > 0));""",
 }
 
 

@@ -86,6 +86,15 @@ class Ingest(unittest.TestCase):
     def cfg(self):
         return SimpleNamespace(linear={"lead": "lead@x", "teams": ["FIN"], "team": {}})
 
+    def setUp(self):
+        # These due-sidecar fixtures intentionally lack an owned-project cache, so the real
+        # relationship refresh refuses to run. Mock the independent relationship boundary
+        # so the tests stay network-free.
+        self.refresh = mock.patch("factory.relationships.refresh",
+                                  return_value={"sources": 0, "replaced": 0, "removed": 0})
+        self.refresh.start()
+        self.addCleanup(self.refresh.stop)
+
     def issue(self, ident="FIN-1", issue_id="i1", updated=T0, due="2026-10-15"):
         return {"id": issue_id, "identifier": ident, "updatedAt": updated,
                 "state": {"name": "Todo", "type": "unstarted"}, "team": {"key": "FIN"},
