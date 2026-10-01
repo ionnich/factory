@@ -200,14 +200,27 @@ def _scaffold_body(sources: list[dict]) -> dict:
 
 
 # --------------------------------------------------------------------------- dependency cycles
-def _dep_cycles(conn, own_ids: set[str], deps: list[str], exclude_id: int | None) -> bool:
-    """True when dependencies form a cycle across briefs: edge A -> B when A depends on a source B owns. Only
-    recorded completed/accepted facts count, but a cycle is rejected regardless of completion."""
-    rows = conn.execute("SELECT id, sources_json, body_json FROM work_brief").fetchall()
-    if exclude_id is not None:
-        rows = [r for r in rows if r["id"] != exclude_id]
-    own = {r["id"]: {s["identifier"] for s in json.loads(r["sources_json"])} for r in rows}
-    dep = {r["id"]: set(json.loads(r["body_json"]).get("dependencies") or []) for r in rows}
+def _dep_cycles(conn, own_ids: set[str], deps: list[str], lineage_id: int | None) -> bool:
+    """True when dependencies form a cycle across the EFFECTIVE brief graph: each lineage's current published
+    version plus the candidate replacing its own lineage. Historical and draft versions are invisible, so a
+    dependency removed in a newer published version actually breaks the old cycle, and a mere draft amendment never
+    silently supersedes the approved intent for another candidate."""
+    current = _current_published(conn)
+    parent = {r["id"]: r["parent_id"] for r in conn.execute("SELECT id, parent_id FROM work_brief")}
+
+    def root(i):
+        while parent.get(i) is not None:
+            i = parent[i]
+        return i
+
+    if lineage_id is not None:  # the candidate replaces its own lineage's current published version
+        lineage_root = root(lineage_id)
+        current = [c for c in current if root(c) != lineage_root]
+    own, dep = {}, {}
+    for cid in current:
+        row = conn.execute("SELECT sources_json, body_json FROM work_brief WHERE id=?", (cid,)).fetchone()
+        own[cid] = {s["identifier"] for s in json.loads(row["sources_json"])}
+        dep[cid] = set(json.loads(row["body_json"]).get("dependencies") or [])
     own[-1], dep[-1] = set(own_ids), set(deps)
     ids = list(own)
     adj = {b: {a for a in ids if a != b and dep[b] & own[a]} for b in ids}
@@ -228,8 +241,8 @@ def _dep_cycles(conn, own_ids: set[str], deps: list[str], exclude_id: int | None
     return any(visit(b) for b in ids)
 
 
-def _ensure_acyclic(conn, own_ids: set[str], deps: list[str], exclude_id: int | None) -> None:
-    if _dep_cycles(conn, own_ids, deps, exclude_id):
+def _ensure_acyclic(conn, own_ids: set[str], deps: list[str], lineage_id: int | None) -> None:
+    if _dep_cycles(conn, own_ids, deps, lineage_id):
         raise StageError("dependency cycle among briefs")
 
 
@@ -422,7 +435,7 @@ def revise(cfg: Config, conn, brief_id, body, reason, actor) -> dict:
         raise StageError("amending a published brief needs a reason")
     sources = _sources_for(cfg, conn, [s["identifier"] for s in json.loads(row["sources_json"])])
     norm = _normalize_body(body, sources, _is_human(actor))
-    _ensure_acyclic(conn, {s["identifier"] for s in sources}, norm["dependencies"], None)
+    _ensure_acyclic(conn, {s["identifier"] for s in sources}, norm["dependencies"], brief_id)
     with db.tx(conn):
         if conn.execute("SELECT 1 FROM work_brief WHERE parent_id=?", (brief_id,)).fetchone():
             raise StageError(f"brief #{brief_id} already has a newer revision; revise the latest version")
