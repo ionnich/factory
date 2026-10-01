@@ -29,7 +29,9 @@ MAX_PROMPT_BYTES = 256_000   # bound on untrusted ticket text fed to the model
 BODY_KEYS = ("title", "outcome", "acceptance", "scope", "exclusions", "decisions",
              "dependencies", "resources", "risks", "evidence")
 IDENT = re.compile(r"^[A-Z]+-\d+$")               # e.g. FIN-123
-RESOURCE = re.compile(r"^[a-z][a-z0-9_-]*:[^\s]+$")  # namespace:key; key may be '*' or a slash hierarchy
+_RESOURCE_NS = re.compile(r"^[a-z][a-z0-9_-]*$")  # lowercase namespace
+# key = segment(/segment)*, each segment [A-Za-z0-9][A-Za-z0-9._-]* (no leading/trailing slash, no empty/./.. segments, no wildcard)
+_RESOURCE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$")
 TITLE_MAX = 200
 OUTCOME_MAX = 8000
 ITEM_MAX = 2000
@@ -95,6 +97,18 @@ def _conflict(a: str, b: str) -> bool:
     return ka == kb or ka.startswith(kb + "/") or kb.startswith(ka + "/")
 
 
+def _valid_resource(r: str) -> bool:
+    """Canonical resource key: lowercase namespace, key = non-empty slash segments with no leading/trailing slash,
+    no empty or . or .. segments, and no wildcard — the only wildcard is the exact global:*. Keys preserve case
+    (mandatory repo:OWNER/NAME). Unsafe alias forms are rejected here and by the dispatch_resource CHECK."""
+    ns, sep, key = r.partition(":")
+    if not sep or not _RESOURCE_NS.fullmatch(ns):
+        return False
+    if ns == "global":
+        return key == "*"
+    return bool(_RESOURCE_KEY.fullmatch(key))
+
+
 def _merge_resources(body_resources: list[str], repos: list[str], route: str) -> list[str]:
     """Server-derived repo:/route: are always present and never removable/editable. global:* is the conservative
     default when the editor names no explicit resource; an explicit `global:*` is preserved (a human can name it
@@ -156,8 +170,9 @@ def _validate_body(body, sources: list[dict]) -> dict:
         raise StageError(f"a brief cannot depend on its own source: {', '.join(bad)}")
     resources = _strs("resources", body.get("resources", []))
     for r in resources:
-        if not RESOURCE.match(r):
-            raise StageError(f"resource {r!r}: want namespace:key")
+        if not _valid_resource(r):
+            raise StageError(f"resource {r!r}: want lowercase-namespace:key with non-empty slash segments "
+                             "(no '.', '..', or '*' except global:*)")
     risks = _strs("risks", body.get("risks", []))
     evidence = _strs("evidence", body.get("evidence", []))
     return {"title": title, "outcome": outcome, "acceptance": acceptance, "scope": scope,
@@ -226,9 +241,10 @@ def _is_human(actor) -> bool:
 
 def _require_human(actor) -> str:
     """Only a person publishes intent or readiness: user:dashboard, user:factory-chat (externally confirmed) or an
-    explicit CLI user. Agents (agent:*, factory:*) may groom and revise drafts, never approve/hold/amend."""
+    explicit CLI user. Agents (agent:*, factory:*) may groom and revise (including creating unapproved amendment
+    drafts), never approve/hold/unhold."""
     if not _is_human(actor):
-        raise StageError("only a person publishes briefs (agents cannot approve, hold or amend)")
+        raise StageError("only a person publishes briefs (agents cannot approve, hold or unhold)")
     return actor
 
 
@@ -397,11 +413,10 @@ def groom(cfg: Config, conn, identifiers, actor) -> dict:
 
 def revise(cfg: Config, conn, brief_id, body, reason, actor) -> dict:
     """Append a NEW draft version (a new id) on every revision — including revising an unpublished draft, so a
-    draft's body is never mutated in place. Published bodies are never overwritten; amending a published brief needs
-    a human and a reason. Each version re-captures its sources as they are now."""
+    draft's body is never mutated in place. Published bodies are never overwritten. Amending a published brief needs
+    a reason but not a human (an agent may create an unapproved amendment draft); only approve/hold/unhold are
+    human-gated. Each version re-captures its sources as they are now."""
     row = _row(conn, brief_id)
-    if row["state"] != "draft":
-        _require_human(actor)  # amending a published brief is publish-adjacent; agents may revise drafts only
     reason = (reason or "").strip() or None
     if row["state"] != "draft" and not reason:
         raise StageError("amending a published brief needs a reason")
@@ -551,15 +566,17 @@ def _verdicts(conn, brief_id: int, sources: list[dict]) -> tuple[bool, list[dict
 
 
 def _dependency_status(conn, identifier: str) -> str:
-    """Dependencies count ready only on a recorded completed/accepted fact, never a title or model assertion."""
+    """Dependencies count ready only on a recorded completed/accepted fact, never a title or model assertion. An
+    unsuperseded already-done verdict counts only when it is for the CURRENT snapshot (a reopened ticket's old
+    verdict is not readiness); the latest completed state is still completion."""
     s = conn.execute("SELECT * FROM linear_latest WHERE identifier=?", (identifier,)).fetchone()
     if s is None:
         return "unknown"
     if s["state_type"] == "completed":
         return "ready"
-    v = conn.execute("SELECT kind FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
+    v = conn.execute("SELECT kind, snapshot_updated_at FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
                      (s["issue_id"],)).fetchone()
-    return "ready" if (v and v["kind"] == "already-done") else "unmet"
+    return "ready" if (v and v["kind"] == "already-done" and v["snapshot_updated_at"] == s["updated_at"]) else "unmet"
 
 
 def _source_safety(cfg: Config, conn, s: dict) -> str | None:

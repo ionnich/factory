@@ -551,7 +551,31 @@ CREATE UNIQUE INDEX ask_one_pending ON ask(decision_id) WHERE status = 'pending'
 -- same-namespace slash ancestor/descendant, or global:*.
 CREATE TABLE dispatch_resource (
   run_id   TEXT NOT NULL REFERENCES dispatch(run_id),
-  resource TEXT NOT NULL,
+  -- Canonical key: lowercase namespace, key = non-empty slash segments (no leading/trailing slash, no empty or
+  -- . or .. segments, no wildcard) — the only wildcard is the exact global:*. The scheduler compares these keys
+  -- literally, so unsafe alias forms are rejected here and in strategy._valid_resource.
+  resource TEXT NOT NULL CHECK (
+    substr(resource, 1, instr(resource, ':') - 1) GLOB '[a-z][a-z0-9_-]*'
+    AND instr(substr(resource, instr(resource, ':') + 1), ':') = 0
+    AND (substr(resource, 1, instr(resource, ':') - 1) <> 'global' OR resource = 'global:*')
+    AND (
+      resource = 'global:*'
+      OR (
+        substr(resource, instr(resource, ':') + 1) <> ''
+        AND substr(resource, instr(resource, ':') + 1, 1) <> '/'
+        AND substr(resource, -1) <> '/'
+        AND instr(resource, '*') = 0
+        AND instr(resource, '//') = 0
+        AND instr(resource, '/./') = 0
+        AND instr(resource, '/../') = 0
+        AND substr(resource, instr(resource, ':') + 1) NOT IN ('.', '..')
+        AND substr(resource, instr(resource, ':') + 1) NOT LIKE './%'
+        AND substr(resource, instr(resource, ':') + 1) NOT LIKE '../%'
+        AND substr(resource, instr(resource, ':') + 1) NOT LIKE '%/.'
+        AND substr(resource, instr(resource, ':') + 1) NOT LIKE '%/..'
+      )
+    )
+  ),
   PRIMARY KEY (run_id, resource)
 );
 CREATE TRIGGER dispatch_resource_draft_only_i BEFORE INSERT ON dispatch_resource
@@ -582,12 +606,17 @@ CREATE TABLE dispatch_launch (
   sent_at    TEXT,
   error      TEXT
 );
+-- A launch is reserved for a staged dispatch, or for a preexisting legacy executing run at its own executor pane
+-- (the explicit restart protocol reserves a durable slot before the /new send).
 CREATE TRIGGER launch_reserve_state BEFORE INSERT ON dispatch_launch
-WHEN (SELECT state FROM dispatch WHERE run_id = NEW.run_id) IS NOT 'staged'
-BEGIN SELECT RAISE(ABORT, 'a launch is reserved for a staged dispatch'); END;
+WHEN (SELECT state FROM dispatch WHERE run_id = NEW.run_id) NOT IN ('staged', 'executing')
+  OR ((SELECT state FROM dispatch WHERE run_id = NEW.run_id) = 'executing'
+      AND (SELECT executor_pane FROM dispatch WHERE run_id = NEW.run_id) IS NOT NEW.pane_id)
+BEGIN SELECT RAISE(ABORT, 'a launch is reserved for a staged dispatch, or an executing dispatch at its own executor pane'); END;
 CREATE TRIGGER launch_edges BEFORE UPDATE OF state ON dispatch_launch
 WHEN NEW.state IS NOT OLD.state AND (OLD.state, NEW.state) NOT IN (VALUES
-  ('reserved', 'sent'), ('reserved', 'uncertain'), ('uncertain', 'sent'), ('uncertain', 'reserved'))
+  ('reserved', 'sent'), ('reserved', 'uncertain'), ('uncertain', 'sent'), ('uncertain', 'reserved'),
+  ('sent', 'uncertain'))
 BEGIN SELECT RAISE(ABORT, 'illegal launch state transition'); END;
 -- Release a reservation only when it was definitely never sent, or a `sent` launch once its dispatch is terminal
 -- (executor safe). An `uncertain` launch (unsafe pane) is retained even at terminal until an explicit safe release:
@@ -637,11 +666,14 @@ WHERE c.resource = o.resource
 -- retained uncertain/sent row means the pane is not yet confirmed safe) or a running dispatch's executor pane. Raw
 -- sqlite3 cannot bypass.
 CREATE TRIGGER launch_reserve_guard BEFORE INSERT ON dispatch_launch
-WHEN (SELECT count(DISTINCT run_id) FROM launch_active) + 1 > (SELECT max_parallel FROM execution_policy WHERE id = 1)
-  OR EXISTS (SELECT 1 FROM dispatch_launch WHERE pane_id = NEW.pane_id)
-  OR EXISTS (SELECT 1 FROM dispatch WHERE executor_pane = NEW.pane_id AND state = 'executing')
+WHEN (SELECT count(DISTINCT run_id) FROM launch_active WHERE run_id <> NEW.run_id) + 1
+      > (SELECT max_parallel FROM execution_policy WHERE id = 1)
+  OR EXISTS (SELECT 1 FROM dispatch_launch WHERE pane_id = NEW.pane_id AND run_id <> NEW.run_id)
+  OR EXISTS (SELECT 1 FROM dispatch WHERE executor_pane = NEW.pane_id AND state = 'executing'
+             AND run_id <> NEW.run_id)
   OR ((SELECT route FROM dispatch WHERE run_id = NEW.run_id) IS NOT NULL
-      AND EXISTS (SELECT 1 FROM claim_holders WHERE route = (SELECT route FROM dispatch WHERE run_id = NEW.run_id)))
+      AND EXISTS (SELECT 1 FROM claim_holders WHERE route = (SELECT route FROM dispatch WHERE run_id = NEW.run_id)
+                  AND run_id <> NEW.run_id))
   OR EXISTS (SELECT 1 FROM resource_conflicts rc WHERE rc.a = NEW.run_id
              AND rc.b IN (SELECT run_id FROM claim_holders))
   OR NOT EXISTS (SELECT 1 FROM dispatch_resource WHERE run_id = NEW.run_id)
