@@ -9,14 +9,14 @@
   /* shadcn-compat slots that resolve to real colors (theme colorOverrides); each carries a sane fallback */
   --fx-panel: var(--color-card, color-mix(in srgb, var(--midground-base, #ebdbb2) 5%, var(--background-base, #282828)));
   --fx-panel-2: var(--color-popover, var(--fx-panel));
-  --fx-muted: var(--color-muted-foreground, color-mix(in srgb, var(--midground-base, #ebdbb2) 62%, transparent));
+  --fx-muted: color-mix(in srgb, var(--midground-base, #ebdbb2) 74%, var(--background-base, #282828));
   --fx-dim: color-mix(in srgb, var(--midground-base, #ebdbb2) 55%, transparent);
-  --fx-disabled: color-mix(in srgb, var(--midground-base, #ebdbb2) 48%, transparent);
+  --fx-disabled: var(--fx-muted);  /* readable muted, no opacity dimming */
   --fx-ink: #161616;  /* dark text on solid amber/green fills, readable in both themes */
   --fx-border: var(--color-border, color-mix(in srgb, var(--midground-base, #ebdbb2) 18%, transparent));
   --fx-line: color-mix(in srgb, var(--fx-border) 55%, transparent);
   --fx-fill: color-mix(in srgb, var(--midground-base, #ebdbb2) 8%, transparent);
-  --fx-inset: var(--color-input, color-mix(in srgb, var(--background-base, #282828) 82%, #000));
+  --fx-inset: color-mix(in srgb, var(--background-base, #282828) 88%, #000000);  /* canvas-relative recessed surface */
   /* semantic accents: theme --fx-* first, then the shadcn semantic slot, then a neutral fallback */
   --a: var(--fx-amber, var(--color-warning, #f59e0b));
   --g: var(--fx-green, var(--color-success, #10b981));
@@ -25,8 +25,8 @@
   --n: var(--fx-gray, #8b8b8b);
   --e: var(--fx-edge, var(--color-border, #504945));
   /* neumorphic light: a top-left highlight and a bottom-right shade, both relative to the canvas */
-  --fx-hi: color-mix(in srgb, var(--background-base, #282828) 40%, #ffffff);
-  --fx-lo: color-mix(in srgb, var(--background-base, #282828) 62%, #000000);
+  --fx-hi: color-mix(in srgb, var(--background-base, #282828) 90%, #ffffff);  /* ~10% white, restrained */
+  --fx-lo: color-mix(in srgb, var(--background-base, #282828) 66%, #000000);
   --fx-raised: -1px -1px 1px var(--fx-hi), 2px 3px 6px var(--fx-lo);
   --fx-pressed: inset 1px 2px 4px var(--fx-lo), inset -1px -1px 0 var(--fx-hi);
   /* radius scale */
@@ -56,10 +56,11 @@
 .fx .star { color: var(--a); margin-right: .15rem; }
 
 /* controls: every button is a 44px target; disabled stays readable (no opacity fade) */
-.fx button { min-height: 44px; }
+.fx button { min-width: 44px; min-height: 44px; }
 .fx :disabled { opacity: 1; }
 .fx :is(input, textarea, select):disabled { color: var(--fx-disabled); }
-/* SDK buttons: primary (solid midground) raised + depress, ghost quiet; kill the DS active:invert + arc chrome */
+/* SDK buttons: round off the square chrome, tame the 0.2em tracking; primary raised + depress, ghost quiet */
+.fx button.bg-midground, .fx button.bg-transparent { border-radius: var(--fx-r); letter-spacing: normal; }
 .fx button.bg-midground { box-shadow: var(--fx-raised); }
 .fx button.bg-midground:active { box-shadow: var(--fx-pressed); }
 .fx button:disabled { box-shadow: none; }
@@ -68,8 +69,10 @@
 .fx .arc-border { display: none; }
 /* native text fields are inset everywhere, not just the named ones */
 .fx input:not([type="checkbox"]):not([type="radio"]), .fx textarea, .fx select {
-  background: var(--fx-inset); box-shadow: var(--fx-pressed); border-color: var(--fx-line);
+  background-color: var(--fx-inset); box-shadow: var(--fx-pressed); border-color: var(--fx-line);
 }
+.fx input:not([type="checkbox"]):not([type="radio"]) { min-height: 44px; }
+.fx input::placeholder, .fx textarea::placeholder { color: var(--fx-muted); opacity: 1; }
 
 /* row anatomy hooks (the markup sibling adopts these) */
 .fx-row-title { font-weight: 550; font-size: .9rem; line-height: 1.3; overflow-wrap: anywhere; }
@@ -176,9 +179,9 @@
                 background: var(--fx-panel); color: var(--fx-muted); font: inherit; font-size: .85rem; font-weight: 600;
                 cursor: pointer; transition: border-color .15s, color .15s, box-shadow .15s, background .15s; }
 .fx-stage-tab:hover { color: var(--fx-fg); }
-.fx-stage-tab.on { color: var(--b); border-color: color-mix(in srgb, var(--b) 45%, transparent);
+.fx-stage-tab.on { color: var(--fx-fg); border-color: var(--b);
                    background: color-mix(in srgb, var(--b) 12%, var(--fx-panel)); box-shadow: var(--fx-pressed); }
-.fx-stage-tab.on .fx-count { color: var(--b); background: color-mix(in srgb, var(--b) 14%, transparent); }
+.fx-stage-tab.on .fx-count { color: var(--fx-fg); background: color-mix(in srgb, var(--b) 22%, transparent); }
 /* keyboard focus shows wherever it lands: buttons, links, summaries, rows, radios, the pane, a card or question */
 .fx :where(button, summary, [role="tab"], [role="radio"], [role="button"], a, .fx-pane):focus-visible {
   outline: 2px solid var(--b); outline-offset: 2px; }
@@ -248,7 +251,7 @@
            border-radius: var(--fx-r-full); cursor: pointer; border: 1px solid var(--fx-line); background: var(--fx-panel);
            color: var(--fx-muted); font: inherit; font-size: .8rem; font-weight: 600;
            transition: border-color .15s, color .15s, background .15s, box-shadow .15s; }
-.fx-chip.on { color: var(--b); border-color: color-mix(in srgb, var(--b) 45%, transparent);
+.fx-chip.on { color: var(--fx-fg); border-color: var(--b);
               background: color-mix(in srgb, var(--b) 12%, var(--fx-panel)); box-shadow: var(--fx-pressed); }
 .fx-tmeta { gap: .35rem; margin: .15rem 0; }
 .fx-trow .fx-ttitle, .fx-trow .fx-hint { overflow-wrap: anywhere; }
@@ -298,6 +301,7 @@
   .fx-q { font-size: 1.08rem; }
   .fx-stage-tabs, .fx-tabs { gap: .3rem; }
   .fx-stage-tab { padding: .45rem .55rem; }  /* the strip heads the page: tighter, so a phone rarely scrolls it sideways */
+  .fx input:not([type="checkbox"]):not([type="radio"]), .fx textarea, .fx select { font-size: 16px; }  /* ≥16px avoids iOS focus zoom */
 }
 .fx-cost { list-style: none; margin: 0; padding: 0; display: grid; gap: .35rem; font-size: .82rem; }
 .fx-cost li { display: grid; grid-template-columns: 10.5rem 1fr 3.8rem; align-items: center; gap: .5rem; }
@@ -363,7 +367,7 @@
 .fx-seg button { font: inherit; font-size: .88rem; font-weight: 650; min-height: 44px; padding: .55rem .4rem; border: 0;
                  background: none; color: inherit; cursor: pointer; transition: background .15s, color .15s, box-shadow .15s; }
 .fx-seg button + button { border-left: 1px solid var(--fx-line); }
-.fx-seg button.on { color: var(--b); background: color-mix(in srgb, var(--b) 14%, var(--fx-panel)); box-shadow: var(--fx-pressed); }
+.fx-seg button.on { color: var(--fx-fg); background: color-mix(in srgb, var(--b) 14%, var(--fx-panel)); box-shadow: var(--fx-pressed); }
 .fx-sw-o.on { border: 2px solid var(--b); background: color-mix(in srgb, var(--b) 10%, var(--fx-panel)); box-shadow: var(--fx-pressed); }
 .fx-sw-detail { display: grid; gap: .1rem; }
 .fx-sw-meta { font-size: .75rem; color: var(--fx-muted); font-style: italic; }
@@ -388,12 +392,11 @@ ul.fx-ev { margin: 0 0 0 1rem; font-size: .78rem; color: var(--fx-muted); overfl
 .fx-quick-head > span { display: block; }
 .fx-railway .fx-wire.alt { opacity: .3; stroke-dasharray: 4 4; }
 .fx-railway .fx-wire.lit { opacity: 1; stroke-dasharray: none; filter: drop-shadow(0 0 3px var(--b)); }
-.fx-rw-row { display: flex; align-items: center; gap: .4rem; font-size: .82rem; opacity: .5; transition: opacity .2s; white-space: nowrap; overflow: hidden; }
-.fx-rw-row.lit { opacity: 1; }
+.fx-rw-row { display: flex; align-items: center; gap: .4rem; font-size: .82rem; white-space: nowrap; overflow: hidden; }
 .fx-rw-q { overflow: hidden; text-overflow: ellipsis; }
 .fx-rw-o { font: inherit; background: none; border: 1px solid var(--fx-line); border-radius: var(--fx-r-full);
            min-height: 44px; margin: 0; padding: .1rem .6rem; color: inherit; cursor: pointer; }
-.fx-rw-o[aria-pressed="true"] { border-color: var(--b); color: var(--b); font-weight: 650; box-shadow: var(--fx-pressed); }
+.fx-rw-o[aria-pressed="true"] { border-color: var(--b); color: var(--fx-fg); font-weight: 650; box-shadow: var(--fx-pressed); }
 .fx-rw-o:disabled { cursor: default; }
 
 /* Jev guidance (jev.jsx): compact, advisory; focus highlights consequence text, never a preselection */
