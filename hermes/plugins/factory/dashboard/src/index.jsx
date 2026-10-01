@@ -564,28 +564,40 @@ function LaunchRecovery({ d, onDone }) {
 // Run: the execution scheduler's read (capacity in use, launch reservations, held resource claims), straight from the
 // DB — capacity shows even at zero, reservations/uncertain launches honestly, and held claims are distinct from
 // running slots (they persist through done/reconcile until archive). A launch's link goes to the dispatch's actual
-// phase (from the overview), not a hardcoded Run stage.
-function SchedulerStatus({ s, byRun, onGo }) {
+// phase: the overview lookup, the loaded archive, or the server's holder state; when still unknown it goes to the
+// Archive lookup rather than pretending it is Run.
+const STATE_PHASE = { draft: "draft", staged: "run", executing: "run", done: "reconcile", reconciled: "reconcile",
+                      archived: "archive" };
+function SchedulerStatus({ s, byRun, archRun, onGo }) {
   if (!s) return null;
   const launches = s.launches || [], holders = s.holders || [];
   const cap = s.max_parallel ?? 2, used = s.capacity_used ?? 0;
   const uncertain = launches.filter((l) => l.state === "uncertain");
-  const stageOf = (runId) => byRun?.[runId]?.phase || "run";
+  const stageOf = (runId) => {
+    if (byRun?.[runId]?.phase) return byRun[runId].phase;
+    if (archRun?.[runId]?.phase) return archRun[runId].phase;
+    const h = holders.find((x) => x.run_id === runId);
+    if (h) return STATE_PHASE[h.state] || "archive";
+    return "archive";  // unknown: look it up in the Archive, never pretend it is Run
+  };
   return (
     <details className="fx-sec fx-fold">
       <summary>Scheduling <span className="fx-count">{used}/{cap}</span></summary>
       <div className="fx-hint fx-line">parallel cap {cap} · {used} in use · {plural(launches.length, "launch reservation")}</div>
       {uncertain.length ? (
-        <div className="fx-err fx-line">{plural(uncertain.length, "launch")} uncertain — open the run to confirm unsent and release it.</div>
+        <div className="fx-err fx-line">{plural(uncertain.length, "launch")} uncertain — open the dispatch to confirm and release it.</div>
       ) : null}
       {launches.length ? (
-        <div className="fx-hint fx-line">{launches.map((l) => (
-          <span key={l.run_id}>
-            <button className="fx-link-btn" onClick={() => onGo({ stage: stageOf(l.run_id), run: l.run_id })}>{l.run_id} ›</button>
-            {` ${l.state} (pane ${l.pane_id || "—"})`}
-            {" · "}
-          </span>
-        ))}</div>
+        <div className="fx-hint fx-line">{launches.map((l) => {
+          const st = stageOf(l.run_id);
+          return (
+            <span key={l.run_id}>
+              <button className="fx-link-btn" onClick={() => onGo({ stage: st, run: l.run_id })}>{l.run_id} ›</button>
+              {` ${LABEL[st] || st} · ${l.state} (pane ${l.pane_id || "—"})`}
+              {" · "}
+            </span>
+          );
+        })}</div>
       ) : null}
       {holders.length ? (
         <div className="fx-hint fx-line">held claims (not running): {holders.map((h) => `${h.resource}@${h.run_id}:${h.state}`).join(", ")}</div>
@@ -869,13 +881,16 @@ function FactoryPage() {
     if (first) setLoc(next);
   }, [data]);
   const archived = data?.lifecycle?.counts?.archive;
-  useEffect(() => {  // Archive: fetched on entering it, and again when a dispatch gets archived while it is open
-    if (loc.stage !== "archive" || archived == null) return;
+  const refetchArchive = useCallback(() => {  // one-shot Archive refresh (the effect reuses it; a release invalidates it)
     let current = true;  // a reply after leaving, or to an older fetch, is dropped
     SDK.fetchJSON(`${API}/archive`).then((rows) => current && setArch({ rows, err: null }),
                                           (e) => current && setArch((a) => ({ ...a, err: errText(e) })));
     return () => { current = false; };
-  }, [loc.stage === "archive", archived]);
+  }, []);
+  useEffect(() => {  // Archive: fetched on entering it, and again when a dispatch gets archived while it is open
+    if (loc.stage !== "archive" || archived == null) return;
+    return refetchArchive();
+  }, [loc.stage === "archive", archived, refetchArchive]);
   React.useLayoutEffect(() => {  // after a navigation, never a refresh: focus what it points at, or restore the scroll
     const a = after.current;
     if (!a || !data) return;
@@ -1000,7 +1015,7 @@ function FactoryPage() {
     plan: () => <><JobLine jobs={data.jobs} name="[bot:planner] Plan drafts" of="draft" />{table("plan", planning)}</>,
     review: () => table("review", plan),
     run: () => <>{deckOf("run")}<ExecutorDeliveries items={deliveries} onDone={done} />
-      <SchedulerStatus s={data.status.scheduler} byRun={byRun} onGo={go} />
+      <SchedulerStatus s={data.status.scheduler} byRun={byRun} archRun={archRun} onGo={go} />
       {table("run", (d) => <><Runtime r={d.runtime} /><LaunchRecovery d={d} onDone={done} /><BriefLink d={d} onGo={go} />{plan(d)}</>)}</>,
     strategy: () => <StrategyTab data={data} view={strat} onViewChange={setStrategy} onDone={done} onNavigate={go} />,
     reconcile: () => <><JobLine jobs={data.jobs} name="factory-reconcile" of="dispatch" />{deckOf("reconcile")}
@@ -1008,7 +1023,7 @@ function FactoryPage() {
       {table("reconcile", (d) => <><LaunchRecovery d={d} onDone={done} />{plan(d)}</>)}</>,
     archive: () => (arch.rows ? <>
       {arch.err ? <div className="fx-err" role="alert">Refreshing the archive failed: {arch.err}. Showing it as last loaded.</div> : null}
-      {table("archive", (d) => <><Audit d={d} /><LaunchRecovery d={d} onDone={done} />{plan(d)}</>)}
+      {table("archive", (d) => <><Audit d={d} /><LaunchRecovery d={d} onDone={(r, d2, msg) => { done(r, d2, msg); refetchArchive(); }} />{plan(d)}</>)}
     </> : arch.err ? <div className="fx-err" role="alert">The archive did not load: {arch.err}</div> : <div className="fx-hint">Loading the archive…</div>),
     learn: () => <>{deckOf("learn")}
       <details className="fx-sec fx-fold" open>
