@@ -431,5 +431,43 @@ class IntentVersionLineage(unittest.TestCase):
         self.assertEqual(self.c.execute("SELECT count(*) FROM dispatch").fetchone()[0], 0)
 
 
+class ReopenedDependency(unittest.TestCase):
+    """A dependency is ready only on a recorded completion fact for its CURRENT snapshot: a reopened ticket whose
+    old already-done verdict is still unsuperseded must not count as ready, and staging must refuse without writing."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tmp = Path(tmp.name)
+        self.c = db.connect(tmp / "t.db")
+        self.addCleanup(self.c.close)
+        _helpers.seed_project(self.c)
+        _helpers.seed_trunk(self.c)
+        _helpers.seed_snapshot(self.c, "i1", "FIN-1")  # the brief's source
+        _helpers.seed_verdict(self.c, "i1")
+        _helpers.seed_snapshot(self.c, "i2", "FIN-2")  # the dependency, currently at SNAP
+        # FIN-2 already-done at SNAP (unsuperseded), a real verdict row
+        self.c.execute("INSERT INTO verdict(issue_id,snapshot_updated_at,context,repo,kind,reason,evidence_json,"
+                       "evidence_paths_json,created_at,created_by) VALUES ('i2',?,?,?,?,?,?,?,?,?)",
+                       (SNAP, "api", "o/api", "already-done", "r", "[1]", "[]", db.now(), "t"))
+        self.cfg = _helpers.mkcfg(tmp)
+
+    def test_reopened_dependency_blocks_staging(self):
+        from factory import strategy
+        brief = strategy.approve(self.cfg, self.c,
+                                 strategy.create(self.cfg, self.c, ["FIN-1"], _helpers.HUMAN,
+                                                 body=_helpers.body(dependencies=["FIN-2"]))["id"], _helpers.HUMAN)
+        # the already-done verdict at the current snapshot is readiness, before the ticket reopens
+        self.assertTrue(next(b for b in strategy.ready(self.cfg, self.c) if b["id"] == brief["id"])["intent_ready"])
+        _helpers.seed_snapshot(self.c, "i2", "FIN-2", snap="2026-09-02T00:00:00Z")  # FIN-2 reopens; old verdict stays unsuperseded
+        item = next(b for b in strategy.ready(self.cfg, self.c) if b["id"] == brief["id"])
+        self.assertFalse(item["intent_ready"])
+        self.assertEqual(item["dependencies"], [{"identifier": "FIN-2", "status": "unmet"}])
+        before = self.c.execute("SELECT count(*) FROM dispatch").fetchone()[0]
+        with self.assertRaises(dispatch.StageError):
+            dispatch.stage_brief(self.cfg, self.c, brief["id"], "user")
+        self.assertEqual(self.c.execute("SELECT count(*) FROM dispatch").fetchone()[0], before)  # nothing staged
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -339,15 +339,11 @@ def _brief_verdict(conn, brief_id: int, issue_id: str):
 
 
 def _dependency_status(conn, identifier: str) -> str:
-    """Dependencies count ready only on a recorded completed/accepted fact, never a title or model assertion."""
-    s = conn.execute("SELECT * FROM linear_latest WHERE identifier=?", (identifier,)).fetchone()
-    if s is None:
-        return "unknown"
-    if s["state_type"] == "completed":
-        return "ready"
-    v = conn.execute("SELECT kind FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
-                     (s["issue_id"],)).fetchone()
-    return "ready" if (v and v["kind"] == "already-done") else "unmet"
+    """Dependency readiness follows the authoritative Strategy rule (lazy import preserves the dispatch<->strategy
+    cycle design): ready only on a recorded completed state or a CURRENT-snapshot already-done verdict — a reopened
+    ticket's stale, still-unsuperseded already-done verdict is not readiness."""
+    from . import strategy
+    return strategy._dependency_status(conn, identifier)
 
 
 def _create_brief_draft(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool,
