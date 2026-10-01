@@ -58,12 +58,10 @@ componentStyles:
   footer:
     background: "rgba(255, 255, 235, 0.96)"
 
-terminalBackground: "#FFFFEB"
-terminalForeground: "#1A1A1A"
-
 customCSS: |
-  /* Current dashboard YAML normalization omits terminal colors. Keep Factory readable
-     until the host forwards terminalForeground from user themes. */
+  /* The host's user-theme loader does not forward terminal foreground colors. */
   .fx {
     --theme-terminal-foreground: #1A1A1A;
+    --fx-muted: var(--color-muted-foreground);
+    --fx-fill: var(--color-muted);
   }
