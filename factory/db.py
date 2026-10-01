@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -619,6 +619,13 @@ WHEN OLD.state <> 'draft' AND (NEW.body_sha256 IS NOT OLD.body_sha256 OR NEW.rep
   OR NEW.run_id IS NOT OLD.run_id OR NEW.created_at IS NOT OLD.created_at OR NEW.route IS NOT OLD.route
   OR NEW.brief_id IS NOT OLD.brief_id)
 BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;""",
+    # v22: per-version Linear due date sidecar (Linear dueDate, YYYY-MM-DD, nullable). Version-keyed so a due
+    # removal lands as a new snapshot version with a NULL row; the exact snapshot version is authoritative.
+    22: """CREATE TABLE linear_due (
+  issue_id TEXT NOT NULL, snapshot_updated_at TEXT NOT NULL,
+  due_date TEXT,
+  PRIMARY KEY (issue_id, snapshot_updated_at),
+  FOREIGN KEY (issue_id, snapshot_updated_at) REFERENCES linear_snapshot(issue_id, updated_at));""",
 }
 
 

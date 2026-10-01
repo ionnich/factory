@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from factory import db, prune, witness
+from factory import db, linear, prune, witness
 
 SNAP = "2026-09-01T00:00:00Z"
 
@@ -76,6 +76,52 @@ class Dagster(unittest.TestCase):
     def test_sql_is_rejected(self):
         with self.assertRaisesRegex(witness.WitnessError, "not SQL"):
             self.run_q("SELECT 1")
+
+
+class Ingest(unittest.TestCase):
+    """linear.ingest writes the version-keyed due sidecar without touching an existing raw snapshot."""
+
+    T0, T1 = "2026-09-01T00:00:00.000Z", "2026-09-02T00:00:00.000Z"
+
+    def cfg(self):
+        return SimpleNamespace(linear={"lead": "lead@x", "teams": ["FIN"], "team": {}})
+
+    def issue(self, ident="FIN-1", issue_id="i1", updated=T0, due="2026-10-15"):
+        return {"id": issue_id, "identifier": ident, "updatedAt": updated,
+                "state": {"name": "Todo", "type": "unstarted"}, "team": {"key": "FIN"},
+                "title": ident, "url": f"https://linear/{ident}", "dueDate": due}
+
+    def test_due_sidecar_enriched_without_rewriting_unchanged_snapshot(self):
+        c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
+        old = self.issue(); old.pop("dueDate")  # the OLD snapshot predates the dueDate field
+        raw = json.dumps(old, sort_keys=True)
+        c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,'unstarted',1,?)", ("i1", "FIN-1", self.T0, self.T0, raw))
+        with mock.patch("factory.linear.fetch", return_value=[self.issue()]):
+            linear.ingest(self.cfg(), c)
+        # raw_json stays byte-for-byte (no dueDate key added); the due sidecar carries the real fetched due
+        self.assertEqual(c.execute("SELECT raw_json FROM linear_snapshot WHERE issue_id='i1'").fetchone()[0], raw)
+        self.assertEqual(c.execute("SELECT due_date FROM linear_due WHERE issue_id='i1' AND snapshot_updated_at=?").fetchone()["due_date"], "2026-10-15")
+
+    def test_due_sidecar_ingest_is_idempotent(self):
+        c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
+        for _ in (1, 2):  # the same unchanged issue ingested twice adds no duplicate rows
+            with mock.patch("factory.linear.fetch", return_value=[self.issue()]):
+                linear.ingest(self.cfg(), c)
+        self.assertEqual(c.execute("SELECT count(*) FROM linear_snapshot WHERE issue_id='i1'").fetchone()[0], 1)
+        self.assertEqual(c.execute("SELECT count(*) FROM linear_due WHERE issue_id='i1'").fetchone()[0], 1)
+
+    def test_new_version_due_removal_keeps_the_prior_version(self):
+        c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
+        c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,'unstarted',1,?)",
+                  ("i1", "FIN-1", self.T0, self.T0, json.dumps(self.issue(due="2026-10-15"), sort_keys=True)))
+        c.execute("INSERT INTO linear_due(issue_id, snapshot_updated_at, due_date) VALUES (?,?,?)",
+                  ("i1", self.T0, "2026-10-15"))
+        with mock.patch("factory.linear.fetch", return_value=[self.issue(updated=self.T1, due=None)]):
+            linear.ingest(self.cfg(), c)
+        self.assertEqual(c.execute("SELECT due_date FROM linear_due WHERE issue_id='i1' AND snapshot_updated_at=?",
+                                   (self.T0,)).fetchone()["due_date"], "2026-10-15")  # prior version untouched
+        self.assertIsNone(c.execute("SELECT due_date FROM linear_due WHERE issue_id='i1' AND snapshot_updated_at=?",
+                                    (self.T1,)).fetchone()["due_date"])  # actual due removal on the new version
 
 
 if __name__ == "__main__":
