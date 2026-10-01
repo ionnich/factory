@@ -11,6 +11,7 @@ refused and the command to paste is returned instead. `resend` sends only an alr
 """
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -75,6 +76,32 @@ def _run(*args: str, timeout: int = 600) -> str:
     return r.stdout[-60000:]
 
 
+def _run_json(*args: str, timeout: int = 600) -> str:
+    """Run a Strategy JSON command and return its COMPLETE, valid JSON — never a raw tail slice that could cut a
+    large brief mid-stream into invalid JSON."""
+    r = subprocess.run([FACTORY, *args], capture_output=True, text=True, timeout=timeout, env=ENV)
+    if r.returncode:
+        return json.dumps({"ok": False, "exit": r.returncode, "error": (r.stderr or r.stdout).strip()[-1500:]})
+    try:
+        return json.dumps(json.loads(r.stdout))
+    except json.JSONDecodeError:
+        return json.dumps({"ok": False, "error": f"strategy returned unparsable output ({len(r.stdout)} chars)"})
+
+
+def _strategy_list() -> str:
+    """Strategy list: parse the COMPLETE overview before any truncation and return a valid briefs+scheduler
+    summary. The full source list (`tickets`) is dropped — a large Backlog must never push the briefs out of a
+    tail-truncated, invalid JSON blob; per-brief detail is read with `show`."""
+    r = subprocess.run([FACTORY, "strategy", "list"], capture_output=True, text=True, timeout=600, env=ENV)
+    if r.returncode:
+        return json.dumps({"ok": False, "exit": r.returncode, "error": (r.stderr or r.stdout).strip()[-1500:]})
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return json.dumps({"ok": False, "error": f"strategy list returned unparsable output ({len(r.stdout)} chars)"})
+    return json.dumps({"briefs": data.get("briefs", []), "scheduler": data.get("scheduler", {})})
+
+
 def _approve(command: str, description: str) -> str | None:
     """None when a human approved this one operation; otherwise why not. Mirrors Hermes's own one-shot gates."""
     try:
@@ -113,24 +140,24 @@ def handle(params: dict, **_) -> str:
         arg = params.get("identifier") if action == "ticket" else run_id if action == "status" else None
         return _run(action, *([arg] if arg else []))
     if action == "list":
-        return _run("strategy", "list")
+        return _strategy_list()
     if action == "show":
         bid = params.get("brief_id")
-        return _run("strategy", "show", str(bid)) if bid else '{"ok": false, "error": "brief_id required"}'
+        return _run_json("strategy", "show", str(bid)) if bid else '{"ok": false, "error": "brief_id required"}'
     if action == "groom":
         ids = [i.strip().upper() for i in params.get("identifiers") or [] if i.strip()]
         if not ids:
             return '{"ok": false, "error": "no identifiers to groom"}'
         # The strategy groom model call is bounded to 600 s inside the CLI; give the subprocess 660 s so the
         # adapter's own deadline never kills the CLI before its child omp process can clean up.
-        return _run("strategy", "groom", *ids, "--actor", "agent:factory-chat", timeout=660)
+        return _run_json("strategy", "groom", *ids, "--actor", "agent:factory-chat", timeout=660)
     if action == "amend":
         bid = params.get("brief_id")
         body = (params.get("body") or "").strip()
         reason = (params.get("reason") or "").strip()
         if not (bid and body and reason):
             return '{"ok": false, "error": "brief_id, body and reason required"}'
-        return _run("strategy", "revise", str(bid), "--body", body, "--reason", reason, "--actor", "agent:factory-chat")
+        return _run_json("strategy", "revise", str(bid), "--body", body, "--reason", reason, "--actor", "agent:factory-chat")
     if action == "publish":
         bid = params.get("brief_id")
         if not bid:
@@ -138,16 +165,16 @@ def handle(params: dict, **_) -> str:
         command = f"factory strategy approve {bid}"
         why = _approve(command, f"Publish brief {bid}: approve its intent for verification and planning. "
                                 "It does not approve execution, answer questions, or mutate Linear.")
-        return _refused(why, command) if why else _run("strategy", "approve", str(bid), "--actor", "user:factory-chat")
+        return _refused(why, command) if why else _run_json("strategy", "approve", str(bid), "--actor", "user:factory-chat")
     if action == "hold":
         bid = params.get("brief_id")
         reason = (params.get("reason") or "").strip()
         if not (bid and reason):
             return '{"ok": false, "error": "brief_id and reason required"}'
-        command = f"factory strategy hold {bid}"
+        command = f"factory strategy hold {bid} --reason {shlex.quote(reason)}"
         why = _approve(command, f"Hold brief {bid}: {reason}")
-        return _refused(why, command) if why else _run("strategy", "hold", str(bid), "--reason", reason,
-                                                       "--actor", "user:factory-chat")
+        return _refused(why, command) if why else _run_json("strategy", "hold", str(bid), "--reason", reason,
+                                                            "--actor", "user:factory-chat")
     if action == "stage":
         bid = params.get("brief_id")
         if not bid:
