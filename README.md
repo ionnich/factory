@@ -224,7 +224,14 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
 
 - **Sources:** combine search, state, context and assignee filters. Assignee choices are **All assignees**
   (default), **Assigned to me** (the configured Factory lead), **Unassigned**, and individual emails.
-  Filters survive workspace switches; changing filters preserves picked sources and resets pagination.
+  Filters and sorting survive workspace switches; changing either preserves picked sources and resets pagination.
+  Sort by **Priority** (default: priority, due date, then oldest creation), **Due soon**, **Oldest created**,
+  **Newest created**, or **Recently updated**. Unspecified priority and missing dates sort last.
+  Rows show priority, creation age, last update and actual due dates; missing creation/update dates stay unknown.
+  Due dates are cached against the exact Linear snapshot version in `linear_due` (schema v22), so refreshing
+  metadata never rewrites immutable snapshots. Older cached versions need metadata backfill before dates appear.
+  **Not checked** and **Check outdated** describe existing verification evidence, separately from workflow state
+  and execution blockers; these labels do not run a new scan. Counts distinguish displayed, matching and total sources.
 - A **brief** is an approved, self-contained, versioned work brief: title, outcome, acceptance, scope, exclusions,
   decisions, dependencies, resources, risks, evidence — plus server-captured source snapshots (issue id, repo,
   context, route, verdict id/evidence, trunk anchors). Briefs are groomed from cached snapshots by DeepSeek, edited
