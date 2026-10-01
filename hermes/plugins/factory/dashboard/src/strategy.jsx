@@ -166,8 +166,8 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const busy = view?.busy || null, err = view?.err || null;
   const update = (patch) => onViewChange((v) => ({ ...v, ...patch }));
 
-  // The overview: brief summaries, the source list, execution policy and active dispatches. Refetched on every
-  // overview refresh (`data` is a new object each time) and on mount.
+  // The overview: brief summaries, the source list, and the execution scheduler's read. Refetched on every overview
+  // refresh (`data` is a new object each time) and on mount.
   const [all, setAll] = useState(null);
   const [loadErr, setLoadErr] = useState(null);
   useEffect(() => {
@@ -179,8 +179,14 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
 
   const briefs = all?.briefs || [];
   const tickets = all?.tickets || [];
-  const policy = all?.policy || {};
-  const active = all?.active || [];
+  // Real execution-scheduler read (scheduler.status): capacity in use, running dispatches, launch reservations and
+  // held resource claims. Held claims are not running slots — they persist through done/reconcile until archive.
+  const sched = all?.scheduler || {};
+  const running = sched.running || [];
+  const launches = sched.launches || [];
+  const holders = sched.holders || [];
+  const capMax = sched.max_parallel ?? 2;
+  const capUsed = sched.capacity_used ?? 0;
   const summary = open != null ? briefs.find((b) => b.id === open) : null;
 
   // The open brief's full body + captured sources + compiled render, from GET /strategy/{id} (a pure read).
@@ -333,22 +339,42 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
           )) : <div className="fx-empty">{needle ? "No source matches." : "No sources yet; refresh sources first."}</div>}
       </div>
 
-      {/* ---- active dispatches and capacity ---- */}
-      {all && active.length ? (
+      {/* ---- capacity and scheduling (real scheduler.status, shown even at zero use) ---- */}
+      {all ? (
         <details className="fx-sec fx-fold">
-          <summary>Active dispatches <span className="fx-count">{active.length}</span></summary>
-          <div className="fx-hint fx-line">parallel cap {policy.max_parallel ?? 2} · {active.length} active</div>
-          {active.map((r) => {
-            const b = briefs.find((x) => x.dispatch?.run_id === r.run_id);
-            return (
+          <summary>Capacity & scheduling <span className="fx-count">{capUsed}/{capMax}</span></summary>
+          <div className="fx-hint fx-line">parallel cap {capMax} · {capUsed} in use · {plural(running.length, "dispatch")} running · {plural(launches.length, "launch reservation")}</div>
+          {running.length ? <>
+            <div className="fx-k">Running</div>
+            {running.map((r) => (
               <div key={r.run_id} className="fx-hint fx-line">
-                <span className="fx-id">{r.run_id}</span> · {r.state}
-                {r.route ? ` · route ${r.route}` : ""}{r.pane ? ` · pane ${r.pane}` : ""}
-                {b ? <> · brief <button className="fx-link-btn" onClick={() => openBrief(b.id)}>#{b.id} ›</button></> : null}
-                {r.resources?.length ? <div className="fx-hint">claims: {r.resources.join(", ")}</div> : null}
+                <span className="fx-id">{r.run_id}</span> · executing{r.route ? ` · route ${r.route}` : ""}{r.executor_pane ? ` · pane ${r.executor_pane}` : ""}
+                {r.brief_id ? <> · brief <button className="fx-link-btn" onClick={() => openBrief(r.brief_id)}>#{r.brief_id} ›</button></> : null}
               </div>
-            );
-          })}
+            ))}
+          </> : null}
+          {launches.length ? <>
+            <div className="fx-k">Launch reservations</div>
+            {launches.map((l) => {
+              const b = briefs.find((x) => x.dispatch?.run_id === l.run_id);
+              return (
+                <div key={l.run_id} className="fx-hint fx-line">
+                  <span className="fx-id">{l.run_id}</span> · launch {l.state} · pane {l.pane_id || "—"}
+                  {l.state === "uncertain" ? <span className="fx-err"> · uncertain — confirm unsent before handing off again</span> : null}
+                  {b ? <> · brief <button className="fx-link-btn" onClick={() => openBrief(b.id)}>#{b.id} ›</button></> : null}
+                </div>
+              );
+            })}
+          </> : null}
+          {holders.length ? <>
+            <div className="fx-k">Held resource claims (not running slots)</div>
+            {holders.map((h, i) => (
+              <div key={`${h.run_id}-${h.resource}-${i}`} className="fx-hint fx-line">
+                <span className="fx-id">{h.resource}</span> · {h.run_id} · {h.state}
+                {h.brief_id ? <> · brief <button className="fx-link-btn" onClick={() => openBrief(h.brief_id)}>#{h.brief_id} ›</button></> : null}
+              </div>
+            ))}
+          </> : null}
         </details>
       ) : null}
 

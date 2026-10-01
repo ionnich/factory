@@ -552,6 +552,37 @@ function LaunchRecovery({ d, onDone }) {
   );
 }
 
+// Run: the execution scheduler's read (capacity in use, launch reservations, held resource claims), straight from the
+// DB — capacity shows even at zero, reservations/uncertain launches honestly, and held claims are distinct from
+// running slots (they persist through done/reconcile until archive).
+function SchedulerStatus({ s, onGo }) {
+  if (!s) return null;
+  const launches = s.launches || [], holders = s.holders || [];
+  const cap = s.max_parallel ?? 2, used = s.capacity_used ?? 0;
+  const uncertain = launches.filter((l) => l.state === "uncertain");
+  return (
+    <details className="fx-sec fx-fold">
+      <summary>Scheduling <span className="fx-count">{used}/{cap}</span></summary>
+      <div className="fx-hint fx-line">parallel cap {cap} · {used} in use · {plural(launches.length, "launch reservation")}</div>
+      {uncertain.length ? (
+        <div className="fx-err fx-line">{plural(uncertain.length, "launch")} uncertain — open the run to confirm unsent and release it.</div>
+      ) : null}
+      {launches.length ? (
+        <div className="fx-hint fx-line">{launches.map((l) => (
+          <span key={l.run_id}>
+            <button className="fx-link-btn" onClick={() => onGo({ stage: "run", run: l.run_id })}>{l.run_id} ›</button>
+            {` ${l.state} (pane ${l.pane_id || "—"})`}
+            {" · "}
+          </span>
+        ))}</div>
+      ) : null}
+      {holders.length ? (
+        <div className="fx-hint fx-line">held claims (not running): {holders.map((h) => `${h.resource}@${h.run_id}:${h.state}`).join(", ")}</div>
+      ) : null}
+    </details>
+  );
+}
+
 // Draft and Plan, from the record only: when planning was requested (the plan gate's offer, or a replan) and why the
 // planner's last plan was refused. Whether a planner is at work right now is not recorded, so it is never shown.
 function Planning({ d }) {
@@ -958,6 +989,7 @@ function FactoryPage() {
     plan: () => <><JobLine jobs={data.jobs} name="[bot:planner] Plan drafts" of="draft" />{table("plan", planning)}</>,
     review: () => table("review", plan),
     run: () => <>{deckOf("run")}<ExecutorDeliveries items={deliveries} onDone={done} />
+      <SchedulerStatus s={data.status.scheduler} onGo={go} />
       {table("run", (d) => <><Runtime r={d.runtime} /><LaunchRecovery d={d} onDone={done} /><BriefLink d={d} onGo={go} />{plan(d)}</>)}</>,
     strategy: () => <StrategyTab data={data} view={strat} onViewChange={setStrategy} onDone={done} onNavigate={go} />,
     reconcile: () => <><JobLine jobs={data.jobs} name="factory-reconcile" of="dispatch" />{deckOf("reconcile")}

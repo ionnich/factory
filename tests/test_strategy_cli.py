@@ -1,7 +1,7 @@
-"""Strategy CLI/API slice: the `factory strategy …` commands and `stage --brief` are thin wiring to the briefs slice
-(`factory.strategy`, owned by a sibling worktree) and the execution slice's `dispatch.stage_brief`. `factory.strategy`
-is imported lazily inside the handler so the CLI still loads without it during a split checkout; these tests inject a
-fake module so the lazy import resolves, and assert the exact arguments each command passes through."""
+"""Strategy CLI/API slice: the `factory strategy …` commands, `stage --brief`, `recover-launch`, and `verdict put
+--brief` are thin wiring to `factory.strategy`, `factory.scheduler`, `dispatch.stage_brief` and `prune.put`. These
+tests inject fake `factory.strategy`/`factory.scheduler` modules so the handlers' lazy imports resolve, and assert the
+exact arguments each command passes through."""
 import contextlib
 import io
 import json
@@ -13,6 +13,8 @@ from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 from factory import cli, dispatch
+
+SCHED_STATUS = {"max_parallel": 2, "capacity_used": 0, "running": [], "launches": [], "holders": []}
 
 
 def run_cli(fn, cfg, conn, a):
@@ -39,19 +41,45 @@ def fake_strategy():
     return mod
 
 
+def fake_scheduler():
+    mod = ModuleType("factory.scheduler")
+    mod.status = mock.Mock(return_value=dict(SCHED_STATUS))
+    return mod
+
+
+def _install(name, mod):
+    prev = sys.modules.get(name)
+    sys.modules[name] = mod
+    return prev
+
+
+def _restore(name, prev):
+    if prev is None:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = prev
+
+
 @contextlib.contextmanager
 def strategy_module():
     """Install the fake `factory.strategy` for the handler's lazy `from . import strategy`."""
     mod = fake_strategy()
-    prev = sys.modules.get("factory.strategy")
-    sys.modules["factory.strategy"] = mod
+    prev = _install("factory.strategy", mod)
     try:
         yield mod
     finally:
-        if prev is None:
-            sys.modules.pop("factory.strategy", None)
-        else:
-            sys.modules["factory.strategy"] = prev
+        _restore("factory.strategy", prev)
+
+
+@contextlib.contextmanager
+def scheduler_module():
+    """Install the fake `factory.scheduler` for the handler's lazy `from . import scheduler`."""
+    mod = fake_scheduler()
+    prev = _install("factory.scheduler", mod)
+    try:
+        yield mod
+    finally:
+        _restore("factory.scheduler", prev)
 
 
 def a(**kw):
@@ -61,11 +89,14 @@ def a(**kw):
 class StrategyCommands(unittest.TestCase):
     """Each `factory strategy …` command passes the exact interface arguments through to the briefs slice."""
 
-    def test_list_is_overview(self):
-        with strategy_module() as mod:
+    def test_list_is_overview_plus_scheduler_status(self):
+        with strategy_module() as mod, scheduler_module() as sch:
             out = run_cli(cli.cmd_strategy, "cfg", "conn", a(scmd="list"))
         mod.overview.assert_called_once_with("cfg", "conn")
-        self.assertEqual(out, {"briefs": [], "tickets": []})
+        sch.status.assert_called_once_with("conn")
+        self.assertEqual(out["briefs"], [])
+        self.assertEqual(out["tickets"], [])
+        self.assertEqual(out["scheduler"], SCHED_STATUS)
 
     def test_show_is_get_without_render(self):
         with strategy_module() as mod:

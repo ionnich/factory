@@ -322,6 +322,7 @@ def cmd_overview(cfg, conn, a):
 
 
 def status(cfg, conn) -> dict:
+    from . import scheduler  # capacity, running, launch reservations and held claims (a pure DB read)
     q = lambda sql, *p: [dict(r) for r in conn.execute(sql, p)]
     fresh = {"fresh": 0, "stale": 0, "unverified": 0}
     owned = prune.owned_in_scope(cfg, conn)
@@ -355,6 +356,8 @@ def status(cfg, conn) -> dict:
                           "v.kind, v.target, v.written_back_run run_id FROM verdict v JOIN linear_latest l USING (issue_id) "
                           "WHERE v.written_back_run LIKE 'sweep-%' AND v.superseded_at IS NULL "
                           "ORDER BY v.written_back_run DESC LIMIT 10"),
+        # the execution scheduler's read: capacity in use, running dispatches, launch reservations, held claims
+        "scheduler": scheduler.status(conn),
     }
 
 
@@ -632,13 +635,14 @@ def cmd_witness(cfg, conn, a):
 
 
 # ---- strategy: source grooming and approved, versioned work briefs -------------------------------------------
-# `factory.strategy` (the briefs slice, a sibling worktree) owns the invariants and raises `dispatch.StageError`
-# for refusals; this CLI only wires each command to it. `show --render` returns the brief plus its compiled
-# Markdown intent/provenance. Grooming runs real DeepSeek in `strategy.groom` (long, no fake fields).
+# `factory.strategy` owns the invariants and raises `dispatch.StageError` for refusals; this CLI wires each command
+# to it. `show --render` returns the brief plus its compiled Markdown intent/provenance; `list` appends the
+# execution scheduler's read (capacity, running, launch reservations, held claims). Grooming runs real DeepSeek.
 def cmd_strategy(cfg, conn, a):
-    from . import strategy  # lazy: the briefs slice lands in a sibling worktree, so the CLI loads without it
+    from . import strategy
     if a.scmd == "list":
-        return out(strategy.overview(cfg, conn))
+        from . import scheduler
+        return out({**strategy.overview(cfg, conn), "scheduler": scheduler.status(conn)})
     if a.scmd == "show":
         brief = strategy.get(conn, a.brief_id)
         return out({"brief": brief, "render": strategy.render(conn, a.brief_id)} if a.render else brief)
