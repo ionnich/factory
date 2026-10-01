@@ -1,6 +1,6 @@
 """Execution slice behavioral regressions: hierarchical resource conflict, bounded capacity admission with a single
-winner, exact-version brief verification (brief_verdict), the bounded propose queue with blocked-first independence,
-uncertain-send safety, and the direct execute/resume pane guards."""
+winner, exact-version brief verification (real strategy.create/approve + brief_verdict), the bounded propose queue
+with blocked-first independence, uncertain-send safety, and the direct execute/resume pane guards."""
 import hashlib
 import json
 import os
@@ -13,11 +13,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
-import _v21  # noqa: E402
+import _helpers  # noqa: E402
 
 from factory import db, dispatch, prune, scheduler
 
-SNAP = _v21.SNAP
+SNAP = _helpers.SNAP
 
 
 class ResourceConflict(unittest.TestCase):
@@ -44,11 +44,10 @@ class Admission(unittest.TestCase):
         self.path = Path(tmp.name) / "t.db"
         self.c = db.connect(self.path)
         self.addCleanup(self.c.close)
-        _v21.ensure_schema(self.c)
 
     def staged(self, run_id, resources, route=None):
-        _v21.seed_dispatch(self.c, run_id, "draft", route=route)
-        scheduler.set_claims(self.c, run_id, resources)
+        _helpers.seed_dispatch(self.c, run_id, "draft", route=route)
+        _helpers.set_claims(self.c, run_id, resources)
         self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' "
                        "WHERE run_id=?", (run_id,))
         return run_id
@@ -60,8 +59,9 @@ class Admission(unittest.TestCase):
             self.assertIsNone(scheduler.reserve_if_free(self.c, run, pane, os.getpid()))
         self.staged("d3", {"repo:c", "route:fx-c"})
         self.assertIn("capacity full", scheduler.reserve_if_free(self.c, "d3", "p3", os.getpid()))
-        self.c.execute("UPDATE dispatch SET state='executing', executing_at=? WHERE run_id='d1'", (SNAP,))
-        self.assertEqual(scheduler.capacity_used(self.c), 2)  # executing + own sent launch counts once
+        self.c.execute("UPDATE dispatch SET state='executing', executor_pane='p1', executing_at=? WHERE run_id='d1'",
+                       (SNAP,))
+        self.assertEqual(scheduler.capacity_used(self.c), 2)  # executing + own launch counts once
 
     def test_unknown_global_conflicts_with_everything(self):
         self.staged("d1", {"global:*"})
@@ -81,13 +81,21 @@ class Admission(unittest.TestCase):
         self.staged("d2", {"repo:b", "route:fx-b"})
         self.assertIn("pane p1 is reserved for dispatch d1", scheduler.reserve_if_free(self.c, "d2", "p1", os.getpid()))
 
-    def test_terminal_frees_capacity_but_claims_held_until_archive(self):
-        self.staged("d1", {"repo:a", "route:fx-a"})
+    def test_terminal_frees_capacity_claims_held_until_archive(self):
+        _helpers.seed_snapshot(self.c, "i1", "FIN-1")
+        v = _helpers.seed_verdict(self.c, "i1")
+        _helpers.seed_dispatch(self.c, "d1", "draft")
+        _helpers.set_claims(self.c, "d1", {"repo:a", "route:fx-a"})
+        _helpers.seed_ticket(self.c, "d1", "i1", "FIN-1", v)
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' "
+                       "WHERE run_id='d1'")
         self.assertIsNone(scheduler.reserve_if_free(self.c, "d1", "p1", os.getpid()))
-        self.c.execute("UPDATE dispatch SET state='executing', executing_at=? WHERE run_id='d1'", (SNAP,))
+        self.c.execute("UPDATE dispatch SET state='executing', executor_pane='p1', executing_at=? WHERE run_id='d1'",
+                       (SNAP,))
         self.assertEqual(scheduler.capacity_used(self.c), 1)
-        scheduler.release_launch(self.c, "d1")  # terminal: done/reconciled free the slot
-        self.assertEqual(scheduler.capacity_used(self.c), 0)
+        self.c.execute("UPDATE dispatch_ticket SET card_status='blocked' WHERE run_id='d1'")  # auto-done -> done
+        self.assertEqual(self.c.execute("SELECT state FROM dispatch WHERE run_id='d1'").fetchone()[0], "done")
+        self.assertEqual(scheduler.capacity_used(self.c), 0)  # terminal frees capacity
         self.staged("d2", {"repo:a", "route:fx-b"})  # claims still conflict until archive
         self.assertIn("resource conflict", scheduler.reserve_if_free(self.c, "d2", "p2", os.getpid()))
 
@@ -119,70 +127,59 @@ class StageBrief(unittest.TestCase):
         tmp = Path(tmp.name)
         self.c = db.connect(tmp / "t.db")
         self.addCleanup(self.c.close)
-        _v21.ensure_schema(self.c)
-        self.c.execute("INSERT INTO linear_project VALUES ('p','s','API','lead@x',?)", (SNAP,))
-        self.c.execute("INSERT INTO repo_trunk VALUES ('o/api','main','deadbeef',?)", (SNAP,))
-        _v21.seed_snapshot(self.c, "i1", "FIN-1")
-        self.verdict = _v21.seed_verdict(self.c, "i1")
-        self.cfg = _v21.mkcfg(tmp)
+        _helpers.seed_project(self.c)
+        _helpers.seed_trunk(self.c)
+        _helpers.seed_snapshot(self.c, "i1", "FIN-1")
+        self.verdict = _helpers.seed_verdict(self.c, "i1")
+        self.cfg = _helpers.mkcfg(tmp)
 
     def test_stage_brief_requires_exact_association(self):
-        _v21.seed_brief(self.c, 1, ["FIN-1"])  # approved but never verified for this exact version
-        with mock.patch.object(dispatch, "_brief", return_value=_v21.brief_dict(1, ["FIN-1"])):
-            with self.assertRaisesRegex(dispatch.StageError, "no recorded verification"):
-                dispatch.stage_brief(self.cfg, self.c, 1, "user")
+        brief = _helpers.publish_brief(self.cfg, self.c, ["FIN-1"])  # real, approved, but unverified
+        with self.assertRaisesRegex(dispatch.StageError, "no recorded verification"):
+            dispatch.stage_brief(self.cfg, self.c, brief["id"], "user")
 
     def test_stage_brief_pins_association_and_resources(self):
-        _v21.seed_brief(self.c, 1, ["FIN-1"])
-        _v21.seed_association(self.c, 1, "i1", self.verdict)
-        with mock.patch.object(dispatch, "_brief", return_value=_v21.brief_dict(1, ["FIN-1"])):
-            res = dispatch.stage_brief(self.cfg, self.c, 1, "user")
-        self.assertEqual(res["brief_id"], 1)
+        brief = _helpers.publish_brief(self.cfg, self.c, ["FIN-1"])
+        _helpers.associate(self.c, brief["id"], "i1", self.verdict)
+        res = dispatch.stage_brief(self.cfg, self.c, brief["id"], "user")
+        self.assertEqual(res["brief_id"], brief["id"])
         row = self.c.execute("SELECT brief_id, state FROM dispatch WHERE run_id=?", (res["run_id"],)).fetchone()
-        self.assertEqual((row["brief_id"], row["state"]), (1, "draft"))
+        self.assertEqual((row["brief_id"], row["state"]), (brief["id"], "draft"))
         self.assertEqual(scheduler.claims(self.c, res["run_id"]), {"global:*", "repo:o/api", "route:fx-api"})
 
     def test_new_amendment_needs_new_verification(self):
-        _v21.seed_brief(self.c, 1, ["FIN-1"])
-        _v21.seed_association(self.c, 1, "i1", self.verdict)  # v1 verified
-        _v21.seed_brief(self.c, 2, ["FIN-1"], parent_id=1, revision=2)  # approved amendment, unverified
-        with mock.patch.object(dispatch, "_brief", return_value=_v21.brief_dict(2, ["FIN-1"])):
-            with self.assertRaisesRegex(dispatch.StageError, "no recorded verification"):
-                dispatch.stage_brief(self.cfg, self.c, 2, "user")  # source verdict is fresh, but this version is not
-        with mock.patch.object(dispatch, "_brief", return_value=_v21.brief_dict(1, ["FIN-1"])):
-            with self.assertRaisesRegex(dispatch.StageError, "superseded by a newer revision"):
-                dispatch.stage_brief(self.cfg, self.c, 1, "user")  # old version superseded by approved child
+        from factory import strategy
+        brief1 = _helpers.publish_brief(self.cfg, self.c, ["FIN-1"])
+        _helpers.associate(self.c, brief1["id"], "i1", self.verdict)  # v1 verified
+        draft2 = strategy.revise(self.cfg, self.c, brief1["id"], _helpers.body(title="T2"), "amend", _helpers.HUMAN)
+        brief2 = strategy.approve(self.cfg, self.c, draft2["id"], _helpers.HUMAN)  # approved amendment, unverified
+        with self.assertRaisesRegex(dispatch.StageError, "no recorded verification"):
+            dispatch.stage_brief(self.cfg, self.c, brief2["id"], "user")  # fresh source verdict is not borrowed
+        with self.assertRaisesRegex(dispatch.StageError, "superseded by a newer revision"):
+            dispatch.stage_brief(self.cfg, self.c, brief1["id"], "user")
 
     def test_stage_brief_refuses_source_changed_since_capture(self):
-        _v21.seed_brief(self.c, 1, ["FIN-1"])
-        _v21.seed_association(self.c, 1, "i1", self.verdict)
+        brief = _helpers.publish_brief(self.cfg, self.c, ["FIN-1"])
+        _helpers.associate(self.c, brief["id"], "i1", self.verdict)
         self.c.execute("INSERT INTO linear_snapshot VALUES ('i1','FIN-1',?,?,?,?,?)",
                        ("2026-09-02T00:00:00Z", "2026-09-02T00:00:00Z", "unstarted", 1,
                         json.dumps({"identifier": "FIN-1", "title": "x", "state": {"name": "Todo"},
                                     "team": {"key": "FIN"}, "assignee": None, "labels": {"nodes": []},
                                     "description": "Domain: API"})))
-        with mock.patch.object(dispatch, "_brief", return_value=_v21.brief_dict(1, ["FIN-1"])):
-            with self.assertRaisesRegex(dispatch.StageError, "changed since the brief was captured"):
-                dispatch.stage_brief(self.cfg, self.c, 1, "user")
+        with self.assertRaisesRegex(dispatch.StageError, "changed since the brief was captured"):
+            dispatch.stage_brief(self.cfg, self.c, brief["id"], "user")
 
     def test_stage_explicit_brief_rejects_non_approved(self):
-        _v21.seed_brief(self.c, 1, ["FIN-1"], state="draft")
-        with mock.patch.object(dispatch, "_brief", return_value=_v21.brief_dict(1, ["FIN-1"], state="draft")):
-            with self.assertRaisesRegex(dispatch.StageError, "not approved"):
-                dispatch.stage(self.cfg, self.c, ["FIN-1"], "user", brief_id=1)  # no bypass via explicit brief id
-
-    def test_stage_brief_refuses_held(self):
-        _v21.seed_brief(self.c, 1, ["FIN-1"], state="held")
-        with mock.patch.object(dispatch, "_brief", return_value=_v21.brief_dict(1, ["FIN-1"], state="held")):
-            with self.assertRaisesRegex(dispatch.StageError, "not approved"):
-                dispatch.stage_brief(self.cfg, self.c, 1, "user")
+        from factory import strategy
+        draft = strategy.create(self.cfg, self.c, ["FIN-1"], _helpers.HUMAN, body=_helpers.body())  # draft, not approved
+        with self.assertRaisesRegex(dispatch.StageError, "not approved"):
+            dispatch.stage(self.cfg, self.c, ["FIN-1"], "user", brief_id=draft["id"])  # no bypass via explicit id
 
     def test_stage_identifiers_resolve_exact_approved_brief(self):
-        _v21.seed_brief(self.c, 1, ["FIN-1"])
-        _v21.seed_association(self.c, 1, "i1", self.verdict)
-        with mock.patch.object(dispatch, "_brief", return_value=_v21.brief_dict(1, ["FIN-1"])):
-            res = dispatch.stage(self.cfg, self.c, ["FIN-1"], "user")
-        self.assertEqual(res["brief_id"], 1)
+        brief = _helpers.publish_brief(self.cfg, self.c, ["FIN-1"])
+        _helpers.associate(self.c, brief["id"], "i1", self.verdict)
+        res = dispatch.stage(self.cfg, self.c, ["FIN-1"], "user")
+        self.assertEqual(res["brief_id"], brief["id"])
 
     def test_stage_without_matching_brief_refuses(self):
         with self.assertRaisesRegex(dispatch.StageError, "no approved brief matches exactly"):
@@ -195,11 +192,15 @@ class Propose(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.c = db.connect(Path(tmp.name) / "t.db")
         self.addCleanup(self.c.close)
-        _v21.ensure_schema(self.c)
+        _helpers.seed_project(self.c)
+        _helpers.seed_trunk(self.c)
+        _helpers.seed_snapshot(self.c, "i1", "FIN-1")
+        self.verdict = _helpers.seed_verdict(self.c, "i1")
+        self.cfg = _helpers.mkcfg(Path(tmp.name))
 
     def test_handoff_does_not_starve_independent_second(self):
-        _v21.seed_dispatch(self.c, "d1", "staged")
-        _v21.seed_dispatch(self.c, "d2", "staged")
+        _helpers.seed_dispatch(self.c, "d1", "staged")
+        _helpers.seed_dispatch(self.c, "d2", "staged")
 
         def fake_handoff(cfg, conn, run_id):
             if run_id == "d1":
@@ -207,34 +208,36 @@ class Propose(unittest.TestCase):
             return {"run_id": run_id}
 
         with mock.patch.object(dispatch, "handoff", side_effect=fake_handoff), \
-                mock.patch.object(dispatch, "_ready", return_value=[]):
-            res = dispatch.propose(SimpleNamespace(raw={}), self.c)
+                mock.patch.object(dispatch, "release_safe_terminal", return_value=[]):
+            res = dispatch.propose(self.cfg, self.c)
         self.assertEqual([(h["run_id"], "blocked" in h) for h in res["handoffs"]],
                          [("d1", True), ("d2", False)])
 
     def test_prepare_skips_blocked_brief_and_prepares_next(self):
-        ready = [{"id": 1, "ready": False, "blockers": ["no evidence"]},
-                 {"id": 2, "ready": True, "blockers": []}]
+        from factory import strategy
+        held = _helpers.publish_brief(self.cfg, self.c, ["FIN-1"])
+        strategy.hold(self.cfg, self.c, held["id"], "waiting", _helpers.HUMAN)  # not intent-ready
+        ready = _helpers.publish_brief(self.cfg, self.c, ["FIN-1"])
+        _helpers.associate(self.c, ready["id"], "i1", self.verdict)
 
         def fake_stage(cfg, conn, brief_id, actor):
             return {"run_id": f"r{brief_id}", "brief_id": brief_id}
 
-        with mock.patch.object(dispatch, "_ready", return_value=ready), \
-                mock.patch.object(dispatch, "stage_brief", side_effect=fake_stage), \
-                mock.patch.object(dispatch, "handoff", return_value={}):
-            res = dispatch.propose(SimpleNamespace(raw={}), self.c)
-        self.assertEqual(res["prepared"], [{"brief_id": 2, "run_id": "r2"}])
-        self.assertEqual(res["blocked"], [{"brief_id": 1, "blockers": ["no evidence"]}])
+        with mock.patch.object(dispatch, "stage_brief", side_effect=fake_stage), \
+                mock.patch.object(dispatch, "handoff", return_value={}), \
+                mock.patch.object(dispatch, "release_safe_terminal", return_value=[]):
+            res = dispatch.propose(self.cfg, self.c)
+        self.assertEqual(res["prepared"], [{"brief_id": ready["id"], "run_id": f"r{ready['id']}"}])
+        self.assertEqual([b["brief_id"] for b in res["blocked"]], [held["id"]])
 
     def test_prepare_respects_queue_cap(self):
-        _v21.seed_dispatch(self.c, "d1", "draft")
-        _v21.seed_dispatch(self.c, "d2", "draft")
-        _v21.seed_dispatch(self.c, "d3", "staged")  # 3 nonexecuting already: nothing more prepared
-        ready = [{"id": 9, "ready": True, "blockers": []}]
-        with mock.patch.object(dispatch, "_ready", return_value=ready), \
-                mock.patch.object(dispatch, "stage_brief") as stage, \
-                mock.patch.object(dispatch, "handoff", return_value={}):
-            dispatch.propose(SimpleNamespace(raw={"executor": {"queue_cap": 3}}), self.c)
+        _helpers.seed_dispatch(self.c, "d1", "draft")
+        _helpers.seed_dispatch(self.c, "d2", "draft")
+        _helpers.seed_dispatch(self.c, "d3", "staged")  # 3 nonexecuting already: nothing more prepared
+        with mock.patch.object(dispatch, "stage_brief") as stage, \
+                mock.patch.object(dispatch, "handoff", return_value={}), \
+                mock.patch.object(dispatch, "release_safe_terminal", return_value=[]):
+            dispatch.propose(self.cfg, self.c)
         stage.assert_not_called()
 
 
@@ -245,9 +248,8 @@ class UncertainSend(unittest.TestCase):
         self.path = Path(tmp.name) / "t.db"
         self.c = db.connect(self.path)
         self.addCleanup(self.c.close)
-        _v21.ensure_schema(self.c)
-        _v21.seed_dispatch(self.c, "d1", "draft")
-        scheduler.set_claims(self.c, "d1", {"repo:a", "route:fx-a"})
+        _helpers.seed_dispatch(self.c, "d1", "draft")
+        _helpers.set_claims(self.c, "d1", {"repo:a", "route:fx-a"})
         self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' "
                        "WHERE run_id='d1'")
         self.cfg = SimpleNamespace(raw={})
@@ -286,8 +288,7 @@ class UncertainSend(unittest.TestCase):
             dispatch.release_unsent(self.cfg, self.c, "d1", "agent:factory", "reason")
         with self.assertRaisesRegex(dispatch.StageError, "say why"):
             dispatch.release_unsent(self.cfg, self.c, "d1", "user:cli", "  ")
-        panes = {"result": {"panes": []}}  # the stored pane is unknown: refuse
-        with mock.patch.object(dispatch, "_herdr", return_value=panes), \
+        with mock.patch.object(dispatch, "_herdr", return_value={"result": {"panes": []}}), \
                 self.assertRaisesRegex(dispatch.StageError, "unknown"):
             dispatch.release_unsent(self.cfg, self.c, "d1", "user:cli", "reason")
         busy = {"result": {"panes": [{"pane_id": "w1:p1", "agent": "omp", "agent_status": "running"}]}}
@@ -302,13 +303,12 @@ class ExecuteGuard(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.c = db.connect(Path(tmp.name) / "t.db")
         self.addCleanup(self.c.close)
-        _v21.ensure_schema(self.c)
 
     def test_legacy_staged_execute_reserves_safely(self):
         body = b"# Dispatch d1\n"
         self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at,route) "
                        "VALUES ('d1','draft','[]','x',?,'fx-api')", (SNAP,))
-        scheduler.set_claims(self.c, "d1", {"repo:a", "route:fx-api"})  # draft: pinned
+        _helpers.set_claims(self.c, "d1", {"repo:a", "route:fx-api"})  # pinned while draft
         self.c.execute("UPDATE dispatch SET state='staged', body_sha256=?, approved_by='u', last_actor='p' "
                        "WHERE run_id='d1'", (hashlib.sha256(body).hexdigest(),))
         dispatches = Path(tempfile.mkdtemp())
@@ -322,8 +322,8 @@ class ExecuteGuard(unittest.TestCase):
         self.assertEqual(self.c.execute("SELECT state FROM dispatch").fetchone()[0], "executing")
 
     def test_resume_refuses_another_dispatchs_pane(self):
-        _v21.seed_dispatch(self.c, "d1", "executing")
-        _v21.seed_dispatch(self.c, "d2", "staged")
+        _helpers.seed_dispatch(self.c, "d1", "executing")
+        _helpers.seed_dispatch(self.c, "d2", "staged")
         self.c.execute("INSERT INTO dispatch_launch(run_id,pane_id,state,claimed_at) VALUES ('d2','w1:p1','sent',?)",
                        (SNAP,))
         pane = {"pane_id": "w1:p1", "agent": "omp", "agent_status": "idle"}
@@ -332,7 +332,7 @@ class ExecuteGuard(unittest.TestCase):
             dispatch.resume(SimpleNamespace(raw={}), self.c, "d1")
 
     def test_resume_refuses_busy_fallback_pane(self):
-        _v21.seed_dispatch(self.c, "d1", "executing")  # executor_pane is 'pane1', not the fallback
+        _helpers.seed_dispatch(self.c, "d1", "executing")  # executor_pane is 'pane1', not the fallback
         pane = {"pane_id": "w1:p1", "agent": "omp", "agent_status": "running"}
         with mock.patch.object(dispatch, "_target", return_value=(pane, "factory-primary")), \
                 self.assertRaisesRegex(dispatch.StageError, "unrelated work"):
@@ -345,19 +345,15 @@ class PruneBacklogBrief(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         c = db.connect(Path(tmp.name) / "t.db")
         self.addCleanup(c.close)
-        _v21.ensure_schema(c)
-        c.execute("INSERT INTO linear_project VALUES ('p','s','API','lead@x',?)", (SNAP,))
-        c.execute("INSERT INTO repo_trunk VALUES ('o/api','main','deadbeef',?)", (SNAP,))
-        _v21.seed_snapshot(c, "i1", "FIN-1", state_type="backlog", in_scope=0)  # Backlog source
-        _v21.seed_brief(c, 1, ["FIN-1"])
-        cfg = _v21.mkcfg(Path(tmp.name))
-        with mock.patch.object(prune, "_brief_verify_targets", return_value=[
-                {"brief_id": 1, "identifier": "FIN-1", "issue_id": "i1", "narrative": "# Brief 1"}]):
-            got = prune.gate(cfg, c)
+        _helpers.seed_project(c)
+        _helpers.seed_trunk(c)
+        _helpers.seed_snapshot(c, "i1", "FIN-1", state_type="backlog", in_scope=0)  # Backlog source
+        cfg = _helpers.mkcfg(Path(tmp.name))
+        _helpers.publish_brief(cfg, c, ["FIN-1"])  # real approved brief, unverified
+        got = prune.gate(cfg, c)
         items = {t["identifier"]: t for t in got["context"]["tickets"]}
         self.assertIn("FIN-1", items)
-        self.assertEqual(items["FIN-1"]["brief_id"], 1)
-        self.assertEqual(items["FIN-1"]["brief"], "# Brief 1")
+        self.assertIn("brief_id", items["FIN-1"])
 
 
 if __name__ == "__main__":

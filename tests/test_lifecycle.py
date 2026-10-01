@@ -69,6 +69,7 @@ class Phases(unittest.TestCase):
                        "created_by) VALUES ('i1',?,'r1','valid','r','[1]',?,'t')", (SNAP, SNAP))
         self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at,drafted_by) "
                        "VALUES ('d1','draft','[]','x',?,'user')", (SNAP,))
+        self.c.execute("INSERT INTO dispatch_resource(run_id, resource) VALUES ('d1','global:*')")  # pinned while draft
         self.c.execute("INSERT INTO dispatch_ticket(run_id,issue_id,identifier,snapshot_updated_at,verdict_id) "
                        "VALUES ('d1','i1','FIN-1',?,1)", (SNAP,))
         self.cfg = SimpleNamespace(repos={}, raw={}, dispatches=self.tmp, mirror_path=lambda r: self.tmp / r)

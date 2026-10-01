@@ -25,11 +25,6 @@ from . import db
 
 GLOBAL = "global:*"
 
-# dispatch states that still hold resource claims against a new admission (until archived).
-_CLAIM_STATES = ("executing", "done", "reconciled")
-# launch states that still hold capacity + pane.
-_LAUNCH_STATES = ("reserved", "sent", "uncertain")
-
 
 def max_parallel(conn: sqlite3.Connection) -> int:
     row = conn.execute("SELECT max_parallel FROM execution_policy WHERE id=1").fetchone()
@@ -82,15 +77,14 @@ def set_claims(conn: sqlite3.Connection, run_id: str, resources) -> None:
 
 
 def conflicting_holder(conn: sqlite3.Connection, run_id: str, resources) -> str | None:
-    """A live holder (executing/done/reconciled, or a pending launch) whose claims conflict with any of
-    `resources`. Returns a human blocker, else None."""
+    """A current claim holder (executing/done/reconciled, or a nonterminal launch) whose claims conflict with any
+    of `resources`. Uses the authoritative `claim_holders` view (route/resource persist until archive; archived
+    dispatches no longer conflict)."""
     if not resources:
         return None
     holders = conn.execute(
         "SELECT d.run_id, r.resource FROM dispatch_resource r JOIN dispatch d USING (run_id) "
-        "WHERE (d.state IN ('executing','done','reconciled') "
-        "   OR EXISTS (SELECT 1 FROM dispatch_launch l WHERE l.run_id = d.run_id)) "
-        "AND d.run_id <> ?", (run_id,)).fetchall()
+        "WHERE d.run_id IN (SELECT run_id FROM claim_holders) AND d.run_id <> ?", (run_id,)).fetchall()
     for h in holders:
         for want in resources:
             if resources_conflict(h["resource"], want):
@@ -99,10 +93,9 @@ def conflicting_holder(conn: sqlite3.Connection, run_id: str, resources) -> str 
 
 
 def capacity_used(conn: sqlite3.Connection) -> int:
-    """executing dispatches union nonterminal launch reservations, counted by distinct run id."""
-    return conn.execute(
-        "SELECT count(*) FROM (SELECT run_id FROM dispatch WHERE state='executing' "
-        "UNION SELECT run_id FROM dispatch_launch WHERE state IN ('reserved','sent','uncertain'))").fetchone()[0]
+    """Distinct running+nonterminal-launch run ids, from the authoritative `launch_active` view. A terminal dispatch
+    frees capacity even if its (unsafe) launch reservation is retained for explicit recovery."""
+    return conn.execute("SELECT count(DISTINCT run_id) FROM launch_active").fetchone()[0]
 
 
 def launch(conn: sqlite3.Connection, run_id: str):
@@ -173,8 +166,17 @@ def mark_uncertain(conn: sqlite3.Connection, run_id: str, error: str) -> None:
 
 
 def release_launch(conn: sqlite3.Connection, run_id: str) -> None:
-    """Release the capacity + pane slot. Safe when definitely unsent (release_unsent) or terminal."""
+    """Release a launch row. Caller must ensure it is safe (definitely unsent, i.e. `reserved`, or a terminal
+    `sent`); the schema launch_release_guard blocks `uncertain` and nonterminal `sent`."""
     conn.execute("DELETE FROM dispatch_launch WHERE run_id=?", (run_id,))
+
+
+def release_terminal_launch(conn: sqlite3.Connection, run_id: str) -> None:
+    """Release a terminal dispatch's launch slot only when the reservation is positively safe (`reserved` or
+    `sent`). An `uncertain` launch is retained (the pane is not confirmed safe) for explicit human recovery."""
+    l = conn.execute("SELECT state FROM dispatch_launch WHERE run_id=?", (run_id,)).fetchone()
+    if l is not None and l["state"] in ("reserved", "sent"):
+        conn.execute("DELETE FROM dispatch_launch WHERE run_id=?", (run_id,))
 
 
 def release_claims(conn: sqlite3.Connection, run_id: str) -> None:
@@ -187,9 +189,7 @@ def status(conn: sqlite3.Connection) -> dict:
     """Read-only execution summary for the Run tab / dashboard: capacity, running, launches, held resources."""
     holders = conn.execute(
         "SELECT d.run_id, d.state, r.resource, d.brief_id FROM dispatch_resource r JOIN dispatch d USING (run_id) "
-        "WHERE d.state IN ('executing','done','reconciled') "
-        "   OR EXISTS (SELECT 1 FROM dispatch_launch l WHERE l.run_id = d.run_id) "
-        "ORDER BY r.resource").fetchall()
+        "WHERE d.run_id IN (SELECT run_id FROM claim_holders) ORDER BY r.resource").fetchall()
     return {
         "max_parallel": max_parallel(conn),
         "capacity_used": capacity_used(conn),

@@ -141,52 +141,59 @@ def _approved_head_brief(conn, brief_id: int) -> dict:
     return {"id": row["id"], "sources": json.loads(row["sources_json"])}
 
 
-def _has_association(conn, brief_id: int, issue_id: str) -> bool:
-    """True when brief_verdict already pins a current (non-superseded) verdict for this exact brief version+issue."""
-    bv = conn.execute("SELECT verdict_id FROM brief_verdict WHERE brief_id=? AND issue_id=?",
-                      (brief_id, issue_id)).fetchone()
-    if bv is None:
-        return False
-    v = conn.execute("SELECT superseded_at FROM verdict WHERE id=?", (bv["verdict_id"],)).fetchone()
-    return v is not None and v["superseded_at"] is None
+def _associated_stale(cfg: Config, conn, issue_id: str, verdict_id: int) -> bool:
+    """True when a brief_verdict association's verdict is no longer current-valid-fresh (superseded, non-valid, or
+    stale evidence/aged). A stale current association must force fresh brief verification, never a raw fallback."""
+    v = conn.execute("SELECT * FROM verdict WHERE id=?", (verdict_id,)).fetchone()
+    if v is None or v["superseded_at"] is not None or v["kind"] != "valid":
+        return True
+    cur = conn.execute("SELECT * FROM linear_latest WHERE issue_id=?", (issue_id,)).fetchone()
+    if cur is None:
+        return True
+    ctx, _ = map_context(cfg, cur)
+    return verdict_staleness(cfg, conn, cur, ctx, v) is not None
+
+
+def _brief_source_issues(conn) -> set:
+    """issue ids of every source of a published (approved|held) brief, so generic raw-narrative jobs never
+    contradict a brief-backed verification."""
+    out = set()
+    for (sources_json,) in conn.execute("SELECT sources_json FROM work_brief WHERE state IN ('approved','held')"):
+        out |= {s["issue_id"] for s in json.loads(sources_json) if s.get("issue_id")}
+    return out
 
 
 def _brief_verify_targets(cfg: Config, conn) -> list[dict]:
-    """Sources of approved, current, unconsumed briefs that still lack an exact-version verification association.
-    A new approved brief (or amendment) needs a fresh prune from its compiled intent even when the source already
-    carries a fresh generic verdict. Held briefs, superseded versions and source-drifted briefs are excluded."""
+    """Sources of intent-ready briefs that need exact-version verification: an unverified source (no/non-valid
+    association for this version) or one whose associated verdict went stale. Uses strategy.ready intent_ready, so
+    held / source-drifted / superseded / dependency-unmet briefs are already excluded."""
     from . import strategy
     out = []
-    for b in conn.execute(
-            "SELECT id FROM work_brief WHERE state='approved' AND "
-            "NOT EXISTS (SELECT 1 FROM dispatch d WHERE d.brief_id = work_brief.id) AND "
-            "NOT EXISTS (SELECT 1 FROM work_brief c WHERE c.parent_id = work_brief.id AND c.state IN ('approved','held')) "
-            "ORDER BY id"):
-        sources = json.loads(conn.execute("SELECT sources_json FROM work_brief WHERE id=?", (b["id"],)).fetchone()[0])
-        for src in sources:
-            ident = src.get("identifier")
-            if not ident:
-                continue
-            cur = conn.execute("SELECT updated_at FROM linear_latest WHERE issue_id=?", (src["issue_id"],)).fetchone()
-            if cur is not None and cur["updated_at"] != src["snapshot_updated_at"]:
-                continue  # source drifted since capture: amendment, not verification
-            if _has_association(conn, b["id"], src["issue_id"]):
-                continue
-            out.append({"brief_id": b["id"], "identifier": ident, "issue_id": src["issue_id"],
-                        "narrative": strategy.render(conn, b["id"])})
+    for b in strategy.ready(cfg, conn):
+        if not b.get("intent_ready"):
+            continue
+        verdict_by_issue = {v["issue_id"]: v for v in b.get("verdicts", [])}
+        for s in b["sources"]:
+            v = verdict_by_issue.get(s["issue_id"])
+            if v is None or not v.get("valid") or _associated_stale(cfg, conn, s["issue_id"], v["verdict_id"]):
+                out.append({"brief_id": b["id"], "identifier": s["identifier"], "issue_id": s["issue_id"],
+                            "narrative": strategy.render(conn, b["id"])})
     return out
 
 
 def gate(cfg: Config, conn) -> dict:
     """Hermes pre-check over owned tickets: auto-verdict unmapped ones, list the rest for the agent. A brief-backed
-    source is verified from the brief narrative (never the raw Linear prose) and carries its brief_id so the agent
-    writes the exact-version association; a new approved brief/amendment forces work even when the source already
-    has a fresh generic verdict."""
+    source is verified from the compiled brief narrative (never raw Linear prose) and carries its exact brief_id; an
+    unverified or stale-associated source forces brief verification even when the source already has a fresh generic
+    verdict. Published brief sources never get a contradictory generic raw-narrative job."""
     batch = cfg.raw.get("prune", {}).get("batch", 2)
     todo, auto = [], 0
+    brief_sources = _brief_source_issues(conn)
     rows = sorted(owned_in_scope(cfg, conn), key=lambda s: s["updated_at"], reverse=True)
     rows.sort(key=lambda s: json.loads(s["raw_json"])["priority"] or 5)  # stable: priority, then newest
     for s in rows:
+        if s["issue_id"] in brief_sources:
+            continue  # a published brief source is verified brief-backed, never raw
         ctx, why = map_context(cfg, s)
         reason = staleness(cfg, conn, s, ctx)
         if reason is None:
@@ -299,6 +306,8 @@ def put(cfg: Config, conn, identifier: str, kind: str, reason: str, evidence: li
             src = next((x for x in b["sources"] if x.get("identifier") == identifier), None)
             if src is None:
                 raise VerdictError(f"{identifier} is not a source of brief #{brief_id}")
+            if src["issue_id"] != s["issue_id"]:
+                raise VerdictError(f"{identifier}: brief #{brief_id} pins issue {src['issue_id']}, not {s['issue_id']}")
             if s["updated_at"] != src["snapshot_updated_at"]:
                 raise VerdictError(f"{identifier} changed since brief #{brief_id} captured it; amend the brief")
         if not owned(cfg, conn, s):
@@ -339,7 +348,9 @@ def put(cfg: Config, conn, identifier: str, kind: str, reason: str, evidence: li
             (s["issue_id"], s["updated_at"], ctx.name if ctx else None, ctx.repo if ctx else None, trunk,
              kind, target, reason.strip(), json.dumps(evidence), json.dumps(sorted(set(paths))), now, actor))
         if brief_id is not None:  # the exact version -> verdict association (never a generic borrowed verdict)
-            conn.execute("INSERT INTO brief_verdict(brief_id, issue_id, verdict_id) VALUES (?,?,?)",
+            # Re-verify upserts the same (version, source) key; only verdict_id is re-bound (schema key_frozen).
+            conn.execute("INSERT INTO brief_verdict(brief_id, issue_id, verdict_id) VALUES (?,?,?) "
+                         "ON CONFLICT(brief_id, issue_id) DO UPDATE SET verdict_id=excluded.verdict_id",
                          (brief_id, s["issue_id"], cur.lastrowid))
         learn.cite(conn, reason)
         return cur.lastrowid

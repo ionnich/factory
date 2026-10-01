@@ -11,12 +11,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
-import _v21  # noqa: E402
+import _helpers  # noqa: E402
 
 from factory import db, dispatch, scheduler
 from factory.config import Context
 
-SNAP = "2026-09-01T00:00:00Z"
+SNAP = _helpers.SNAP
 LEAD, CAPTAIN = {"pane_id": "w6X:p2", "agent": "omp", "agent_status": "done"}, {"pane_id": "w6M:p1", "agent_status": "idle"}
 
 
@@ -27,7 +27,6 @@ class Route(unittest.TestCase):
         (self.homes / "factory-primary" / "state").mkdir(parents=True)
         (self.homes / "fx-news-pipeline" / "state").mkdir(parents=True)
         self.c = db.connect(tmp / "f.db")
-        _v21.ensure_schema(self.c)
         self.cfg = SimpleNamespace(raw={}, dispatches=tmp / "dispatches")
         body = b"# Dispatch d1\n"
         (self.cfg.dispatches / "d1").mkdir(parents=True)
