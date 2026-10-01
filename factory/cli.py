@@ -653,6 +653,12 @@ def cmd_strategy(cfg, conn, a):
         return out({"brief": brief, "render": strategy.render(conn, a.brief_id)} if a.render else brief)
     if a.scmd == "groom":
         return out(strategy.groom(cfg, conn, a.identifiers, a.actor))
+    if a.scmd == "investigate":
+        from . import brief_investigate
+        return out(brief_investigate.request(cfg, conn, a.brief_id))
+    if a.scmd == "investigate-run":
+        from . import brief_investigate
+        return out(brief_investigate.run(cfg, conn, a.id))
     if a.scmd == "create":
         return out(strategy.create(cfg, conn, a.identifiers, a.actor, body=_json_body(a.body) if a.body else None))
     if a.scmd == "revise":
@@ -853,6 +859,12 @@ def main(argv=None):
     s = st.add_parser("groom", help="run DeepSeek over the named sources into an editable draft brief")
     s.add_argument("identifiers", nargs="+")
     s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("investigate", help="start a detached read-only investigation of a blocked published brief")
+    s.add_argument("brief_id", type=int)
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("investigate-run", help=argparse.SUPPRESS)
+    s.add_argument("id", type=int)
     s.set_defaults(fn=cmd_strategy)
     s = st.add_parser("create", help="draft a brief from the named sources (deterministic; optional body)")
     s.add_argument("identifiers", nargs="+")

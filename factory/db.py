@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -634,6 +634,23 @@ BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;""",
   edges_json  TEXT NOT NULL CHECK (json_valid(edges_json) AND json_type(edges_json) = 'array'),
   nodes_json  TEXT NOT NULL CHECK (json_valid(nodes_json) AND json_type(nodes_json) = 'array'),
   fingerprint TEXT NOT NULL CHECK (length(fingerprint) > 0));""",
+    # v24: durable blocked-brief investigations and their optional unapproved replacement revision.
+    24: """CREATE TABLE brief_investigation (
+  id INTEGER PRIMARY KEY,
+  brief_id INTEGER NOT NULL REFERENCES work_brief(id),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+  requested_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT,
+  error TEXT,
+  proposal_brief_id INTEGER REFERENCES work_brief(id),
+  result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+  context_json TEXT NOT NULL CHECK (json_valid(context_json)),
+  CHECK (status IN ('pending', 'running') OR completed_at IS NOT NULL),
+  CHECK (status <> 'completed' OR result_json IS NOT NULL),
+  CHECK (status <> 'failed' OR error IS NOT NULL));
+CREATE UNIQUE INDEX brief_investigation_active ON brief_investigation(brief_id)
+WHERE status IN ('pending', 'running');""",
 }
 
 
