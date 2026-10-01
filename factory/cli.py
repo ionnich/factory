@@ -8,6 +8,7 @@ import sqlite3
 import statistics
 import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from . import ask, config, costs, db, decide, dispatch, jev, learn, linear, prune, reconcile, repos, witness
 
@@ -30,7 +31,7 @@ def _json_body(src: str) -> dict:
     """A brief body as a JSON object: inline JSON, a file path, or - for stdin (the verdict_put pattern)."""
     src = src.strip()
     try:
-        body = json.loads(src if src[:1] in "{[" else sys.stdin.read() if src == "-" else open(src).read())
+        body = json.loads(src if src[:1] in "{[" else sys.stdin.read() if src == "-" else Path(src).read_text())
     except (json.JSONDecodeError, OSError) as e:
         raise dispatch.StageError(f"body: {e}") from None
     if not isinstance(body, dict):
