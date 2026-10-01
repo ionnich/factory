@@ -1,14 +1,14 @@
 // Strategy: a supporting workspace (beside the lifecycle stages, at ?stage=strategy) that turns source tickets into
 // approved, immutable, versioned work briefs (intent). Factory keeps verification, implementation planning and
-// execution; Strategy keeps source grooming and human-published intent, so a dispatch never reconstructs intent by
+// execution; Strategy keeps source grooming and human-approved intent, so a dispatch never reconstructs intent by
 // re-reading a Linear narrative.
 //
 //   GET /strategy is a pure cached read: brief summaries (no body), the source list, execution policy, and active
 //   dispatches. Selecting a brief GETs /strategy/{id} for its full body + captured sources + the compiled Markdown
 //   render. Grooming runs real DeepSeek through the CLI (long), so it shows busy and any error truthfully — never a
 //   fake placeholder. Editing persists a new draft revision (immutable versions; an amendment needs a reason).
-//   Publishing (approve) is intent only, distinct from staging (execution) — each its own action with a
-//   resource-review warning. Holding/unholding is an explicit readiness change.
+//   Approval freezes intent for planning only; creating a draft dispatch is a separate readiness-gated action.
+//   Holding/unholding is an explicit readiness change.
 //
 // Layout: sources are the default landing surface, with grouped relationship-aware browsing first. The brief list is
 // opened intentionally, and a selected brief replaces browsing until the operator returns to sources. Grouped mode
@@ -288,7 +288,7 @@ function BriefRow({ b, selected, onSelect, onDispatch }) {
         <div className="fx-row-meta fx-hint">#{b.id} · revision {b.revision}{b.created_by ? ` · ${b.created_by}` : ""}
           {b.created_at ? ` · ${ago(b.created_at)}` : ""}
           {b.sources?.length ? ` · ${plural(b.sources.length, "source")}` : ""}</div>
-        {blockers.length ? <div className="fx-hint">{clip(blockers.join("; "), 120)}</div> : null}
+        {blockers.length ? <div className="fx-hint">Open for grouped readiness details and recovery actions.</div> : null}
         {relWarnings.length ? <div className="fx-err">{clip(relWarnings.join("; "), 160)}</div> : null}
       </div>
       <div className="fx-tc-ne">
@@ -298,6 +298,68 @@ function BriefRow({ b, selected, onSelect, onDispatch }) {
           </button>
         ) : <span className="fx-hint">not dispatched</span>}
       </div>
+    </div>
+  );
+}
+
+const READINESS_GROUPS = {
+  completed: ["Completed sources", "Completed work cannot be dispatched again. Review a replacement without these sources."],
+  canceled: ["Canceled sources", "Canceled work cannot be dispatched. Review a replacement without these sources."],
+  "human-review": ["QA / human review", "These tickets are owned by the human review flow, not execution."],
+  ownership: ["Ownership and routing", "Resolve assignment, domain mapping, or route ownership before including these sources."],
+  source: ["Other source conflicts", "Resolve the current source conflict before including these tickets."],
+};
+
+function FactRows({ rows }) {
+  return (
+    <div className="fx-stack-v">
+      {rows.map((row, i) => (
+        <div className="fx-row fx-row-meta" key={`${row.identifier || "fact"}-${i}`}>
+          {row.identifier ? <span className="fx-id">{row.identifier}</span> : null}
+          <span>{row.reason || row.status}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Structured backend facts keep safety detail scannable without parsing or flattening refusal strings.
+function ReadinessPanel({ summary }) {
+  const facts = summary?.readiness_facts;
+  if (!facts) {
+    if (!summary?.blockers?.length) return null;
+    return <FxDetails summary={<span className="fx-k">Readiness details ({summary.blockers.length})</span>}>
+      <FactRows rows={summary.blockers.map((reason) => ({ reason }))} />
+    </FxDetails>;
+  }
+  const sourceGroups = Object.entries(READINESS_GROUPS).map(([category, meta]) => ({
+    category, meta, rows: (facts.sources || []).filter((row) => row.category === category),
+  })).filter((group) => group.rows.length);
+  const groups = [
+    ...sourceGroups,
+    facts.drift?.length ? { category: "drift", meta: ["Source drift", "Review the changed source, then amend or groom a replacement that captures current truth."], rows: facts.drift } : null,
+    facts.dependencies?.length ? {
+      category: "dependencies", meta: ["Unmet dependencies", "Complete the prerequisite or revise the brief's dependency decision."],
+      rows: facts.dependencies.map((d) => ({ identifier: d.identifier, reason: d.status })),
+    } : null,
+    facts.held ? { category: "held", meta: ["Held", "Resolve the hold reason, then explicitly unhold. The approved brief remains intact."],
+                   rows: [{ reason: facts.held }] } : null,
+    facts.verification?.length ? {
+      category: "verification", meta: ["Verification pending", "Factory must bind fresh valid evidence to this exact approved version before a draft dispatch can be created."],
+      rows: facts.verification,
+    } : null,
+  ].filter(Boolean);
+  if (!groups.length) return <div className="fx-hint">Ready to create a draft dispatch.</div>;
+  return (
+    <div className="fx-stack-v" role="region" aria-label="Dispatch readiness">
+      <div className="fx-k">What blocks a draft dispatch</div>
+      {groups.map((group) => (
+        <details className="fx-sec fx-fold" key={group.category} open>
+          <summary>{group.meta[0]} ({group.rows.length})</summary>
+          <div className="fx-hint">{group.meta[1]}</div>
+          <FactRows rows={group.rows} />
+        </details>
+      ))}
     </div>
   );
 }
@@ -693,10 +755,19 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   // The editable form, reset when the open brief's version changes (a new revision is its own row).
   const [edit, setEdit] = useState(null);
   const [reason, setReason] = useState("");
-  const [arm, setArm] = useState(null);  // the weighty action awaiting its second tap: publish|stage|amend|hold
+  const [arm, setArm] = useState(null);  // the weighty action awaiting its second tap: approve|dispatch|amend|hold
   useEffect(() => { setEdit(current ? toForm(current.body) : null); setReason(""); setArm(null); },
             [current?.id, current?.revision]);  // eslint-disable-line react-hooks/exhaustive-deps
   const dirty = !!current && !!edit && canonical(edit) !== canonical(toForm(current.body || {}));
+  const canCreateDispatch = current?.state === "approved" && summary?.readiness === "ready" && !dirty;
+  const dispatchWhy = dirty ? "Save or discard edits first."
+    : summary?.readiness === "verification-pending" ? "Exact-version verification is pending."
+    : summary?.readiness === "needs-amendment" ? "Review source drift and amend or groom a replacement."
+    : summary?.readiness === "blocked" ? "Resolve the grouped blockers or review replacement sources."
+    : summary?.readiness === "held" ? "Resolve the hold reason and explicitly unhold."
+    : summary?.readiness === "dispatched" ? "This brief already has a dispatch."
+    : summary?.readiness === "superseded" ? "Use the current approved revision."
+    : !summary ? "Readiness is still loading." : null;
 
   const call = async (path, body, what) => {  // one write at a time; busy/err live in the parent view (survive leaving)
     update({ busy: what, err: null });
@@ -727,7 +798,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     if (r.id !== atOpen) { lastOpen.current = r.id; onNavigate({ stage: "strategy", brief: r.id }); }
   };
 
-  // Editing any field (title, outcome, resources, …) disarms an armed publish so the human always re-confirms the
+  // Editing any field (title, outcome, resources, …) disarms an armed approval so the human always re-confirms the
   // values actually shown; nothing is auto-saved or auto-approved.
   const editField = (key, v) => { setEdit((e) => ({ ...e, [key]: v })); setArm(null); };
 
@@ -738,7 +809,8 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     if (!r) return;
     // Remove only the identifiers this request submitted; picks made since are left alone. Spread `s` so the rest of
     // the view (open brief, filters, sort, source mode, expansions, pagination) is preserved.
-    onViewChange((s) => ({ ...s, picked: (s.picked || []).filter((i) => !submitted.includes(i)) }));
+    onViewChange((s) => ({ ...s, picked: (s.picked || []).filter((i) => !submitted.includes(i)),
+                           replacementReview: null }));
     if (applyGuarded(r, atNav)) settleId(r, atOpen);
     onDone(r, null, `Groomed a draft brief #${r.id} from ${submitted.length} source${submitted.length === 1 ? "" : "s"}`);
   };
@@ -751,29 +823,29 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     onDone(r, null, `Saved draft #${r.id}`);
   };
 
-  const publish = async () => {
-    if (arm !== "publish") { setArm("publish"); return; }
+  const approveBrief = async () => {
+    if (arm !== "approve") { setArm("approve"); return; }
     setArm(null);
     const atOpen = open, atNav = NAV_TOKEN;
     let target = current;
-    if (dirty) {  // publish the exact edited version: persist it, then approve it
-      target = await call(`/strategy/${open}/revise`, { body: formToBody(edit), reason: reason.trim() || "publish" }, "publish");
+    if (dirty) {  // approve the exact edited version: persist it, then approve it
+      target = await call(`/strategy/${open}/revise`, { body: formToBody(edit), reason: reason.trim() || "approval" }, "approve");
       if (!target) return;
     }
     const approved = await call(`/strategy/${target.id}/approve`, {}, "approve");
     if (!approved) return;
     if (applyGuarded(approved, atNav)) settleId(approved, atOpen);
-    onDone(approved, null, `Published #${approved.id} as approved intent (not execution)`);
+    onDone(approved, null, `Approved brief #${approved.id} for planning (not execution)`);
   };
 
-  const amend = async () => {  // published -> new draft revision; the reason is required
+  const amend = async () => {  // approved/held -> new draft revision; the reason is required
     if (arm !== "amend") { setArm("amend"); return; }
     if (!reason.trim()) return;
     const atOpen = open, atNav = NAV_TOKEN;
     const r = await call(`/strategy/${open}/revise`, { body: formToBody(edit), reason: reason.trim() }, "amend");
     if (!r) return;
     if (applyGuarded(r, atNav)) settleId(r, atOpen);
-    onDone(r, null, `Amendment #${r.id} drafted; review and publish`);
+    onDone(r, null, `Amendment #${r.id} drafted; review and approve`);
   };
 
   const hold = async () => {
@@ -794,17 +866,25 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     onDone(r, null, `Unheld #${open}`);
   };
 
-  const alive = useRef(true);  // a late reply never steals navigation: staging only moves the page while Strategy is open
+  const alive = useRef(true);  // a late reply never steals navigation: dispatch creation moves only while Strategy is open
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
-  const stage = async () => {
-    if (arm !== "stage") { setArm("stage"); return; }
+  const createDispatch = async () => {
+    if (arm !== "dispatch") { setArm("dispatch"); return; }
     setArm(null);
     const atNav = NAV_TOKEN;
-    const r = await call(`/strategy/${open}/stage`, {}, "stage");
+    const r = await call(`/strategy/${open}/stage`, {}, "dispatch");
     if (!r) return;
-    onDone(r, null, `Staged ${r.run_id || ""} for review`);
+    onDone(r, null, `Created draft dispatch ${r.run_id || ""} for review`);
     // Redirect only if the operator is still on this brief (nav token) and the tab is still mounted (lifecycle).
     if (r.run_id && alive.current && NAV_TOKEN === atNav) onNavigate({ stage: "draft", run: r.run_id });
+  };
+
+  const reviewReplacement = () => {
+    const replacement = summary?.replacement || { eligible: [], excluded: [] };
+    onViewChange((v) => ({ ...v, briefsOpen: false, picked: [...replacement.eligible],
+      replacementReview: { briefId: current.id, excluded: replacement.excluded,
+                           eligible: replacement.eligible } }));
+    onNavigate({ stage: "strategy", brief: null });
   };
 
   const refresh = async () => {
@@ -821,6 +901,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const sourceMode = view?.sourceMode === "flat" ? "flat" : view?.sourceMode === "dag" ? "dag" : "groups";
   const expandedGroups = view?.expandedGroups || [];
   const briefsOpen = !!view?.briefsOpen;
+  const replacementReview = view?.replacementReview || null;
   const limit = view?.limit || (sourceMode === "flat" ? PAGE_FLAT : PAGE_GROUPS);
 
   const needle = q.trim().toLowerCase();
@@ -1016,25 +1097,44 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
               {current.amendment_reason ? <div className="fx-why">Amended: {current.amendment_reason}</div> : null}
               {current.hold_reason ? <div className="fx-why">Hold: {current.hold_reason}</div> : null}
               {summary?.readiness === "superseded" ? (
-                <div className="fx-err">Superseded — a newer revision exists; a draft with a child cannot be published.</div>
+                <div className="fx-err">Superseded — a newer revision exists; a draft with a child cannot be approved.</div>
               ) : null}
-              {summary?.source_changed?.length ? (
-                <div className="fx-err">A source changed since this brief was captured: {summary.source_changed.join(", ")}. Amend to re-capture, or review the discrepancy before dispatching.</div>
-              ) : null}
-              {summary?.blockers?.length ? <div className="fx-err">Not ready: {summary.blockers.join("; ")}</div> : null}
+              <ReadinessPanel summary={summary} />
               {current.state === "approved" ? (
-                <div className="fx-why">Approved is intent only. Execution needs its own review and fresh verification; publishing does not start work.</div>
+                <div className="fx-why">Approval freezes scope for planning only. It does not authorize or start execution.</div>
+              ) : null}
+              {summary?.replacement?.excluded?.length ? (
+                <div className="fx-sec fx-stack-v">
+                  <div className="fx-k">Recover this scope</div>
+                  <div className="fx-hint">The approved brief stays intact. This explicit action replaces any current source picks,
+                    excludes the ineligible members listed above, and opens the normal relationship review and grooming flow.</div>
+                  <div className="fx-row">
+                    <Button size="sm" ghost disabled={!!busy} onClick={reviewReplacement}>
+                      {summary.replacement.eligible.length ? "Review replacement sources" : "Browse other work"}
+                    </Button>
+                    {current.state === "approved" ? <span className="fx-hint">Consider Hold while the blocked scope is unresolved.</span> : null}
+                  </div>
+                  {!summary.replacement.eligible.length ? (
+                    <div className="fx-err">None of this brief's sources remain eligible. Browse other work; empty grooming is not offered.</div>
+                  ) : null}
+                </div>
               ) : null}
 
               <div className="fx-brief-fields">
                 {FIELDS.map(([key, label, kind]) => (
-                  <Field key={key} label={label} kind={kind} value={edit[key]} disabled={!!busy}
-                         onChange={(v) => editField(key, v)} />
+                  <Fragment key={key}>
+                    <Field label={label} kind={kind} value={edit[key]} disabled={!!busy}
+                           onChange={(v) => editField(key, v)} />
+                    {key === "resources" && (edit.resources || "").split("\n").map((x) => x.trim()).includes("global:*") ? (
+                      <div className="fx-err">Unreviewed <code>global:*</code> serializes this work against every other dispatch.
+                        Replace it with reviewed specific claims when the scope allows.</div>
+                    ) : null}
+                  </Fragment>
                 ))}
               </div>
               {dirty ? (current.state === "draft"
                 ? <div className="fx-hint">Unsaved edits.</div>
-                : <div className="fx-err">Unsaved edits are not the approved intent — amend (with a reason) before staging.</div>
+                : <div className="fx-err">Unsaved edits are not the approved intent — amend (with a reason) before creating a draft dispatch.</div>
               ) : null}
 
               <div className="fx-k">Captured sources (server-captured, not model-edited)</div>
@@ -1054,15 +1154,15 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
                     <div className="fx-row">
                       <Button size="sm" disabled={!!busy || !dirty} onClick={save}>{busy === "save" ? "Saving…" : "Save draft"}</Button>
                       {summary?.readiness !== "superseded"
-                        ? <Button size="sm" disabled={!!busy} onClick={publish}>{busy === "publish" ? "Publishing…" : arm === "publish" ? "Confirm publish" : "Publish"}</Button>
+                        ? <Button size="sm" disabled={!!busy} onClick={approveBrief}>{busy === "approve" ? "Approving…" : arm === "approve" ? "Confirm approval" : "Approve brief"}</Button>
                         : null}
                     </div>
-                    {arm === "publish" ? (
+                    {arm === "approve" ? (
                       <div className="fx-sw">
-                        <div className="fx-sw-q">Publish as approved intent?</div>
-                        <div className="fx-sw-detail">This approves the exact version above as the brief's intent. It does not
-                          start execution, override missing evidence, answer questions, or change Linear. Unreviewed resources
-                          default to <code>global:*</code> (serializes everything) until you review them.</div>
+                        <div className="fx-sw-q">Approve this brief?</div>
+                        <div className="fx-sw-detail">This freezes the exact version above as approved scope for verification and
+                          planning. It does not create a dispatch, start execution, override missing evidence, answer questions,
+                          or change Linear.</div>
                       </div>
                     ) : null}
                   </>
@@ -1076,7 +1176,8 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
                         ? <Button size="sm" disabled={!!busy} onClick={unhold}>{busy === "unhold" ? "…" : "Unhold"}</Button>
                         : <Button size="sm" ghost disabled={!!busy} onClick={hold}>{busy === "hold" ? "…" : arm === "hold" ? "Confirm hold" : "Hold"}</Button>}
                       {current.state === "approved"
-                        ? <Button size="sm" disabled={!!busy || dirty} onClick={stage}>{busy === "stage" ? "Staging…" : arm === "stage" ? "Confirm stage" : "Stage"}</Button>
+                        ? <Button size="sm" disabled={!!busy || !canCreateDispatch} title={dispatchWhy || undefined}
+                                  onClick={createDispatch}>{busy === "dispatch" ? "Creating…" : arm === "dispatch" ? "Confirm draft dispatch" : "Create draft dispatch"}</Button>
                         : null}
                     </div>
                     {(arm === "amend" || arm === "hold") ? (
@@ -1088,12 +1189,14 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
                         </Button>
                       </div>
                     ) : null}
-                    {arm === "stage" ? (
+                    {current.state === "approved" && !canCreateDispatch && dispatchWhy ? (
+                      <div className="fx-hint">Draft dispatch unavailable: {dispatchWhy}</div>
+                    ) : null}
+                    {arm === "dispatch" ? (
                       <div className="fx-sw">
-                        <div className="fx-sw-q">Stage this approved brief for execution?</div>
-                        <div className="fx-sw-detail">Staging pins this brief and hands it to the draft review flow; nothing
-                          runs until the review is approved. Verification may run first, and fresh code/data evidence is
-                          required.</div>
+                        <div className="fx-sw-q">Create a draft dispatch from this approved brief?</div>
+                        <div className="fx-sw-detail">This pins the approved brief and opens the draft review flow. It does not
+                          stage or execute work; execution still requires a separate dispatch review and approval.</div>
                       </div>
                     ) : null}
                   </>
@@ -1164,6 +1267,27 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
           ) : null}
 
           <RelationshipStatus relationships={relationships} missingIds={missingIds} />
+          {replacementReview ? (
+            <div className="fx-sec fx-stack-v" role="status">
+              <div className="fx-k">Replacement review for brief #{replacementReview.briefId}</div>
+              {replacementReview.eligible.length ? (
+                <div className="fx-hint">{plural(replacementReview.eligible.length, "remaining eligible source")} preselected.
+                  Review the selection and relationships before grooming. The approved brief is unchanged.</div>
+              ) : (
+                <div className="fx-err">No existing source remains eligible. Browse and select other work; grooming stays
+                  unavailable until you make a non-empty selection.</div>
+              )}
+              {replacementReview.excluded.length ? (
+                <details className="fx-sec fx-fold" open>
+                  <summary>Excluded from replacement ({replacementReview.excluded.length})</summary>
+                  <FactRows rows={replacementReview.excluded} />
+                </details>
+              ) : null}
+              <div className="fx-row">
+                <Button size="sm" ghost onClick={() => update({ replacementReview: null })}>End replacement review</Button>
+              </div>
+            </div>
+          ) : null}
           {picked.length ? (
             <RelationshipReview picked={picked} memberGroupId={memberGroupId} groupById={groupById}
                                 missingIds={missingIds} relationships={relationships} nodeInfo={nodeInfo} reasonOf={reasonOf} />
