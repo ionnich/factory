@@ -11,10 +11,31 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import db, decide, jev, learn, prune, repos
+from . import db, decide, jev, learn, prune, repos, scheduler
 from .config import Config, secret
 
 HERMES = str(Path.home() / ".local/bin/hermes")
+
+# The strategy module is owned by the Briefs slice; imported lazily so dispatch stays importable in either order
+# (strategy.py raises StageError from here, and imports dispatch for it).
+def _brief(conn, brief_id: int):
+    from . import strategy
+    return strategy.get(conn, brief_id)
+
+
+def _ready(cfg: Config, conn):
+    from . import strategy
+    return strategy.ready(cfg, conn)
+
+
+def _ticket_context(conn, brief_id: int, identifier: str):
+    from . import strategy
+    return strategy.ticket_context(conn, brief_id, identifier)
+
+
+def _render_brief(conn, brief_id: int) -> str | None:
+    from . import strategy
+    return strategy.render(conn, brief_id)
 
 
 class StageError(Exception):
@@ -258,35 +279,144 @@ PHASE = ("CASE WHEN state = 'draft' AND planned_at IS NOT NULL THEN 'review' "
          "WHEN state IN ('done', 'reconciled') THEN 'reconcile' ELSE 'archive' END")
 
 
-def stage(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool = False) -> dict:
-    """Draft a dispatch for review. Nothing is frozen or started until it is approved. Caller runs ingest first."""
-    if not identifiers:
-        raise StageError("name at least one ticket")
-    if len(identifiers) > max_tickets(cfg):
-        raise StageError(f"{len(identifiers)} tickets > stage.max_tickets {max_tickets(cfg)}; keep dispatches small")
-    if len(set(identifiers)) != len(identifiers):
-        raise StageError("duplicate ticket")
-    cands = candidates(cfg, conn)
-    ok = {c["identifier"] for c in cands["candidates"]}
-    why = {s["identifier"]: s["reason"] for s in cands["skipped"]}
-    bad = [f"{i}: {why.get(i, 'not an owned in-scope ticket')}" for i in identifiers if i not in ok]
-    if bad:
-        raise StageError("not stageable: " + "; ".join(bad))
-    rows = []
+def _approved_unconsumed(conn) -> list:
+    """Approved, current (head-of-lineage), unconsumed briefs in stable approved order. A superseded version (one
+    with a published child) is never offered."""
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM work_brief WHERE state='approved' AND "
+        "NOT EXISTS (SELECT 1 FROM dispatch d WHERE d.brief_id = work_brief.id) AND "
+        "NOT EXISTS (SELECT 1 FROM work_brief c WHERE c.parent_id = work_brief.id AND c.state IN ('approved','held')) "
+        "ORDER BY (approved_at IS NULL), approved_at, id")]
+
+
+def _resolve_brief(conn, identifiers: list[str]) -> int:
+    """The approved, unconsumed, current brief whose captured sources are exactly `identifiers` (set equality)."""
+    want = set(identifiers)
+    matches = [b["id"] for b in _approved_unconsumed(conn)
+               if {s.get("identifier") for s in json.loads(b["sources_json"])} == want]
+    if not matches:
+        raise StageError("no approved brief matches exactly these tickets; publish and approve a brief first")
+    if len(matches) > 1:
+        raise StageError("more than one approved brief matches these tickets; pass an explicit brief id")
+    return matches[0]
+
+
+def _load_approved_brief(conn, brief_id: int) -> dict:
+    """The shared approved-brief gate for both stage entrypoints: approved (not held/draft), not superseded by a
+    published child, and not already consumed. Rejects expired/superseded/held intent atomically on first read."""
+    brief = _brief(conn, brief_id)
+    if brief.get("state") != "approved":
+        raise StageError(f"brief #{brief_id} is {brief.get('state', 'unknown')}, not approved")
+    if conn.execute("SELECT 1 FROM work_brief WHERE parent_id=? AND state IN ('approved','held')",
+                    (brief_id,)).fetchone():
+        raise StageError(f"brief #{brief_id} was superseded by a newer revision; use the current version")
+    if consumed := conn.execute("SELECT run_id FROM dispatch WHERE brief_id=?", (brief_id,)).fetchone():
+        raise StageError(f"brief #{brief_id} is already dispatched as {consumed['run_id']}")
+    return brief
+
+
+def _brief_verdict(conn, brief_id: int, issue_id: str):
+    """The exact version -> verdict association for a brief source: the current valid verdict this brief version was
+    verified with. Never a borrowed generic/prior source verdict; a missing or superseded association is refused."""
+    bv = conn.execute("SELECT verdict_id FROM brief_verdict WHERE brief_id=? AND issue_id=?",
+                      (brief_id, issue_id)).fetchone()
+    if bv is None:
+        raise StageError(f"brief #{brief_id} has no recorded verification for issue {issue_id}; "
+                         "verify it from the brief first")
+    v = conn.execute("SELECT * FROM verdict WHERE id=?", (bv["verdict_id"],)).fetchone()
+    if v is None or v["superseded_at"] is not None or v["issue_id"] != issue_id:
+        raise StageError(f"brief #{brief_id}'s verification for issue {issue_id} was superseded; re-verify")
+    if v["kind"] != "valid":
+        raise StageError(f"brief #{brief_id}'s verification for issue {issue_id} is {v['kind']}, not valid")
+    return v
+
+
+def _dependency_status(conn, identifier: str) -> str:
+    """Dependencies count ready only on a recorded completed/accepted fact, never a title or model assertion."""
+    s = conn.execute("SELECT * FROM linear_latest WHERE identifier=?", (identifier,)).fetchone()
+    if s is None:
+        return "unknown"
+    if s["state_type"] == "completed":
+        return "ready"
+    v = conn.execute("SELECT kind FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
+                     (s["issue_id"],)).fetchone()
+    return "ready" if (v and v["kind"] == "already-done") else "unmet"
+
+
+def _create_brief_draft(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool,
+                        brief_id: int, brief: dict) -> dict:
+    """Verify the brief's sources against the pinned capture (no Linear re-read), the exact-version verification
+    association, and readiness, then draft the dispatch: brief_id, captured snapshot + associated verdict anchors,
+    and the reviewed resource claims are pinned into it. Nothing is frozen or started until approved."""
+    sources = {s["identifier"]: s for s in brief.get("sources", [])}
+    if set(sources) != set(identifiers):
+        raise StageError(f"brief #{brief_id} covers {', '.join(sorted(sources))}, not {', '.join(identifiers)}")
+    for dep in brief.get("body", {}).get("dependencies", []):  # readiness before anything is written
+        if (st := _dependency_status(conn, dep)) != "ready":
+            raise StageError(f"dependency {dep} is {st}; not staging")
+    review = {k: t.get("review_state") for k, t in cfg.linear.get("team", {}).items()}
+    rows, owners = [], set()
     for ident in identifiers:
+        src = sources[ident]
         s = prune.latest(conn, ident)
-        ctx, _ = prune.map_context(cfg, s)
-        v = conn.execute("SELECT id FROM verdict WHERE issue_id=? AND superseded_at IS NULL", (s["issue_id"],)).fetchone()
+        if s["updated_at"] != src.get("snapshot_updated_at"):
+            raise StageError(f"{ident} changed since the brief was captured; amend the brief before staging")
+        if not prune.owned(cfg, conn, s):
+            raise StageError(f"{ident}: not the factory's concern (its Domain project is not led by {cfg.linear['lead']})")
+        raw = json.loads(s["raw_json"])
+        assignee = (raw.get("assignee") or {}).get("email")
+        if assignee not in (None, cfg.linear["lead"]):
+            raise StageError(f"{ident}: assigned to {assignee}")
+        if s["state_type"] in ("completed", "canceled"):
+            raise StageError(f"{ident}: already {s['state_type']}")
+        if raw["state"]["name"] == review.get(raw.get("team", {}).get("key")):
+            raise StageError(f"{ident}: waits on a human ({raw['state']['name']})")
+        ctx, why = prune.map_context(cfg, s)
+        if ctx is None:
+            raise StageError(f"{ident}: {why}")
+        owner = ctx.owner(prune.issue_fields(s)[0])
+        if owner is None:
+            raise StageError(f"{ident}: no factory-fleet owner for context {ctx.name}")
+        owners.add(owner)
+        v = _brief_verdict(conn, brief_id, s["issue_id"])  # exact association, never a borrowed source verdict
+        if (r := prune.verdict_staleness(cfg, conn, s, ctx, v)):
+            raise StageError(f"{ident}: verification stale ({r}); re-verify from the brief before staging")
+        if conn.execute("SELECT 1 FROM dispatch_ticket t JOIN dispatch d USING (run_id) WHERE t.issue_id=? "
+                        "AND d.state <> 'archived'", (s["issue_id"],)).fetchone():
+            raise StageError(f"{ident}: already in a live dispatch")
         rows.append((s["issue_id"], ident, s["updated_at"], v["id"], ctx.repo))
     trunks = {r[4]: conn.execute("SELECT sha FROM repo_trunk WHERE repo=?", (r[4],)).fetchone()["sha"] for r in rows}
+    resources = set(brief.get("body", {}).get("resources") or [])
+    resources |= {f"repo:{r[4]}" for r in rows}  # mandatory repo claims, derived, cannot be removed
+    if not any(k.startswith("route:") for k in resources):  # canonical fallback home (never an invented fleet)
+        resources.add(f"route:{owners.pop() if len(owners) == 1 else 'home'}")
     run_id = f"{datetime.now(UTC):%Y%m%d-%H%M%S}-{identifiers[0].lower()}"
     with db.tx(conn):
-        conn.execute("INSERT INTO dispatch(run_id, state, repos_json, last_actor, created_at, drafted_by, emergency) "
-                     "VALUES (?,?,?,?,?,?,?)",
+        # Re-validate approved/current/unconsumed + readiness (source-change, dependencies) under the same
+        # transaction that writes the dispatch: a concurrent amend/supersede/consume is never raced.
+        row = conn.execute("SELECT state, body_json, sources_json FROM work_brief WHERE id=?", (brief_id,)).fetchone()
+        if row is None or row["state"] != "approved":
+            raise StageError(f"brief #{brief_id} changed while staging; nothing was written")
+        if conn.execute("SELECT 1 FROM work_brief c WHERE c.parent_id=? AND c.state IN ('approved','held')",
+                        (brief_id,)).fetchone():
+            raise StageError(f"brief #{brief_id} was superseded while staging; nothing was written")
+        if conn.execute("SELECT 1 FROM dispatch WHERE brief_id=?", (brief_id,)).fetchone():
+            raise StageError(f"brief #{brief_id} was consumed while staging; nothing was written")
+        for src in json.loads(row["sources_json"]):
+            cur = conn.execute("SELECT updated_at FROM linear_latest WHERE issue_id=?",
+                               (src["issue_id"],)).fetchone()
+            if cur is not None and cur["updated_at"] != src["snapshot_updated_at"]:
+                raise StageError(f"{src['identifier']} changed while staging; nothing was written")
+        for dep in json.loads(row["body_json"]).get("dependencies", []):
+            if _dependency_status(conn, dep) != "ready":
+                raise StageError(f"dependency {dep} is not ready; nothing was written")
+        conn.execute("INSERT INTO dispatch(run_id, state, repos_json, last_actor, created_at, drafted_by, emergency, "
+                     "brief_id) VALUES (?,?,?,?,?,?,?,?)",
                      (run_id, "draft", json.dumps([{"repo": r, "trunk_sha": s} for r, s in sorted(trunks.items())]),
-                      actor, db.now(), actor, int(emergency)))
+                      actor, db.now(), actor, int(emergency), brief_id))
         conn.executemany("INSERT INTO dispatch_ticket(run_id, issue_id, identifier, snapshot_updated_at, verdict_id) "
                          "VALUES (?,?,?,?,?)", [(run_id, *r[:4]) for r in rows])
+        scheduler.set_claims(conn, run_id, resources)
         for issue_id, ident, _, verdict_id, _ in rows:  # a retry after a block carries the user's guidance along
             g = conn.execute("SELECT x.run_id, x.chosen_note, x.chosen_by, json_extract(x.detail_json, '$.reason') "
                              "reason FROM decision x JOIN dispatch_ticket t ON t.run_id=x.run_id AND "
@@ -296,7 +426,39 @@ def stage(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool
                 conn.execute("INSERT INTO dispatch_note(run_id, node_id, author, body, at) VALUES (?,?,?,?,?)",
                              (run_id, ident, g["chosen_by"], f"Retry of {g['run_id']}, which blocked: {g['reason']}\n"
                                                              f"Guidance: {g['chosen_note']}", db.now()))
-    return {"run_id": run_id, "state": "draft", "tickets": identifiers, "emergency": emergency}
+    return {"run_id": run_id, "state": "draft", "tickets": identifiers, "brief_id": brief_id, "emergency": emergency}
+
+
+def stage(cfg: Config, conn, identifiers: list[str], actor: str, emergency: bool = False,
+          brief_id: int | None = None) -> dict:
+    """Draft a dispatch from an approved brief. Identifiers must resolve an approved exact matching brief (or pass
+    an explicit `brief_id`); the brief's captured intent, not raw Linear prose, becomes the dispatch. Both entry
+    points validate approved/current/unconsumed + readiness through `_load_approved_brief` and
+    `_create_brief_draft`. Nothing is frozen or started until approved."""
+    if not identifiers:
+        raise StageError("name at least one ticket")
+    if len(identifiers) > max_tickets(cfg):
+        raise StageError(f"{len(identifiers)} tickets > stage.max_tickets {max_tickets(cfg)}; keep dispatches small")
+    if len(set(identifiers)) != len(identifiers):
+        raise StageError("duplicate ticket")
+    if brief_id is None:
+        brief_id = _resolve_brief(conn, identifiers)
+    brief = _load_approved_brief(conn, brief_id)
+    return _create_brief_draft(cfg, conn, identifiers, actor, emergency, brief_id, brief)
+
+
+def stage_brief(cfg: Config, conn, brief_id: int, actor: str) -> dict:
+    """Stage an approved brief by id (CLI/proposer entrypoint). Verifies the brief's captured sources against the
+    pinned snapshot and the exact-version verification association, then drafts a brief-backed dispatch."""
+    brief = _load_approved_brief(conn, brief_id)
+    identifiers = [s["identifier"] for s in brief.get("sources", [])]
+    if not identifiers:
+        raise StageError(f"brief #{brief_id} has no sources")
+    if len(identifiers) > max_tickets(cfg):
+        raise StageError(f"brief #{brief_id} has {len(identifiers)} sources > stage.max_tickets {max_tickets(cfg)}")
+    if len(set(identifiers)) != len(identifiers):
+        raise StageError(f"brief #{brief_id} names a source twice")
+    return _create_brief_draft(cfg, conn, identifiers, actor, False, brief_id, brief)
 
 
 PLAN_QUESTIONS_MAX = 2  # each is a decision someone has to read; decide the rest in the plan
@@ -610,8 +772,12 @@ def replan(conn, run_id: str, reason: str, actor: str) -> dict:
 
 
 def _tickets_for_render(cfg: Config, conn, run_id: str, check: bool) -> tuple[list, dict]:
-    """Ticket data as drafted (snapshot + verdict pinned in dispatch_ticket). check=True refuses when the ticket or
-    its verdict moved during review: the reviewed plan would no longer match."""
+    """Ticket data as drafted (snapshot + verdict pinned in dispatch_ticket). A brief-backed dispatch uses the
+    brief's compiled intent as the ticket description/title (never the raw Linear prose, which live source wording
+    must not override); the pinned snapshot/verdict still supply url/repo/context/evidence. check=True refuses when
+    the ticket or its verdict moved during review: the reviewed plan would no longer match."""
+    d = conn.execute("SELECT brief_id FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+    brief_id = d["brief_id"] if d else None
     tickets, bad = [], []
     for r in conn.execute("SELECT * FROM dispatch_ticket WHERE run_id=? ORDER BY rowid", (run_id,)).fetchall():
         s = conn.execute("SELECT * FROM linear_snapshot WHERE issue_id=? AND updated_at=?",
@@ -623,11 +789,16 @@ def _tickets_for_render(cfg: Config, conn, run_id: str, check: bool) -> tuple[li
             ctx, _ = prune.map_context(cfg, latest)
             if v["superseded_at"] or prune.staleness(cfg, conn, latest, ctx):
                 bad.append(r["identifier"])
-        tickets.append({"identifier": r["identifier"], "issue_id": r["issue_id"], "title": raw["title"],
-                        "url": raw["url"], "state": raw["state"]["name"],
-                        "assignee": (raw["assignee"] or {}).get("email"), "repo": v["repo"], "context": v["context"],
-                        "reason": v["reason"], "evidence": json.loads(v["evidence_json"]),
-                        "description": raw.get("description") or ""})
+        t = {"identifier": r["identifier"], "issue_id": r["issue_id"], "title": raw["title"],
+             "url": raw["url"], "state": raw["state"]["name"],
+             "assignee": (raw["assignee"] or {}).get("email"), "repo": v["repo"], "context": v["context"],
+             "reason": v["reason"], "evidence": json.loads(v["evidence_json"]),
+             "description": raw.get("description") or ""}
+        if brief_id:
+            tc = _ticket_context(conn, brief_id, r["identifier"]) or {}
+            t["description"] = tc.get("description") or t["description"]
+            t["title"] = tc.get("title") or t["title"]
+        tickets.append(t)
     if bad:
         raise StageError(f"{', '.join(bad)} changed since the draft (ticket or verdict); reject it and draft again")
     return tickets, {x["repo"]: x["trunk_sha"] for x in json.loads(
@@ -693,6 +864,7 @@ def reject(cfg: Config, conn, run_id: str, reason: str, actor: str) -> dict:
         path.write_bytes(body)
         conn.execute("UPDATE dispatch SET state='archived', body_sha256=?, archived_at=?, rejected_reason=?, "
                      "last_actor=? WHERE run_id=?", (hashlib.sha256(body).hexdigest(), now, reason.strip(), actor, run_id))
+        scheduler.release_claims(conn, run_id)  # a rejected draft never runs: no leaked claims
     _commit_archived(cfg, run_id, f"reject draft {run_id}")
     return {"run_id": run_id, "state": "archived", "rejected": reason.strip(), "path": str(path)}
 
@@ -794,37 +966,97 @@ def _lead_busy(route: str) -> bool:
     return bool(s.get("active_children") or s.get("decisions_open"))
 
 
+def _safety_check(cfg: Config, conn, run_id: str) -> None:
+    """Refresh trunk for the dispatch's repos and refuse when any pinned ticket/verdict (or brief association) went
+    stale since stage: recheck/replan, never a blanket stale bypass. Repo/evidence refresh only, no Linear read."""
+    d = conn.execute("SELECT repos_json FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+    repos_set = {r["repo"] for r in json.loads(d["repos_json"])}
+    if repos_set:
+        repos.sync_all(cfg, conn, only=repos_set)  # refresh code/data evidence trunks
+    _tickets_for_render(cfg, conn, run_id, check=True)  # raises on stale ticket/verdict/superseded association
+
+
 def handoff(cfg: Config, conn, run_id: str) -> dict:
-    """Hand a staged dispatch to whoever runs it (`_target`): fresh omp session (/new), then
-    `run dispatch-intake <run_id>`."""
+    """Hand a staged dispatch to whoever runs it (`_target`): a safety freshness refresh, then an atomic launch
+    reservation (capacity, resource, route and pane) before the external `/new`, then `run dispatch-intake
+    <run_id>`. A send that fails partway is marked `uncertain` and is never auto-replayed; an already-reserved/sent
+    dispatch is not re-sent."""
     d = conn.execute("SELECT * FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
     if d is None or d["state"] != "staged":
         raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not staged")
-    if busy := conn.execute("SELECT run_id FROM dispatch WHERE state='executing'").fetchone():
-        raise StageError(f"dispatch {busy[0]} is still executing")
+    _safety_check(cfg, conn, run_id)  # stale code/data evidence refuses before any external /new
     pane, who = _target(cfg, d)
     if pane.get("agent_status") not in ("idle", "done"):
         raise StageError(f"{who} pane {pane['pane_id']} is {pane.get('agent_status')}; not resetting a busy session")
     if who != "factory-primary" and _lead_busy(who):
         raise StageError(f"{who} still has crews or decisions open; not resetting its session")
+    if existing := scheduler.launch(conn, run_id):
+        if existing["state"] == "uncertain":
+            raise StageError(f"{run_id} has an uncertain send to {existing['pane_id']}; confirm it is unsent "
+                             "(release-unsent) before handing off again")
+        return {"run_id": run_id, "executor_pane": existing["pane_id"], "via": who, "sent": None,
+                "already": existing["state"]}
+    if blocker := scheduler.reserve_if_free(conn, run_id, pane["pane_id"], os.getpid()):
+        raise StageError(blocker)
     sent = ["/new", f"run dispatch-intake {run_id}"]  # session reset at every dispatch boundary
-    _send(pane["pane_id"], sent)
+    try:
+        _send(pane["pane_id"], sent)
+    except Exception as e:  # any transport failure (StageError, OSError, timeout, JSON) may have partially landed
+        scheduler.mark_uncertain(conn, run_id, str(e))
+        raise StageError(f"send to {pane['pane_id']} is uncertain and will not be auto-replayed: {e}")
+    scheduler.mark_sent(conn, run_id)
     return {"run_id": run_id, "executor_pane": pane["pane_id"], "via": who, "sent": sent}
 
 
 def resume(cfg: Config, conn, run_id: str) -> dict:
-    """The "restart the executor" choice on an executing dispatch: interrupt whoever runs it if it is stuck mid-turn
-    (starting the captain if it is gone), then a fresh session runs intake again (`execute` re-attaches; finished
-    cards stay finished)."""
+    """The "restart the executor" choice on an executing dispatch. The restart is claimed atomically in a
+    transaction (launch -> `uncertain`, the durable in-flight marker) before any reset/send, so a concurrent resume
+    refuses on `uncertain` and the initial handoff is never replayed. After the marker, our own stuck executor is
+    reset, then `/new` + intake; success re-marks `sent`, any transport failure retains `uncertain`. Never resets a
+    pane another dispatch holds (launch or executing), a busy fallback pane, or replays an `uncertain` send."""
     d = conn.execute("SELECT * FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
     if d is None or d["state"] != "executing":
         raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not executing")
     pane, who = _target(cfg, d)
-    if pane.get("agent_status") not in ("idle", "done"):
+    if other := conn.execute("SELECT run_id FROM dispatch_launch WHERE pane_id=? AND run_id<>?",
+                             (pane["pane_id"], run_id)).fetchone():
+        raise StageError(f"pane {pane['pane_id']} is reserved for dispatch {other['run_id']}; not resetting it")
+    if other := conn.execute("SELECT run_id FROM dispatch WHERE executor_pane=? AND state='executing' AND run_id<>?",
+                             (pane["pane_id"], run_id)).fetchone():
+        raise StageError(f"pane {pane['pane_id']} is running dispatch {other['run_id']}; not resetting it")
+    if pane.get("agent_status") not in ("idle", "done") and pane["pane_id"] != d["executor_pane"]:
+        raise StageError(f"{who} pane {pane['pane_id']} is busy with unrelated work; not resetting it")
+    with db.tx(conn):  # durable restart marker + atomic pane claim BEFORE any reset or external send
+        d2 = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+        if d2 is None or d2["state"] != "executing":
+            raise StageError(f"{run_id} is no longer executing")
+        held = conn.execute("SELECT 1 FROM dispatch_launch WHERE pane_id=? AND run_id<>?",
+                            (pane["pane_id"], run_id)).fetchone() or conn.execute(
+            "SELECT 1 FROM dispatch WHERE executor_pane=? AND state='executing' AND run_id<>?",
+            (pane["pane_id"], run_id)).fetchone()
+        if held:
+            raise StageError(f"pane {pane['pane_id']} changed while restarting; not resetting it")
+        l = scheduler.launch(conn, run_id)
+        if l is not None and l["state"] == "uncertain":
+            raise StageError(f"{run_id} has an uncertain send; resolve it before restarting (never auto-replay)")
+        if l is not None:  # sent/reserved -> uncertain: the durable restart marker (second resume refuses)
+            conn.execute("UPDATE dispatch_launch SET state='uncertain', pane_id=?, owner_pid=? WHERE run_id=?",
+                         (pane["pane_id"], os.getpid(), run_id))
+        else:  # legacy run bootstrap: no launch yet; claim the pane with the same guards
+            conn.execute("INSERT INTO dispatch_launch(run_id, pane_id, state, owner_pid, claimed_at) "
+                         "VALUES (?,?,?,?,?)", (run_id, pane["pane_id"], "uncertain", os.getpid(), db.now()))
+        conn.execute("UPDATE dispatch SET executor_pane=?, last_actor='factory:resume' WHERE run_id=?",
+                     (pane["pane_id"], run_id))
+    if pane.get("agent_status") not in ("idle", "done"):  # our own stuck executor, after the marker is durable
         _herdr("pane", "send-keys", pane["pane_id"], "esc")
         time.sleep(2)
     sent = ["/new", f"run dispatch-intake {run_id}"]
-    _send(pane["pane_id"], sent)
+    try:
+        _send(pane["pane_id"], sent)
+    except Exception as e:  # any transport failure: retain uncertain, record the error truthfully
+        conn.execute("UPDATE dispatch_launch SET error=? WHERE run_id=?", (str(e)[:400], run_id))
+        raise StageError(f"restart send to {pane['pane_id']} is uncertain and will not be auto-replayed: {e}")
+    scheduler.mark_sent(conn, run_id)  # uncertain -> sent on success
     return {"run_id": run_id, "executor_pane": pane["pane_id"], "via": who, "sent": sent}
 
 
@@ -861,10 +1093,34 @@ def execute(cfg: Config, conn, run_id: str, actor: str) -> dict:
         owner = {p["pane_id"]: p for p in _herdr("pane", "list")["result"]["panes"]}.get(d["executor_pane"]) or {}
         if d["executor_pane"] != pane and owner.get("agent") == "omp":
             raise StageError(f"{run_id} is executing in live pane {d['executor_pane']}; not taking it over")
-        with db.tx(conn):
+        with db.tx(conn):  # re-verify DB ownership under the lock; never take another run's pane
+            d2 = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+            if d2 is None or d2["state"] != "executing":
+                raise StageError(f"{run_id} is no longer executing")
+            held = conn.execute("SELECT 1 FROM dispatch_launch WHERE pane_id=? AND run_id<>?",
+                                (pane, run_id)).fetchone() or conn.execute(
+                "SELECT 1 FROM dispatch WHERE executor_pane=? AND state='executing' AND run_id<>?",
+                (pane, run_id)).fetchone()
+            if held:
+                raise StageError(f"pane {pane} is held by another dispatch; not taking it over")
             conn.execute("UPDATE dispatch SET executor_pane=?, last_actor=? WHERE run_id=?", (pane, actor, run_id))
     else:
-        with db.tx(conn):  # one_executing unique index refuses a second executing dispatch
+        # Direct staged -> executing: refresh and re-check evidence freshness (same as handoff), then require its own
+        # launch (a matching pane, reserved/sent) so the reservation admission guards still hold. A legacy NULL-brief
+        # dispatch (no handoff yet) reserves its pane safely instead of bypassing the admission guards.
+        _safety_check(cfg, conn, run_id)
+        launch = scheduler.launch(conn, run_id)
+        if launch is None:
+            if d["brief_id"] is not None:
+                raise StageError(f"{run_id} has no launch reservation; handoff must reserve it before it can execute")
+            if blocker := scheduler.reserve_if_free(conn, run_id, pane, os.getpid()):
+                raise StageError(blocker)
+        else:
+            if launch["pane_id"] != pane:
+                raise StageError(f"{run_id} is reserved for pane {launch['pane_id']}, not {pane}")
+            if launch["state"] not in ("reserved", "sent"):
+                raise StageError(f"{run_id}'s launch is {launch['state']}; resolve it before executing")
+        with db.tx(conn):
             conn.execute("UPDATE dispatch SET state='executing', executing_at=?, executor_pane=?, last_actor=? "
                          "WHERE run_id=?", (db.now(), pane, actor, run_id))
     return {"run_id": run_id, "path": str(path), "executor_pane": pane,
@@ -873,8 +1129,73 @@ def execute(cfg: Config, conn, run_id: str, actor: str) -> dict:
                 "WHERE t.run_id=?", (run_id,))]}
 
 
+def release_unsent(cfg: Config, conn, run_id: str, actor: str, reason: str) -> dict:
+    """Explicit, confirmed human recovery for a launch whose send may not have happened. Staged or terminal
+    (done/reconciled/archived) dispatch, launch `reserved` or `uncertain`, nonempty human actor + reason, matching
+    pane known + idle. Revalidated in a transaction, then uncertain->reserved->DELETE (the schema edge). Never
+    auto-replayed: the caller confirms unsent at the CLI/API boundary (`--confirm-unsent` / `confirm_unsent:true`)."""
+    if not actor or not actor.startswith("user:"):
+        raise StageError("release-unsent needs a human actor (user:...); agents cannot confirm an unsent send")
+    if not (reason or "").strip():
+        raise StageError("say why the send is known unsent")
+    l = scheduler.launch(conn, run_id)
+    if l is None:
+        raise StageError(f"dispatch {run_id} has no launch reservation to release")
+    if l["state"] == "sent":
+        raise StageError(f"{run_id} was already sent to {l['pane_id']}; not releasing a sent launch")
+    if l["state"] not in ("reserved", "uncertain"):
+        raise StageError(f"{run_id}'s launch is {l['state']}; nothing to release")
+    panes = {p["pane_id"]: p for p in _herdr("pane", "list")["result"]["panes"]}
+    pane = panes.get(l["pane_id"])
+    if pane is None:
+        raise StageError(f"pane {l['pane_id']} is unknown; refusing to release an unverified send")
+    if pane.get("agent_status") not in ("idle", "done"):
+        raise StageError(f"pane {l['pane_id']} is {pane.get('agent_status')}; not releasing a live executor")
+    with db.tx(conn):  # revalidate DB ownership/state under the lock; never release a changed/raced launch
+        d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
+        if d is None or d["state"] not in ("staged", "done", "reconciled", "archived"):
+            raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}; not releasing")
+        l2 = scheduler.launch(conn, run_id)
+        if l2 is None or l2["pane_id"] != l["pane_id"] or l2["state"] == "sent":
+            raise StageError(f"{run_id}'s launch changed while verifying; not releasing")
+        if l2["state"] == "uncertain":
+            conn.execute("UPDATE dispatch_launch SET state='reserved', owner_pid=NULL WHERE run_id=?", (run_id,))
+        scheduler.release_launch(conn, run_id)  # a reserved launch deletes anytime (definitely unsent)
+    return {"run_id": run_id, "released": l["state"], "pane_id": l["pane_id"]}
+
+
+def release_safe_terminal(cfg: Config, conn) -> list[str]:
+    """Conservative terminal cleanup (proposer surface): release a terminal dispatch's `sent`/`reserved` launch only
+    after its pane is proven idle and, for a routed lead, not supervising crews/decisions. An `uncertain` launch is
+    never auto-released. Returns the run ids released."""
+    try:
+        panes = {p["pane_id"]: p for p in _herdr("pane", "list")["result"]["panes"]}
+    except (StageError, OSError, subprocess.TimeoutExpired):
+        return []  # cannot verify panes: never release blind
+    released = []
+    for l in conn.execute("SELECT l.run_id, l.pane_id, d.route FROM dispatch_launch l JOIN dispatch d USING (run_id) "
+                          "WHERE d.state IN ('done','reconciled','archived') AND l.state IN ('reserved','sent')"
+                          ).fetchall():
+        pane = panes.get(l["pane_id"])
+        if pane is None or pane.get("agent_status") not in ("idle", "done"):
+            continue  # busy/unknown pane: keep the reservation
+        if l["route"] and _lead_busy(l["route"]):
+            continue  # lead still supervising crews/decisions: keep
+        with db.tx(conn):
+            d2 = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (l["run_id"],)).fetchone()
+            if d2 is None or d2["state"] not in ("done", "reconciled", "archived"):
+                continue
+            l2 = conn.execute("SELECT state FROM dispatch_launch WHERE run_id=?", (l["run_id"],)).fetchone()
+            if l2 is None or l2["state"] not in ("reserved", "sent"):
+                continue
+            conn.execute("DELETE FROM dispatch_launch WHERE run_id=?", (l["run_id"],))
+        released.append(l["run_id"])
+    return released
+
+
 def archive(cfg: Config, conn, run_id: str) -> dict:
-    """reconciled -> archived: unlock, move to _archived/, commit it to the factory repo."""
+    """reconciled -> archived: unlock, move to _archived/, commit it to the factory repo, and release the resource
+    claims (the terminal done/reconciled states already freed the launch slot)."""
     d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
     if d is None or d["state"] != "reconciled":
         raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not reconciled")
@@ -887,6 +1208,8 @@ def archive(cfg: Config, conn, run_id: str) -> dict:
     with db.tx(conn):
         conn.execute("UPDATE dispatch SET state='archived', archived_at=?, last_actor='factory:archive' WHERE run_id=?",
                      (db.now(), run_id))
+        scheduler.release_claims(conn, run_id)  # archived: claims no longer conflict (claim_holders excludes it)
+        scheduler.release_terminal_launch(conn, run_id)  # reserved/sent only; uncertain retained for explicit recovery
     return {"run_id": run_id, "path": str(dst), "committed": _commit_archived(cfg, run_id, f"archive dispatch {run_id}")}
 
 
@@ -958,6 +1281,9 @@ def card(cfg: Config, conn, run_id: str, ident: str, kind: str, actor: str,
         if d["state"] != "executing":  # last card closed the dispatch: run-time questions no longer apply
             decide.void(conn, "run_id=? AND kind IN ('executor-gone','dispatch-stuck','ask')", (run_id,),
                         "the dispatch finished")
+            # Terminal frees capacity (launch_active), but a sent/reserved launch releases the pane slot only when
+            # positively safe; an uncertain launch is retained for explicit human recovery.
+            scheduler.release_terminal_launch(conn, run_id)
     res = {"run_id": run_id, "identifier": ident, "event": kind,
            "card_status": conn.execute("SELECT card_status FROM dispatch_ticket WHERE run_id=? AND identifier=?",
                                        (run_id, ident)).fetchone()[0], "dispatch_state": d["state"]}
@@ -977,21 +1303,6 @@ def card(cfg: Config, conn, run_id: str, ident: str, kind: str, actor: str,
 PROPOSE = "factory:propose"
 
 
-EMERGENCY_MAX_PATHS = 3
-
-
-def _emergency(cfg: Config, conn, ident: str) -> str | None:
-    """Skip review only on facts, never on an agent's say-so: a person marked the ticket Urgent in Linear, and the
-    verdict's evidence touches at most EMERGENCY_MAX_PATHS files (small blast radius). One ticket, auto repo."""
-    s = prune.latest(conn, ident)
-    v = conn.execute("SELECT evidence_paths_json FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
-                     (s["issue_id"],)).fetchone()
-    paths = json.loads(v["evidence_paths_json"]) if v else []
-    if json.loads(s["raw_json"])["priority"] == 1 and 0 < len(paths) <= EMERGENCY_MAX_PATHS:
-        return f"Urgent in Linear, touches {len(paths)} file(s): {', '.join(paths)}"
-    return None
-
-
 def _cohort(cfg: Config, conn, auto: list) -> list[str]:
     """Assemble one dispatch around the top candidate: the candidates that share its Linear Domain project first,
     then those in its repo with the same fleet owner (so one home runs it), up to stage.max_tickets. The planner may
@@ -1005,35 +1316,53 @@ def _cohort(cfg: Config, conn, auto: list) -> list[str]:
 
 
 def propose(cfg: Config, conn) -> dict:
-    """Cron: move one dispatch at a time. With nothing live, drafts a cohort of related `auto`-repo candidates
-    (emergency: one urgent ticket); hands off approved dispatches, retried every run. The draft's review is a
-    decision like any other: `decide.notify` puts it in the digest and `decide.sweep` takes ★ when its clock runs
-    out (an emergency or earned one at once). A person's draft is never decided without them."""
+    """Cron: consume approved briefs into bounded execution. Stages ready briefs up to a cap of 3 nonexecuting
+    (draft/staged) dispatches — independently of whatever is executing or reconciling — hands off staged dispatches
+    while capacity allows, and never lets a blocked first job starve a later independent one. No unapproved automatic
+    brief: a human publishes/approves briefs; propose only stages approved ones. Legacy NULL-brief dispatches already
+    in flight still finish unchanged. Draft review stays a decision: `decide.notify` + `decide.sweep` take ★ when the
+    clock runs out."""
+    cap = scheduler.sync_policy(conn, cfg.raw.get("executor", {}).get("max_parallel"))
+    queue_cap = cfg.raw.get("executor", {}).get("queue_cap", 3)
     live = conn.execute("SELECT * FROM dispatch WHERE state <> 'archived' ORDER BY created_at").fetchall()
-    if any(d["state"] in ("executing", "done", "reconciled") for d in live):
-        return {"action": "wait", "dispatches": [{"run_id": d["run_id"], "state": d["state"]} for d in live]}
-    if staged := [d for d in live if d["state"] == "staged"]:
-        try:
-            return {"action": "handoff", "handoff": handoff(cfg, conn, staged[0]["run_id"])}
-        except StageError as e:
-            return {"action": "staged", "run_id": staged[0]["run_id"], "handoff_error": str(e)}
+    staged = [d for d in live if d["state"] == "staged"]
     drafts = [d for d in live if d["state"] == "draft"]
-    if not drafts:
-        auto = [c for c in candidates(cfg, conn)["candidates"] if cfg.repos.get(c["repo"], {}).get("auto")]
-        if not auto:
-            return {"action": "idle", "reason": "no candidate in an auto repo"}
-        why = _emergency(cfg, conn, auto[0]["identifier"])
-        idents = [auto[0]["identifier"]] if why else _cohort(cfg, conn, auto)
-        d = stage(cfg, conn, idents, PROPOSE, emergency=bool(why))
-        return {"action": "drafted", "run_id": d["run_id"], "tickets": idents, "emergency": why}
-    own = [d for d in drafts if d["drafted_by"] == PROPOSE]
-    if not own:
-        return {"action": "wait", "reason": "a person's draft is in review", "run_id": drafts[0]["run_id"]}
-    d = own[0]
-    if d["planned_at"] is None:
-        return {"action": "planning", "run_id": d["run_id"]}
-    return {"action": "held", "run_id": d["run_id"], "reason": d["held_reason"]} if d["held_reason"] else \
-        {"action": "in-review", "run_id": d["run_id"]}
+    running = [d for d in live if d["state"] == "executing"]
+    result = {"action": "idle",
+              "capacity": {"max_parallel": cap, "used": scheduler.capacity_used(conn)},
+              "running": [d["run_id"] for d in running],
+              "queued": [d["run_id"] for d in staged] + [d["run_id"] for d in drafts],
+              "handoffs": [], "prepared": [], "blocked": []}
+
+    # Hand off staged dispatches, each independently: a blocked first must not starve a later independent one.
+    for d in staged:
+        try:
+            result["handoffs"].append({"run_id": d["run_id"], "handoff": handoff(cfg, conn, d["run_id"])})
+            result["action"] = "handoff"
+        except StageError as e:
+            result["handoffs"].append({"run_id": d["run_id"], "blocked": str(e)})
+
+    # Prepare more approved briefs while the nonexecuting queue is below its cap; a blocked brief is skipped, not
+    # a stop: an independent later brief can still be prepared.
+    queued = len(staged) + len(drafts)
+    if queued < queue_cap:
+        for brief in _ready(cfg, conn):
+            if queued >= queue_cap:
+                break
+            bid = brief.get("id")
+            if not brief.get("ready"):
+                result["blocked"].append({"brief_id": bid, "blockers": brief.get("blockers", [])})
+                continue
+            try:
+                d = stage_brief(cfg, conn, bid, PROPOSE)
+                result["prepared"].append({"brief_id": bid, "run_id": d["run_id"]})
+                result["action"] = "prepared"
+                queued += 1
+            except StageError as e:
+                result["blocked"].append({"brief_id": bid, "blocker": str(e)})
+    # Conservative terminal cleanup: release terminal sent/reserved launches whose pane is proven idle.
+    result["released_terminal"] = release_safe_terminal(cfg, conn)
+    return result
 
 
 def _last_activity(conn, run_id: str) -> tuple[str | None, str | None]:

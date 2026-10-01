@@ -3,16 +3,20 @@ that runs it may take it (execute)."""
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from factory import db, dispatch
+sys.path.insert(0, os.path.dirname(__file__))
+import _helpers  # noqa: E402
+
+from factory import db, dispatch, scheduler
 from factory.config import Context
 
-SNAP = "2026-09-01T00:00:00Z"
+SNAP = _helpers.SNAP
 LEAD, CAPTAIN = {"pane_id": "w6X:p2", "agent": "omp", "agent_status": "done"}, {"pane_id": "w6M:p1", "agent_status": "idle"}
 
 
@@ -29,11 +33,13 @@ class Route(unittest.TestCase):
         (self.cfg.dispatches / "d1" / "dispatch.md").write_bytes(body)
         self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at,route) "
                        "VALUES ('d1','draft','[]','x',?,'fx-news-pipeline')", (SNAP,))
+        scheduler.set_claims(self.c, "d1", {"repo:o/api", "route:fx-news-pipeline"})  # pinned while draft
         self.c.execute("UPDATE dispatch SET state='staged', body_sha256=?, approved_by='u', last_actor='p' "
                        "WHERE run_id='d1'", (hashlib.sha256(body).hexdigest(),))
         patches = [mock.patch.object(dispatch, "FLEET_HOMES", self.homes),
                    mock.patch.object(dispatch, "_herdr", return_value={"result": {"panes": [LEAD, CAPTAIN]}}),
-                   mock.patch.object(dispatch, "_executor", return_value=CAPTAIN)]
+                   mock.patch.object(dispatch, "_executor", return_value=CAPTAIN),
+                   mock.patch.object(dispatch, "_safety_check")]  # freshness is tested elsewhere
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -68,6 +74,8 @@ class Route(unittest.TestCase):
         with env("w6W:p2"), mock.patch.object(dispatch.subprocess, "run", return_value=other), \
                 self.assertRaisesRegex(dispatch.StageError, "neither fx-news-pipeline's lead"):
             dispatch.execute(self.cfg, self.c, "d1", "fx-core-rs")
+        self.c.execute("INSERT INTO dispatch_launch(run_id,pane_id,state,claimed_at) VALUES ('d1','w6X:p2','sent',?)",
+                       (SNAP,))  # handoff reserved the lead pane; execute requires its own launch
         with env("w6X:p2"):
             res = dispatch.execute(self.cfg, self.c, "d1", "fx-news-pipeline")
         self.assertEqual(res["executor_pane"], "w6X:p2")
