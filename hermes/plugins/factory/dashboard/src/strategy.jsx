@@ -10,11 +10,15 @@
 //   Publishing (approve) is intent only, distinct from staging (execution) — each its own action with a
 //   resource-review warning. Holding/unholding is an explicit readiness change.
 //
+// Layout: the brief list and the selected brief's editor come first (a deep link to a brief lands on it at once);
+// the source browser is a collapsed <details> with a paged list, so hundreds of sources never bury the review.
+//
 // <StrategyTab data view onViewChange onDone onNavigate />: data is the overview (its identity changes on every
-//   refresh, which re-fetches /strategy). view {q, picked, open, busy, err} is the parent's (one, kept while
-//   unmounted): q = source search, picked = source identifiers selected for grooming, open = the selected brief id,
-//   busy/err = the in-flight action and its error. busy and err are live state, not location: leaving Strategy and
-//   coming back keeps them; a late reply patches only this view. onViewChange is the parent's React-style setter;
+//   refresh, which re-fetches /strategy). view {q, picked, open, stateFilter, ctxFilter, busy, err} is the parent's
+//   (one, kept while unmounted): q = source search, picked = source identifiers selected for grooming,
+//   stateFilter/ctxFilter = the source list's state/context filters, open = the selected brief id, busy/err = the
+//   in-flight action and its error. busy and err are live state, not location: leaving Strategy and coming back
+//   keeps them; a late reply patches only this view. onViewChange is the parent's React-style setter;
 //   onDone(result, null, toast) after a write; onNavigate({stage, run?, brief?, sources?}) owns history and the pane.
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
@@ -36,6 +40,8 @@ const Ext = ({ href, children }) => <a className="fx-link" href={href} target="_
 
 const post = (path, body) => SDK.fetchJSON(API + path,
   { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+const PAGE = 50;  // how many source rows render at a time inside the (collapsed) source browser
 
 // The brief body's editable fields: one short title, one outcome, and eight lists (one item per line).
 const FIELDS = [
@@ -71,7 +77,7 @@ const stateLabel = (b) => (b.state === "approved" ? "approved" : b.state === "he
 const DISPATCH_STAGE = { draft: "draft", staged: "run", executing: "run", done: "reconcile",
                          reconciled: "reconcile", archived: "archive" };
 
-// One source ticket: compact and selectable. Its state (including Backlog), lead/assignee and why it is not ready are
+// One source ticket: compact and selectable. Its state (including Backlog), repo/context and why it is not ready are
 // the server's (`reason`). `verdict` is the current verdict kind; `stale` its freshness signal.
 function SourceRow({ s, checked, onToggle }) {
   return (
@@ -163,6 +169,7 @@ function Preview({ md, err, busy }) {
 
 export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const q = view?.q || "", picked = view?.picked || [], open = view?.open || null;
+  const stateFilter = view?.stateFilter || "all", ctxFilter = view?.ctxFilter || "all";
   const busy = view?.busy || null, err = view?.err || null;
   const update = (patch) => onViewChange((v) => ({ ...v, ...patch }));
 
@@ -190,8 +197,10 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const summary = open != null ? briefs.find((b) => b.id === open) : null;
 
   // The open brief's full body + captured sources + compiled render, from GET /strategy/{id} (a pure read).
+  // `mut` bumps on every successful write so the detail (and its render) refetch even for a same-id mutation.
   const [detail, setDetail] = useState(null);
   const [detailErr, setDetailErr] = useState(null);
+  const [mut, setMut] = useState(0);
   const lastOpen = useRef(null);
   useEffect(() => {
     if (lastOpen.current !== open) {  // a different brief: drop the old detail; a same-version re-read keeps it
@@ -203,7 +212,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     SDK.fetchJSON(`${API}/strategy/${open}`).then((x) => { if (live) { setDetail(x); setDetailErr(null); } },
                                                    (e) => { if (live) setDetailErr(errText(e)); });
     return () => { live = false; };
-  }, [open, summary?.revision, summary?.state]);
+  }, [open, summary?.revision, summary?.state, mut]);
   const current = detail?.brief || null;
 
   // The editable form, reset when the open brief's version changes (a new revision is its own row).
@@ -229,12 +238,18 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   // A write that returns a brief becomes the open detail at once (the overview refetch reconciles the summary).
   const applyResult = (r) => {
     if (!r) return false;
-    setDetail({ brief: r, render: null });  // the fresh render is fetched by the detail effect
+    setDetail({ brief: r, render: null });
+    setDetailErr(null);
     setEdit(toForm(r.body));
     setReason(""); setArm(null);
+    setMut((m) => m + 1);  // refetch the compiled render even for same-id mutations (hold/unhold/approve)
     if (r.id !== open) { lastOpen.current = r.id; update({ open: r.id }); }
     return true;
   };
+
+  // Editing any field (title, outcome, resources, …) disarms an armed publish so the human always re-confirms the
+  // values actually shown; nothing is auto-saved or auto-approved.
+  const editField = (key, v) => { setEdit((e) => ({ ...e, [key]: v })); setArm(null); };
 
   const groom = async () => {
     const n = picked.length;
@@ -304,9 +319,18 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     if (r) onDone(r, null, "Sources refreshed");
   };
 
-  // Sources: searchable, compact, multi-select for grooming.
+  // Sources: searchable, filterable by state/context, compact, multi-select, paged inside a collapsed <details>.
   const needle = q.trim().toLowerCase();
-  const list = needle ? tickets.filter((t) => `${t.identifier} ${t.title || ""}`.toLowerCase().includes(needle)) : tickets;
+  const states = useMemo(() => [...new Set(tickets.map((t) => t.state).filter(Boolean))].sort(), [tickets]);
+  const contexts = useMemo(() => [...new Set(tickets.map((t) => t.context).filter(Boolean))].sort(), [tickets]);
+  const filtered = tickets.filter((t) =>
+    (stateFilter === "all" || t.state === stateFilter) &&
+    (ctxFilter === "all" || t.context === ctxFilter));
+  const list = needle ? filtered.filter((t) => `${t.identifier} ${t.title || ""}`.toLowerCase().includes(needle)) : filtered;
+  const [srcOpen, setSrcOpen] = useState(false);
+  const [limit, setLimit] = useState(PAGE);
+  useEffect(() => { setLimit(PAGE); }, [needle, stateFilter, ctxFilter]);
+  const shown = list.slice(0, limit);
   const pick = (id) => update({ picked: picked.includes(id) ? picked.filter((i) => i !== id) : [...picked, id] });
 
   const openBrief = (id) => onNavigate({ stage: "strategy", brief: id });
@@ -318,67 +342,10 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
         planning and execution; publishing intent never starts work.</div>
 
       {loadErr ? <div className="fx-err" role="alert">{all ? `Refreshing strategy failed: ${loadErr}. Showing the last loaded.` : `Strategy did not load: ${loadErr}`}</div> : null}
-
-      {/* ---- sources: select for grooming ---- */}
-      <div className="fx-k">{plural(tickets.length, "source")} · grooming runs DeepSeek on the selection</div>
-      <Input className="fx-search" type="search" placeholder="Search source id or title" value={q}
-             onChange={(e) => update({ q: e.target.value })} />
-      {busy === "groom" ? <div className="fx-err" role="status">Grooming with DeepSeek (this takes a while)…</div> : null}
-      <div className="fx-row">
-        <Button size="sm" disabled={!picked.length || !!busy} onClick={groom}>
-          {busy === "groom" ? "Grooming…" : `Groom ${picked.length} source${picked.length === 1 ? "" : "s"}`}
-        </Button>
-        <Button size="sm" ghost disabled={!!busy} onClick={refresh}>{busy === "refresh" ? "Refreshing…" : "Refresh sources"}</Button>
-        {picked.length ? <Button size="sm" ghost onClick={() => update({ picked: [] })}>Clear</Button> : null}
-      </div>
+      {busy ? <div className="fx-hint" role="status">{busy === "groom" ? "Grooming with DeepSeek (this takes a while)…" : "Working…"}</div> : null}
       {err ? <div className="fx-err" role="alert">{err}</div> : null}
-      <div className="fx-list">
-        {!all && !loadErr ? <div className="fx-hint">Loading…</div>
-          : list.length ? list.map((t) => (
-            <SourceRow key={t.identifier} s={t} checked={picked.includes(t.identifier)} onToggle={() => pick(t.identifier)} />
-          )) : <div className="fx-empty">{needle ? "No source matches." : "No sources yet; refresh sources first."}</div>}
-      </div>
 
-      {/* ---- capacity and scheduling (real scheduler.status, shown even at zero use) ---- */}
-      {all ? (
-        <details className="fx-sec fx-fold">
-          <summary>Capacity & scheduling <span className="fx-count">{capUsed}/{capMax}</span></summary>
-          <div className="fx-hint fx-line">parallel cap {capMax} · {capUsed} in use · {plural(running.length, "dispatch")} running · {plural(launches.length, "launch reservation")}</div>
-          {running.length ? <>
-            <div className="fx-k">Running</div>
-            {running.map((r) => (
-              <div key={r.run_id} className="fx-hint fx-line">
-                <span className="fx-id">{r.run_id}</span> · executing{r.route ? ` · route ${r.route}` : ""}{r.executor_pane ? ` · pane ${r.executor_pane}` : ""}
-                {r.brief_id ? <> · brief <button className="fx-link-btn" onClick={() => openBrief(r.brief_id)}>#{r.brief_id} ›</button></> : null}
-              </div>
-            ))}
-          </> : null}
-          {launches.length ? <>
-            <div className="fx-k">Launch reservations</div>
-            {launches.map((l) => {
-              const b = briefs.find((x) => x.dispatch?.run_id === l.run_id);
-              return (
-                <div key={l.run_id} className="fx-hint fx-line">
-                  <span className="fx-id">{l.run_id}</span> · launch {l.state} · pane {l.pane_id || "—"}
-                  {l.state === "uncertain" ? <span className="fx-err"> · uncertain — confirm unsent before handing off again</span> : null}
-                  {b ? <> · brief <button className="fx-link-btn" onClick={() => openBrief(b.id)}>#{b.id} ›</button></> : null}
-                </div>
-              );
-            })}
-          </> : null}
-          {holders.length ? <>
-            <div className="fx-k">Held resource claims (not running slots)</div>
-            {holders.map((h, i) => (
-              <div key={`${h.run_id}-${h.resource}-${i}`} className="fx-hint fx-line">
-                <span className="fx-id">{h.resource}</span> · {h.run_id} · {h.state}
-                {h.brief_id ? <> · brief <button className="fx-link-btn" onClick={() => openBrief(h.brief_id)}>#{h.brief_id} ›</button></> : null}
-              </div>
-            ))}
-          </> : null}
-        </details>
-      ) : null}
-
-      {/* ---- briefs: compact list, selectable detail ---- */}
+      {/* ---- briefs: compact list, then the selected detail (a deep link lands here at once) ---- */}
       <div className="fx-k">{plural(briefs.length, "brief")}</div>
       <div className="fx-list">
         {briefs.length ? briefs.map((b) => (
@@ -412,7 +379,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
 
           {FIELDS.map(([key, label, kind]) => (
             <Field key={key} label={label} kind={kind} value={edit[key]} disabled={!!busy}
-                   onChange={(v) => setEdit((e) => ({ ...e, [key]: v }))} />
+                   onChange={(v) => editField(key, v)} />
           ))}
           {dirty ? <div className="fx-hint">Unsaved edits.</div> : null}
 
@@ -475,6 +442,86 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
           </div>
         </section>
       ) : null}
+
+      {/* ---- capacity and scheduling (real scheduler.status, shown even at zero use) ---- */}
+      {all ? (
+        <details className="fx-sec fx-fold">
+          <summary>Capacity & scheduling <span className="fx-count">{capUsed}/{capMax}</span></summary>
+          <div className="fx-hint fx-line">parallel cap {capMax} · {capUsed} in use · {plural(running.length, "dispatch")} running · {plural(launches.length, "launch reservation")}</div>
+          {running.length ? <>
+            <div className="fx-k">Running</div>
+            {running.map((r) => (
+              <div key={r.run_id} className="fx-hint fx-line">
+                <span className="fx-id">{r.run_id}</span> · executing{r.route ? ` · route ${r.route}` : ""}{r.executor_pane ? ` · pane ${r.executor_pane}` : ""}
+                {r.brief_id ? <> · brief <button className="fx-link-btn" onClick={() => openBrief(r.brief_id)}>#{r.brief_id} ›</button></> : null}
+              </div>
+            ))}
+          </> : null}
+          {launches.length ? <>
+            <div className="fx-k">Launch reservations</div>
+            {launches.map((l) => {
+              const b = briefs.find((x) => x.dispatch?.run_id === l.run_id);
+              return (
+                <div key={l.run_id} className="fx-hint fx-line">
+                  <span className="fx-id">{l.run_id}</span> · launch {l.state} · pane {l.pane_id || "—"}
+                  {l.state === "uncertain" ? <span className="fx-err"> · uncertain — confirm unsent before handing off again</span> : null}
+                  {b ? <> · brief <button className="fx-link-btn" onClick={() => openBrief(b.id)}>#{b.id} ›</button></> : null}
+                </div>
+              );
+            })}
+          </> : null}
+          {holders.length ? <>
+            <div className="fx-k">Held resource claims (not running slots)</div>
+            {holders.map((h, i) => (
+              <div key={`${h.run_id}-${h.resource}-${i}`} className="fx-hint fx-line">
+                <span className="fx-id">{h.resource}</span> · {h.run_id} · {h.state}
+                {h.brief_id ? <> · brief <button className="fx-link-btn" onClick={() => openBrief(h.brief_id)}>#{h.brief_id} ›</button></> : null}
+              </div>
+            ))}
+          </> : null}
+        </details>
+      ) : null}
+
+      {/* ---- sources: collapsed, paged browser (never buries the brief review above) ---- */}
+      <details className="fx-sec fx-fold" onToggle={(e) => setSrcOpen(e.target.open)}>
+        <summary>Sources <span className="fx-count">{tickets.length}</span>{picked.length ? ` · ${picked.length} picked` : ""}</summary>
+        {srcOpen ? (
+          <>
+            <Input className="fx-search" type="search" placeholder="Search source id or title" value={q}
+                   onChange={(e) => update({ q: e.target.value })} />
+            <div className="fx-row fx-filters">
+              <select className="fx-select" value={stateFilter} aria-label="State filter"
+                      onChange={(e) => update({ stateFilter: e.target.value })}>
+                <option value="all">All states</option>
+                {states.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+              <select className="fx-select" value={ctxFilter} aria-label="Context filter"
+                      onChange={(e) => update({ ctxFilter: e.target.value })}>
+                <option value="all">All contexts</option>
+                {contexts.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div className="fx-row">
+              <Button size="sm" disabled={!picked.length || !!busy} onClick={groom}>
+                {busy === "groom" ? "Grooming…" : `Groom ${picked.length} source${picked.length === 1 ? "" : "s"}`}
+              </Button>
+              <Button size="sm" ghost disabled={!!busy} onClick={refresh}>{busy === "refresh" ? "Refreshing…" : "Refresh sources"}</Button>
+              {picked.length ? <Button size="sm" ghost onClick={() => update({ picked: [] })}>Clear</Button> : null}
+            </div>
+            <div className="fx-list">
+              {!all && !loadErr ? <div className="fx-hint">Loading…</div>
+                : shown.length ? shown.map((t) => (
+                  <SourceRow key={t.identifier} s={t} checked={picked.includes(t.identifier)} onToggle={() => pick(t.identifier)} />
+                )) : <div className="fx-empty">{needle || stateFilter !== "all" || ctxFilter !== "all" ? "No source matches." : "No sources yet; refresh sources first."}</div>}
+            </div>
+            {list.length > shown.length ? (
+              <div className="fx-row">
+                <Button size="sm" ghost onClick={() => setLimit((l) => l + PAGE)}>Show {list.length - shown.length} more</Button>
+              </div>
+            ) : null}
+          </>
+        ) : null}
+      </details>
     </div>
   );
 }
