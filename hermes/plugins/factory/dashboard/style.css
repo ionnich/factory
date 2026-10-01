@@ -355,3 +355,8 @@
 .fx-src { list-style: none; margin: 0; padding: 0; display: grid; gap: .35rem; }
 .fx-src li { padding: .45rem .6rem; border: 1px solid var(--color-border); border-radius: 10px;
              background: var(--color-card); }
+.fx-filters { gap: .4rem; }
+.fx-select { flex: 0 0 auto; max-width: 12rem; font: inherit; font-size: .82rem; padding: .3rem .5rem;
+             border-radius: 8px; border: 1px solid var(--color-border); background: var(--color-card);
+             color: var(--color-foreground); }
+.fx-select:focus { outline: 2px solid var(--b); outline-offset: -1px; }
