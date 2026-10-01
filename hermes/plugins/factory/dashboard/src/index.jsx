@@ -507,9 +507,11 @@ function BriefLink({ d, onGo }) {
   );
 }
 
-// Run: the launch reservation (reserved|sent|uncertain), visible so an uncertain send is never silently replayed. An
-// uncertain or reserved launch offers an explicit recovery — a human attests the send never landed and names why —
-// which releases it for a normal handoff.
+// The launch reservation (reserved|sent|uncertain), visible so an uncertain send is never silently replayed. Release
+// is allowed exactly where the backend allows it: a staged dispatch with reserved|uncertain (never staged+sent), or a
+// terminal done/reconciled/archived dispatch still holding reserved|sent|uncertain (a leftover reservation).
+// Executing is never releasable. A staged release is framed as "unsent"; a terminal one as a completed-run leftover
+// reservation — never claimed unsent, never a restart. Backend verifies reason, confirmation and an idle matching pane.
 function LaunchRecovery({ d, onDone }) {
   const l = d.launch;
   const [reason, setReason] = useState("");
@@ -518,7 +520,9 @@ function LaunchRecovery({ d, onDone }) {
   const [err, setErr] = useState(null);
   if (!l) return null;
   const uncertain = l.state === "uncertain";
-  const releasable = l.state === "reserved" || l.state === "uncertain";
+  const terminal = d.state === "done" || d.state === "reconciled" || d.state === "archived";
+  const releasable = (d.state === "staged" && (l.state === "reserved" || l.state === "uncertain"))
+    || (terminal && (l.state === "reserved" || l.state === "sent" || l.state === "uncertain"));
   const go = async () => {
     if (!armed) { setArmed(true); return; }
     if (!reason.trim()) return;
@@ -527,7 +531,7 @@ function LaunchRecovery({ d, onDone }) {
       const r = await post(`/dispatch/${encodeURIComponent(d.run_id)}/release-unsent`,
                            { confirm_unsent: true, reason: reason.trim() });
       setBusy(false); setArmed(false); setReason("");
-      onDone(r, null, `Released ${d.run_id}'s ${l.state} launch`);
+      onDone(r, null, terminal ? `Released ${d.run_id}'s reservation` : `Released ${d.run_id}'s unsent launch`);
     } catch (e) {
       setBusy(false); setErr(errText(e));
     }
@@ -536,16 +540,21 @@ function LaunchRecovery({ d, onDone }) {
     <div className={`fx-stack-v fx-line${uncertain ? " fx-sw" : ""}`}>
       <div className="fx-row"><Tone tone={uncertain ? "red" : l.state === "sent" ? "blue" : "amber"}>launch {l.state}</Tone>
         <span className="fx-hint">pane {l.pane_id || "—"}</span></div>
-      {uncertain ? <div className="fx-err">The send to pane {l.pane_id} is uncertain and is not auto-replayed.</div> : null}
+      {terminal ? (
+        <div className="fx-hint">This {d.state} run still holds its {l.state} reservation.</div>
+      ) : uncertain ? (
+        <div className="fx-err">The send to pane {l.pane_id} is uncertain and is not auto-replayed.</div>
+      ) : null}
       {l.error ? <Fold className="fx-hint" head="Send error: " text={l.error} /> : null}
       {releasable ? (armed ? (
         <div className="fx-row">
-          <Input autoFocus value={reason} maxLength={2000} disabled={busy} placeholder="Reason: why is the send known unsent?"
+          <Input autoFocus value={reason} maxLength={2000} disabled={busy}
+                 placeholder={terminal ? "Reason: why release this reservation?" : "Reason: why is the send known unsent?"}
                  onChange={(e) => setReason(e.target.value)} />
           <Button size="sm" disabled={busy || !reason.trim()} onClick={go}>{busy ? "Releasing…" : "Confirm release"}</Button>
         </div>
       ) : (
-        <div><Button size="sm" ghost onClick={go}>Release unsent launch</Button></div>
+        <div><Button size="sm" ghost onClick={go}>{terminal ? "Release reservation" : "Release unsent launch"}</Button></div>
       )) : null}
       {err ? <ActErr err={err} /> : null}
     </div>
@@ -554,12 +563,14 @@ function LaunchRecovery({ d, onDone }) {
 
 // Run: the execution scheduler's read (capacity in use, launch reservations, held resource claims), straight from the
 // DB — capacity shows even at zero, reservations/uncertain launches honestly, and held claims are distinct from
-// running slots (they persist through done/reconcile until archive).
-function SchedulerStatus({ s, onGo }) {
+// running slots (they persist through done/reconcile until archive). A launch's link goes to the dispatch's actual
+// phase (from the overview), not a hardcoded Run stage.
+function SchedulerStatus({ s, byRun, onGo }) {
   if (!s) return null;
   const launches = s.launches || [], holders = s.holders || [];
   const cap = s.max_parallel ?? 2, used = s.capacity_used ?? 0;
   const uncertain = launches.filter((l) => l.state === "uncertain");
+  const stageOf = (runId) => byRun?.[runId]?.phase || "run";
   return (
     <details className="fx-sec fx-fold">
       <summary>Scheduling <span className="fx-count">{used}/{cap}</span></summary>
@@ -570,7 +581,7 @@ function SchedulerStatus({ s, onGo }) {
       {launches.length ? (
         <div className="fx-hint fx-line">{launches.map((l) => (
           <span key={l.run_id}>
-            <button className="fx-link-btn" onClick={() => onGo({ stage: "run", run: l.run_id })}>{l.run_id} ›</button>
+            <button className="fx-link-btn" onClick={() => onGo({ stage: stageOf(l.run_id), run: l.run_id })}>{l.run_id} ›</button>
             {` ${l.state} (pane ${l.pane_id || "—"})`}
             {" · "}
           </span>
@@ -989,14 +1000,15 @@ function FactoryPage() {
     plan: () => <><JobLine jobs={data.jobs} name="[bot:planner] Plan drafts" of="draft" />{table("plan", planning)}</>,
     review: () => table("review", plan),
     run: () => <>{deckOf("run")}<ExecutorDeliveries items={deliveries} onDone={done} />
-      <SchedulerStatus s={data.status.scheduler} onGo={go} />
+      <SchedulerStatus s={data.status.scheduler} byRun={byRun} onGo={go} />
       {table("run", (d) => <><Runtime r={d.runtime} /><LaunchRecovery d={d} onDone={done} /><BriefLink d={d} onGo={go} />{plan(d)}</>)}</>,
     strategy: () => <StrategyTab data={data} view={strat} onViewChange={setStrategy} onDone={done} onNavigate={go} />,
     reconcile: () => <><JobLine jobs={data.jobs} name="factory-reconcile" of="dispatch" />{deckOf("reconcile")}
-      <Writebacks rows={data.writebacks || []} onGo={go} />{table("reconcile", plan)}</>,
+      <Writebacks rows={data.writebacks || []} onGo={go} />
+      {table("reconcile", (d) => <><LaunchRecovery d={d} onDone={done} />{plan(d)}</>)}</>,
     archive: () => (arch.rows ? <>
       {arch.err ? <div className="fx-err" role="alert">Refreshing the archive failed: {arch.err}. Showing it as last loaded.</div> : null}
-      {table("archive", (d) => <><Audit d={d} />{plan(d)}</>)}
+      {table("archive", (d) => <><Audit d={d} /><LaunchRecovery d={d} onDone={done} />{plan(d)}</>)}
     </> : arch.err ? <div className="fx-err" role="alert">The archive did not load: {arch.err}</div> : <div className="fx-hint">Loading the archive…</div>),
     learn: () => <>{deckOf("learn")}
       <details className="fx-sec fx-fold" open>
