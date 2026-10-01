@@ -14,9 +14,10 @@
 // the source browser is a collapsed <details> with a paged list, so hundreds of sources never bury the review.
 //
 // <StrategyTab data view onViewChange onDone onNavigate />: data is the overview (its identity changes on every
-//   refresh, which re-fetches /strategy). view {q, picked, open, stateFilter, ctxFilter, assigneeFilter, busy, err} is the parent's
+//   refresh, which re-fetches /strategy). view {q, picked, open, stateFilter, ctxFilter, assigneeFilter, sort, busy, err} is the parent's
 //   (one, kept while unmounted): q = source search, picked = source identifiers selected for grooming,
-//   stateFilter/ctxFilter/assigneeFilter = the source list's state/context/assignee filters, open = the selected brief id, busy/err = the
+//   stateFilter/ctxFilter/assigneeFilter = the source list's state/context/assignee filters, sort = its order (priority by default),
+//   open = the selected brief id, busy/err = the
 //   in-flight action and its error. busy and err are live state, not location: leaving Strategy and coming back
 //   keeps them; a late reply patches only this view. onViewChange is the parent's React-style setter;
 //   onDone(result, null, toast) after a write; onNavigate({stage, run?, brief?, sources?}) owns history and the pane.
@@ -33,7 +34,47 @@ const errText = (e) => String(e && e.message ? e.message : e);
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 const clip = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + "…" : s || "");
 const localTime = (iso) => new Date(iso).toLocaleString([], { hour: "2-digit", minute: "2-digit", month: "short", day: "numeric" });
+const exactTime = (iso) => new Date(iso).toLocaleString([], { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const stop = (e) => e.stopPropagation();
+// A source's calendar due date is exactly YYYY-MM-DD (never a timestamp), so it compares lexically and never shifts a
+// day across a timezone parse. Only a real, well-formed value is a due date.
+const DUE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const isDue = (d) => typeof d === "string" && DUE_RE.test(d);
+// A real timestamp (epoch number or parseable ISO string), else null: missing/invalid dates sort last in BOTH
+// directions and are never guessed from fetched/updated.
+const ts = (v) => {
+  if (v == null || v === "") return null;
+  const t = typeof v === "number" ? v : Date.parse(v);
+  return Number.isFinite(t) ? t : null;
+};
+// Linear priority: 1 Urgent … 4 Low; 0/null/anything else is "No priority" and sorts after 4.
+const PRIORITY = { 1: ["Urgent", "red"], 2: ["High", "amber"], 3: ["Normal", "blue"], 4: ["Low", "gray"] };
+const priorityOf = (p) => PRIORITY[p] || ["No priority", "gray"];
+const PRIORITY_RANK = { 1: 1, 2: 2, 3: 3, 4: 4 };
+const pRank = (p) => PRIORITY_RANK[p] ?? 5;
+const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+// Null keys are missing/invalid dates and go last in both directions (ascending or descending).
+const byAsc = (a, b) => (a == null && b == null ? 0 : a == null ? 1 : b == null ? -1 : cmp(a, b));
+const byDesc = (a, b) => byAsc(b, a);
+// Stable, deterministic sort over an already-filtered copy. Filter first, sort second, paginate third.
+function sortSources(rows, sort) {
+  const key = (t) => ({
+    rank: pRank(t.priority),
+    due: isDue(t.due_date) ? t.due_date : null,
+    created: ts(t.created_at),
+    updated: ts(t.updated_at),
+    id: t.identifier || "",
+  });
+  const order = {
+    // Priority 1-4 first, then due soonest, then oldest created, then identifier (deterministic); No priority after 4.
+    priority: (A, B) => cmp(A.rank, B.rank) || byAsc(A.due, B.due) || byAsc(A.created, B.created) || cmp(A.id, B.id),
+    due: (A, B) => byAsc(A.due, B.due) || cmp(A.id, B.id),
+    oldest: (A, B) => byAsc(A.created, B.created) || cmp(A.id, B.id),
+    newest: (A, B) => byDesc(A.created, B.created) || cmp(A.id, B.id),
+    updated: (A, B) => byDesc(A.updated, B.updated) || cmp(A.id, B.id),
+  };
+  return [...rows].sort((a, b) => (order[sort] || order.priority)(key(a), key(b)));
+}
 const BADGE = { amber: "warning", green: "success", blue: "secondary", gray: "outline", red: "destructive" };
 const Tone = ({ tone, children }) => <Badge tone={BADGE[tone] || "outline"}>{children}</Badge>;
 const Ext = ({ href, children }) => <a className="fx-link" href={href} target="_blank" rel="noreferrer" onClick={stop}>{children}</a>;
@@ -79,9 +120,12 @@ const DISPATCH_STAGE = { draft: "draft", staged: "run", executing: "run", done: 
 let NAV_TOKEN = 0;  // latest navigation generation; the parent bumps it synchronously on every move (go/Back)
 export function bumpNavToken() { NAV_TOKEN += 1; }  // shared across remounts so a late reply sees the newest move
 
-// One source ticket: compact and selectable. Its state (including Backlog), repo/context and why it is not ready are
-// the server's (`reason`). `verdict` is the current verdict kind; `stale` its freshness signal.
+// One source ticket: compact and selectable. Readiness (`reason`) and validity are separate lines: a ticket can be
+// not-ready for one reason and its verdict fresh or stale for another. `verdict` is the current verdict kind, `stale`
+// its freshness signal (null or a reason; a missing verdict is never "outdated"), `verdict_at` when that verdict was
+// made. Priority/created/updated/due are the source's own Linear facts, never the factory's fetch time.
 function SourceRow({ s, checked, onToggle }) {
+  const [pLabel, pTone] = priorityOf(s.priority);
   return (
     <div className="fx-trow">
       <input type="checkbox" className="fx-pick" checked={checked} onChange={onToggle}
@@ -89,13 +133,23 @@ function SourceRow({ s, checked, onToggle }) {
       <div className="fx-grow">
         <div className="fx-row fx-tmeta">
           <Ext href={s.url}>{s.identifier}</Ext>
+          <Tone tone={pTone}>{pLabel}</Tone>
           {s.state ? <Tone tone="gray">{s.state}</Tone> : null}
           {s.repo ? <Tone tone="blue">{s.repo}</Tone> : null}
           {s.assignee ? <span className="fx-hint">{s.assignee}</span> : null}
         </div>
         <div className="fx-ttitle clamp">{s.title}</div>
         {s.reason ? <div className="fx-hint">{s.reason}</div> : null}
-        {!s.reason && s.verdict ? <div className="fx-hint">verdict {s.verdict}{s.stale ? ` · ${s.stale}` : ""}</div> : null}
+        {!s.verdict ? <div className="fx-hint">Not checked</div>
+          : s.stale ? <div className="fx-hint">Check outdated · {s.stale} · prior verdict {s.verdict}</div>
+          : <div className="fx-hint">verdict {s.verdict}{s.verdict_at ? ` · checked ${ago(s.verdict_at)}` : ""}</div>}
+        <div className="fx-row fx-tmeta">
+          {s.created_at ? <span className="fx-hint" title={exactTime(s.created_at)}>Created {ago(s.created_at)}</span>
+                        : <span className="fx-hint">Created unknown</span>}
+          {s.updated_at ? <span className="fx-hint" title={exactTime(s.updated_at)}>Updated {ago(s.updated_at)}</span>
+                        : <span className="fx-hint">Updated unknown</span>}
+          {isDue(s.due_date) ? <span className="fx-hint">Due {s.due_date}</span> : null}
+        </div>
       </div>
     </div>
   );
@@ -175,6 +229,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const q = view?.q || "", picked = view?.picked || [], open = view?.open || null;
   const stateFilter = view?.stateFilter || "all", ctxFilter = view?.ctxFilter || "all",
         assigneeFilter = view?.assigneeFilter || "all";
+  const sort = view?.sort || "priority";
   const busy = view?.busy || null, err = view?.err || null;
   const update = (patch) => onViewChange((v) => ({ ...v, ...patch }));
 
@@ -356,10 +411,16 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     (ctxFilter === "all" || t.context === ctxFilter) &&
     assigneeMatch(t));
   const list = needle ? filtered.filter((t) => `${t.identifier} ${t.title || ""}`.toLowerCase().includes(needle)) : filtered;
+  // Filter first, sort second, paginate third; sorting copies `list` so `tickets` is never mutated.
+  const sorted = sortSources(list, sort);
+  const matching = list.length;
+  const total = tickets.length;
   const [srcOpen, setSrcOpen] = useState(false);
   const [limit, setLimit] = useState(PAGE);
-  useEffect(() => { setLimit(PAGE); }, [needle, stateFilter, ctxFilter, assigneeFilter]);
-  const shown = list.slice(0, limit);
+  useEffect(() => { setLimit(PAGE); }, [needle, stateFilter, ctxFilter, assigneeFilter, sort]);
+  const shown = sorted.slice(0, limit);
+  const shownCount = shown.length;
+  const filteredActive = !!needle || stateFilter !== "all" || ctxFilter !== "all" || assigneeFilter !== "all";
   const pick = (id) => update({ picked: picked.includes(id) ? picked.filter((i) => i !== id) : [...picked, id] });
 
   const openBrief = (id) => onNavigate({ stage: "strategy", brief: id });
@@ -523,7 +584,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
 
       {/* ---- sources: collapsed, paged browser (never buries the brief review above) ---- */}
       <details className="fx-sec fx-fold" onToggle={(e) => setSrcOpen(e.target.open)}>
-        <summary>Sources <span className="fx-count">{tickets.length}</span>{picked.length ? ` · ${picked.length} picked` : ""}</summary>
+        <summary>Sources <span className="fx-count">{filteredActive ? `${matching}/${total}` : total}</span>{picked.length ? ` · ${picked.length} picked` : ""}</summary>
         {srcOpen ? (
           <>
             <Input className="fx-search" type="search" placeholder="Search source id or title" value={q}
@@ -546,6 +607,14 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
                 <option value="unassigned">Unassigned</option>
                 {assignees.map((a) => <option key={a} value={a}>{a}</option>)}
               </select>
+              <select className="fx-select" value={sort} aria-label="Source sort"
+                      onChange={(e) => update({ sort: e.target.value })}>
+                <option value="priority">Priority</option>
+                <option value="due">Due soon</option>
+                <option value="oldest">Oldest created</option>
+                <option value="newest">Newest created</option>
+                <option value="updated">Recently updated</option>
+              </select>
             </div>
             <div className="fx-row">
               <Button size="sm" disabled={!picked.length || !!busy} onClick={groom}>
@@ -554,6 +623,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
               <Button size="sm" ghost disabled={!!busy} onClick={refresh}>{busy === "refresh" ? "Refreshing…" : "Refresh sources"}</Button>
               {picked.length ? <Button size="sm" ghost onClick={() => update({ picked: [] })}>Clear</Button> : null}
             </div>
+            <div className="fx-hint">Showing {shownCount} of {matching} matching · {total} total</div>
             <div className="fx-list">
               {!all && !loadErr ? <div className="fx-hint">Loading…</div>
                 : shown.length ? shown.map((t) => (
