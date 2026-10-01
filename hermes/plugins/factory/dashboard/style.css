@@ -56,11 +56,11 @@
 .fx .star { color: var(--a); margin-right: .15rem; }
 
 /* controls: every button is a 44px target; disabled stays readable (no opacity fade) */
-.fx button { min-width: 44px; min-height: 44px; }
+.fx button { min-width: 44px; min-height: 44px; border-radius: var(--fx-r-sm); }
 .fx :disabled { opacity: 1; }
 .fx :is(input, textarea, select):disabled { color: var(--fx-disabled); }
 /* SDK buttons: round off the square chrome, tame the 0.2em tracking; primary raised + depress, ghost quiet */
-.fx button.bg-midground, .fx button.bg-transparent { border-radius: var(--fx-r); letter-spacing: normal; }
+.fx button.bg-midground, .fx button.bg-transparent { letter-spacing: normal; }
 .fx button.bg-midground { box-shadow: var(--fx-raised); }
 .fx button.bg-midground:active { box-shadow: var(--fx-pressed); }
 .fx button:disabled { box-shadow: none; }
@@ -99,7 +99,7 @@
 .fx-needs-menu[open] > summary::after { content: "▴"; }
 .fx-needs-list { list-style: none; margin: .5rem 0 .6rem; padding: 0; display: grid; gap: .35rem; }
 .fx-need { display: grid; gap: .2rem; width: 100%; text-align: left; font: inherit; font-size: .86rem; color: inherit;
-           cursor: pointer; min-height: 44px; padding: .5rem .7rem; border-radius: var(--fx-r); border: 1px solid var(--fx-line);
+           cursor: pointer; min-height: 44px; padding: .5rem .7rem; border: 1px solid var(--fx-line);
            background: var(--fx-panel); overflow-wrap: anywhere; transition: border-color .15s; }
 .fx-need:hover { border-color: var(--fx-fg); }
 
@@ -141,7 +141,7 @@
 .fx-more[open] .fx-pv { display: none; }
 .fx-opts { display: grid; gap: .45rem; margin: .5rem 0 .3rem; }
 .fx-opt-btn { width: 100%; text-align: left; display: grid; gap: .15rem; min-height: 44px; padding: .6rem .75rem;
-              border-radius: var(--fx-r); cursor: pointer; font: inherit; color: inherit;
+              cursor: pointer; font: inherit; color: inherit;
               background: var(--fx-panel); border: 1px solid var(--fx-line);
               transition: transform .15s var(--spring), border-color .15s, background .15s, box-shadow .15s; }
 .fx-opt-btn:hover { border-color: var(--fx-fg); }
@@ -175,7 +175,7 @@
 .fx-tabs { display: flex; gap: .4rem; flex: 0 0 auto; }
 .fx-tabs + .fx-tabs { padding-left: .6rem; border-left: 1px solid var(--fx-line); }
 .fx-stage-tab { flex: 0 0 auto; display: inline-flex; gap: .35rem; align-items: center; min-height: 44px;
-                padding: .45rem .9rem; border-radius: var(--fx-r-full); border: 1px solid var(--fx-line);
+                padding: .45rem .9rem; border: 1px solid var(--fx-line);
                 background: var(--fx-panel); color: var(--fx-muted); font: inherit; font-size: .85rem; font-weight: 600;
                 cursor: pointer; transition: border-color .15s, color .15s, box-shadow .15s, background .15s; }
 .fx-stage-tab:hover { color: var(--fx-fg); }
@@ -332,7 +332,7 @@
 .fx-landed { display: grid; gap: .4rem; font-size: .85rem; }
 .fx-crumb { justify-self: start; max-width: 100%; text-align: left; font: inherit; font-size: .82rem; font-weight: 650;
             color: var(--b); cursor: pointer; background: color-mix(in srgb, var(--b) 10%, transparent);
-            border: 1px solid color-mix(in srgb, var(--b) 40%, transparent); border-radius: var(--fx-r-full);
+            border: 1px solid color-mix(in srgb, var(--b) 40%, transparent);
             min-height: 44px; padding: .2rem .7rem; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
             overflow-wrap: anywhere; transition: box-shadow .15s, background .15s; }
 .fx-crumb.on { background: color-mix(in srgb, var(--b) 18%, var(--fx-panel)); box-shadow: var(--fx-pressed); }
@@ -363,7 +363,7 @@
          background: color-mix(in srgb, var(--a) 6%, transparent); min-width: 0; }
 .fx-sw.locked { border-width: 1px; border-color: var(--fx-line); background: none; }
 .fx-sw-q { font-weight: 650; font-size: .95rem; line-height: 1.3; overflow-wrap: anywhere; }
-.fx-seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; border: 1px solid var(--fx-line); border-radius: var(--fx-r); overflow: hidden; }
+.fx-seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; border: 1px solid var(--fx-line); border-radius: var(--fx-r-sm); overflow: hidden; }
 .fx-seg button { font: inherit; font-size: .88rem; font-weight: 650; min-height: 44px; padding: .55rem .4rem; border: 0;
                  background: none; color: inherit; cursor: pointer; transition: background .15s, color .15s, box-shadow .15s; }
 .fx-seg button + button { border-left: 1px solid var(--fx-line); }
@@ -394,7 +394,7 @@ ul.fx-ev { margin: 0 0 0 1rem; font-size: .78rem; color: var(--fx-muted); overfl
 .fx-railway .fx-wire.lit { opacity: 1; stroke-dasharray: none; filter: drop-shadow(0 0 3px var(--b)); }
 .fx-rw-row { display: flex; align-items: center; gap: .4rem; font-size: .82rem; white-space: nowrap; overflow: hidden; }
 .fx-rw-q { overflow: hidden; text-overflow: ellipsis; }
-.fx-rw-o { font: inherit; background: none; border: 1px solid var(--fx-line); border-radius: var(--fx-r-full);
+.fx-rw-o { font: inherit; background: none; border: 1px solid var(--fx-line);
            min-height: 44px; margin: 0; padding: .1rem .6rem; color: inherit; cursor: pointer; }
 .fx-rw-o[aria-pressed="true"] { border-color: var(--b); color: var(--fx-fg); font-weight: 650; box-shadow: var(--fx-pressed); }
 .fx-rw-o:disabled { cursor: default; }
@@ -434,7 +434,7 @@ ul.fx-ev { margin: 0 0 0 1rem; font-size: .78rem; color: var(--fx-muted); overfl
              background: var(--fx-panel); }
 .fx-filters { gap: .4rem; }
 .fx-select { flex: 0 0 auto; max-width: 12rem; min-height: 44px; font: inherit; font-size: .82rem;
-             padding: .3rem 1.7rem .3rem .5rem; border-radius: var(--fx-r); border: 1px solid var(--fx-line);
+             padding: .3rem 1.7rem .3rem .5rem; border-radius: var(--fx-r-sm); border: 1px solid var(--fx-line);
              color: var(--fx-fg); appearance: none;
              background-image: linear-gradient(45deg, transparent 50%, var(--fx-muted) 50%),
                                linear-gradient(135deg, var(--fx-muted) 50%, transparent 50%);
