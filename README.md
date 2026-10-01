@@ -44,7 +44,8 @@ One-time, by hand:
   `factory.db` changes refresh data over `/stream` without polling, changing tabs or opening panels.
   The shared visual system uses theme-derived warm surfaces: subtly raised major panels, flat dense rows,
   inset fields and pressed selections with visible accents. Ticket titles lead; repo, assignee and dates stay
-  quiet metadata. Controls have 44px targets, visible keyboard focus and readable disabled labels; phone
+  quiet metadata. Buttons and selects use 6px corners rather than pills. Controls have 44px targets,
+  visible keyboard focus and readable disabled labels; phone
   fields use 16px text and reduced-motion preferences are respected. Styles stay scoped to Factory; SDK
   components, decision safeguards and the railway/configurator workflow are unchanged.
   Stage-local decision cards show options, consequences and ★. Executor answers and options that start or stop
