@@ -76,6 +76,8 @@ const STATE_TONE = { draft: "blue", approved: "green", held: "amber" };
 const stateLabel = (b) => (b.state === "approved" ? "approved" : b.state === "held" ? "held" : "draft");
 const DISPATCH_STAGE = { draft: "draft", staged: "run", executing: "run", done: "reconcile",
                          reconciled: "reconcile", archived: "archive" };
+let NAV_TOKEN = 0;  // latest navigation generation; the parent bumps it synchronously on every move (go/Back)
+export function bumpNavToken() { NAV_TOKEN += 1; }  // shared across remounts so a late reply sees the newest move
 
 // One source ticket: compact and selectable. Its state (including Backlog), repo/context and why it is not ready are
 // the server's (`reason`). `verdict` is the current verdict kind; `stale` its freshness signal.
@@ -102,6 +104,7 @@ function SourceRow({ s, checked, onToggle }) {
 // One brief summary: state, title/revision, its readiness blockers, and its downstream dispatch (if dispatched).
 function BriefRow({ b, selected, onSelect, onDispatch }) {
   const blockers = b.blockers || [];
+  const superseded = b.readiness === "superseded";
   return (
     <div id={`fx-brief-${b.id}`} className={`fx-trow${selected ? " picked" : ""}`} role="button" tabIndex={0}
          aria-current={selected ? "true" : undefined} onClick={onSelect}
@@ -109,6 +112,7 @@ function BriefRow({ b, selected, onSelect, onDispatch }) {
       <div className="fx-grow">
         <div className="fx-row fx-tmeta">
           <Tone tone={STATE_TONE[b.state] || "gray"}>{stateLabel(b)}</Tone>
+          {superseded ? <Tone tone="gray">superseded</Tone> : null}
           {b.source_changed?.length ? <Tone tone="red">needs amendment</Tone> : null}
           {blockers.length ? <Tone tone="amber">{plural(blockers.length, "blocker")}</Tone> : null}
         </div>
@@ -173,11 +177,6 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const busy = view?.busy || null, err = view?.err || null;
   const update = (patch) => onViewChange((v) => ({ ...v, ...patch }));
 
-  // The selected brief at any moment, for async handlers: a late groom applies only if the operator is still where
-  // they submitted it — it must not change the selection or steal navigation.
-  const openRef = useRef(open);
-  useEffect(() => { openRef.current = open; }, [open]);
-
   // The overview: brief summaries, the source list, and the execution scheduler's read. Refetched on every overview
   // refresh (`data` is a new object each time) and on mount.
   const [all, setAll] = useState(null);
@@ -240,16 +239,21 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     }
   };
 
-  // A write that returns a brief becomes the open detail at once (the overview refetch reconciles the summary).
-  const applyResult = (r) => {
-    if (!r) return false;
+  // Apply a write's result only if the operator is still where they submitted it. `atNav` is the navigation
+  // generation captured at submission; a move (including away-and-back) bumps it, so a late reply never changes the
+  // selection, never acts on a newly selected brief, and never steals navigation. No autosave, no auto-approval.
+  const applyGuarded = (r, atNav) => {
+    if (!r || NAV_TOKEN !== atNav) return false;
     setDetail({ brief: r, render: null });
     setDetailErr(null);
     setEdit(toForm(r.body));
     setReason(""); setArm(null);
     setMut((m) => m + 1);  // refetch the compiled render even for same-id mutations (hold/unhold/approve)
-    if (r.id !== open) { lastOpen.current = r.id; update({ open: r.id }); }
     return true;
+  };
+  // When a write returned a new revision id and the context is still eligible, the URL/history follows that id.
+  const settleId = (r, atOpen) => {
+    if (r.id !== atOpen) { lastOpen.current = r.id; onNavigate({ stage: "strategy", brief: r.id }); }
   };
 
   // Editing any field (title, outcome, resources, …) disarms an armed publish so the human always re-confirms the
@@ -258,57 +262,63 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
 
   const groom = async () => {
     const submitted = [...picked];
-    const atOpen = open;
+    const atOpen = open, atNav = NAV_TOKEN;
     const r = await call("/strategy/groom", { identifiers: submitted }, "groom");
     if (!r) return;
     // Remove only the identifiers this request submitted; picks made since are left alone.
     onViewChange((s) => ({ picked: (s.picked || []).filter((i) => !submitted.includes(i)) }));
-    // Apply the new brief only if the operator is still where they submitted; a late result never steals the selection.
-    if (openRef.current === atOpen) applyResult(r);
+    if (applyGuarded(r, atNav)) settleId(r, atOpen);
     onDone(r, null, `Groomed a draft brief #${r.id} from ${submitted.length} source${submitted.length === 1 ? "" : "s"}`);
   };
 
   const save = async () => {
+    const atOpen = open, atNav = NAV_TOKEN;
     const r = await call(`/strategy/${open}/revise`, { body: formToBody(edit), reason: reason.trim() || "edited draft" }, "save");
-    if (!applyResult(r)) return;
+    if (!applyGuarded(r, atNav)) return;
+    settleId(r, atOpen);
     onDone(r, null, `Saved draft #${r.id}`);
-  };
-
-  const approve = async (target) => {
-    const r = await call(`/strategy/${target.id}/approve`, {}, "approve");
-    if (applyResult(r)) onDone(r, null, `Published #${target.id} as approved intent (not execution)`);
   };
 
   const publish = async () => {
     if (arm !== "publish") { setArm("publish"); return; }
     setArm(null);
+    const atOpen = open, atNav = NAV_TOKEN;
     let target = current;
     if (dirty) {  // publish the exact edited version: persist it, then approve it
       target = await call(`/strategy/${open}/revise`, { body: formToBody(edit), reason: reason.trim() || "publish" }, "publish");
       if (!target) return;
-      applyResult(target);
     }
-    await approve(target);
+    const approved = await call(`/strategy/${target.id}/approve`, {}, "approve");
+    if (!approved) return;
+    if (!applyGuarded(approved, atNav)) return;
+    settleId(approved, atOpen);
+    onDone(approved, null, `Published #${approved.id} as approved intent (not execution)`);
   };
 
   const amend = async () => {  // published -> new draft revision; the reason is required
     if (arm !== "amend") { setArm("amend"); return; }
     if (!reason.trim()) return;
+    const atOpen = open, atNav = NAV_TOKEN;
     const r = await call(`/strategy/${open}/revise`, { body: formToBody(edit), reason: reason.trim() }, "amend");
-    if (!applyResult(r)) return;
+    if (!applyGuarded(r, atNav)) return;
+    settleId(r, atOpen);
     onDone(r, null, `Amendment #${r.id} drafted; review and publish`);
   };
 
   const hold = async () => {
     if (arm !== "hold") { setArm("hold"); return; }
     if (!reason.trim()) return;
+    const atOpen = open, atNav = NAV_TOKEN;
     const r = await call(`/strategy/${open}/hold`, { reason: reason.trim() }, "hold");
-    if (applyResult(r)) onDone(r, null, `Held #${open}`);
+    if (!applyGuarded(r, atNav)) return;
+    onDone(r, null, `Held #${open}`);
   };
 
   const unhold = async () => {
+    const atOpen = open, atNav = NAV_TOKEN;
     const r = await call(`/strategy/${open}/unhold`, {}, "unhold");
-    if (applyResult(r)) onDone(r, null, `Unheld #${open}`);
+    if (!applyGuarded(r, atNav)) return;
+    onDone(r, null, `Unheld #${open}`);
   };
 
   const alive = useRef(true);  // a late reply never steals navigation: staging only moves the page while Strategy is open
@@ -342,7 +352,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const pick = (id) => update({ picked: picked.includes(id) ? picked.filter((i) => i !== id) : [...picked, id] });
 
   const openBrief = (id) => onNavigate({ stage: "strategy", brief: id });
-  const openDispatch = (d) => onNavigate({ stage: DISPATCH_STAGE[d.state] || "draft", run: d.run_id });
+  const openDispatch = (d) => onNavigate({ stage: d.phase || DISPATCH_STAGE[d.state] || "draft", run: d.run_id });
 
   return (
     <div className="fx-stack-v">
@@ -357,7 +367,8 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
       <div className="fx-k">{plural(briefs.length, "brief")}</div>
       <div className="fx-list">
         {briefs.length ? briefs.map((b) => (
-          <BriefRow key={b.id} b={b} selected={open === b.id} onSelect={() => openBrief(b.id)} onDispatch={openDispatch} />
+          <BriefRow key={b.id} b={b} selected={open === b.id}
+                    onSelect={() => openBrief(b.id)} onDispatch={openDispatch} />
         )) : <div className="fx-empty">No briefs yet. Groom a source, or create one from the CLI.</div>}
       </div>
 
@@ -370,6 +381,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
             <div className="fx-row">
               <span className="fx-id">#{current.id}</span><span className="fx-hint">revision {current.revision}</span>
               <Tone tone={STATE_TONE[current.state] || "gray"}>{stateLabel(current)}</Tone>
+              {summary?.readiness === "superseded" ? <Tone tone="gray">superseded</Tone> : null}
               {summary?.source_changed?.length ? <Tone tone="red">needs amendment</Tone> : null}
             </div>
             <div className="fx-hint">{current.created_by} · {ago(current.created_at)}
@@ -377,6 +389,9 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
           </div>
           {current.amendment_reason ? <div className="fx-why">Amended: {current.amendment_reason}</div> : null}
           {current.hold_reason ? <div className="fx-why">Hold: {current.hold_reason}</div> : null}
+          {summary?.readiness === "superseded" ? (
+            <div className="fx-err">Superseded — a newer revision exists; a draft with a child cannot be published.</div>
+          ) : null}
           {summary?.source_changed?.length ? (
             <div className="fx-err">A source changed since this brief was captured: {summary.source_changed.join(", ")}. Amend to re-capture, or review the discrepancy before dispatching.</div>
           ) : null}
@@ -389,7 +404,10 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
             <Field key={key} label={label} kind={kind} value={edit[key]} disabled={!!busy}
                    onChange={(v) => editField(key, v)} />
           ))}
-          {dirty ? <div className="fx-hint">Unsaved edits.</div> : null}
+          {dirty ? (current.state === "draft"
+            ? <div className="fx-hint">Unsaved edits.</div>
+            : <div className="fx-err">Unsaved edits are not the approved intent — amend (with a reason) before staging.</div>
+          ) : null}
 
           <div className="fx-k">Captured sources (server-captured, not model-edited)</div>
           <Provenance sources={current.sources} />
@@ -404,7 +422,9 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
               <>
                 <div className="fx-row">
                   <Button size="sm" disabled={!!busy || !dirty} onClick={save}>{busy === "save" ? "Saving…" : "Save draft"}</Button>
-                  <Button size="sm" disabled={!!busy} onClick={publish}>{busy === "publish" ? "Publishing…" : arm === "publish" ? "Confirm publish" : "Publish"}</Button>
+                  {summary?.readiness !== "superseded"
+                    ? <Button size="sm" disabled={!!busy} onClick={publish}>{busy === "publish" ? "Publishing…" : arm === "publish" ? "Confirm publish" : "Publish"}</Button>
+                    : null}
                 </div>
                 {arm === "publish" ? (
                   <div className="fx-sw">
@@ -425,7 +445,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
                     ? <Button size="sm" disabled={!!busy} onClick={unhold}>{busy === "unhold" ? "…" : "Unhold"}</Button>
                     : <Button size="sm" ghost disabled={!!busy} onClick={hold}>{busy === "hold" ? "…" : arm === "hold" ? "Confirm hold" : "Hold"}</Button>}
                   {current.state === "approved"
-                    ? <Button size="sm" disabled={!!busy} onClick={stage}>{busy === "stage" ? "Staging…" : arm === "stage" ? "Confirm stage" : "Stage"}</Button>
+                    ? <Button size="sm" disabled={!!busy || dirty} onClick={stage}>{busy === "stage" ? "Staging…" : arm === "stage" ? "Confirm stage" : "Stage"}</Button>
                     : null}
                 </div>
                 {(arm === "amend" || arm === "hold") ? (
