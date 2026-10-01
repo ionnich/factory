@@ -263,6 +263,14 @@ class UncertainSend(unittest.TestCase):
                        "WHERE run_id='d1'")
         self.cfg = SimpleNamespace(raw={})
         self.pane = {"pane_id": "w1:p1", "agent": "omp", "agent_status": "idle"}
+        # d1 has no route: its launch pane is supervised by the captain; prove the captain idle for release paths.
+        self.homes = Path(tmp.name) / "homes"
+        (self.homes / "factory-primary" / "state").mkdir(parents=True)
+        (self.homes / "factory-primary" / "state" / "home-summary.json").write_text(
+            json.dumps({"active_children": [], "decisions_open": []}))
+        self.patch_fh = mock.patch.object(dispatch, "FLEET_HOMES", self.homes)
+        self.patch_fh.start()
+        self.addCleanup(self.patch_fh.stop)
 
     def test_send_failure_marks_uncertain_and_is_not_replayed(self):
         with mock.patch.object(dispatch, "_safety_check"), \
@@ -467,6 +475,143 @@ class ReopenedDependency(unittest.TestCase):
         with self.assertRaises(dispatch.StageError):
             dispatch.stage_brief(self.cfg, self.c, brief["id"], "user")
         self.assertEqual(self.c.execute("SELECT count(*) FROM dispatch").fetchone()[0], before)  # nothing staged
+
+
+class TerminalPaneRetention(unittest.TestCase):
+    """Terminal capacity frees via launch_active, but the pane reservation is retained through done/reconciled/
+    archived until release_safe_terminal positively proves the pane idle AND the real supervising home free of
+    children and decisions."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.c = db.connect(self.tmp / "t.db")
+        self.addCleanup(self.c.close)
+        self.homes = self.tmp / "homes"
+        (self.homes / "factory-primary" / "state").mkdir(parents=True)
+        (self.homes / "fx-api" / "state").mkdir(parents=True)
+        self.patch_fh = mock.patch.object(dispatch, "FLEET_HOMES", self.homes)
+        self.patch_fh.start()
+        self.addCleanup(self.patch_fh.stop)
+
+    def write_summary(self, home, children=(), decisions=(), text=None):
+        f = self.homes / home / "state" / "home-summary.json"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text if text is not None
+                     else json.dumps({"active_children": list(children), "decisions_open": list(decisions)}))
+
+    def sent_terminal(self, run_id, pane="pane-1", route=None):
+        """Reach a done dispatch that holds a sent launch (raw auto-done), without freeing the pane."""
+        _helpers.seed_snapshot(self.c, "i1", "FIN-1")
+        v = _helpers.seed_verdict(self.c, "i1")
+        _helpers.seed_dispatch(self.c, run_id, "draft", route=route)
+        _helpers.set_claims(self.c, run_id, {"repo:a", "route:fx-a"})
+        _helpers.seed_ticket(self.c, run_id, "i1", "FIN-1", v)
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' "
+                       "WHERE run_id=?", (run_id,))
+        scheduler.reserve_if_free(self.c, run_id, pane, os.getpid())
+        scheduler.mark_sent(self.c, run_id)
+        self.c.execute("UPDATE dispatch SET state='executing', executor_pane=?, executing_at=? WHERE run_id=?",
+                       (pane, SNAP, run_id))
+        self.c.execute("UPDATE dispatch_ticket SET card_status='blocked' WHERE run_id=?", (run_id,))  # auto-done
+        return run_id
+
+    def test_card_completion_retains_sent_launch(self):
+        _helpers.seed_snapshot(self.c, "i1", "FIN-1")
+        v = _helpers.seed_verdict(self.c, "i1")
+        _helpers.seed_dispatch(self.c, "d1", "draft")
+        _helpers.set_claims(self.c, "d1", {"repo:a", "route:fx-a"})
+        _helpers.seed_ticket(self.c, "d1", "i1", "FIN-1", v)
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' "
+                       "WHERE run_id='d1'")
+        scheduler.reserve_if_free(self.c, "d1", "pane-1", os.getpid())
+        scheduler.mark_sent(self.c, "d1")
+        self.c.execute("UPDATE dispatch SET state='executing', executor_pane='pane-1', executing_at=? WHERE run_id='d1'",
+                       (SNAP,))
+        dispatch.card(SimpleNamespace(kanban={"enabled": False}), self.c, "d1", "FIN-1", "block", "user",
+                      body="stuck", ask=False)
+        self.assertEqual(self.c.execute("SELECT state FROM dispatch WHERE run_id='d1'").fetchone()[0], "done")
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))  # pane reservation retained by card completion
+
+    def test_archive_retains_sent_launch(self):
+        self.sent_terminal("d1", pane="pane-1")
+        dispatches = self.tmp / "dispatches"
+        (dispatches / "d1").mkdir(parents=True)
+        (dispatches / "d1" / "dispatch.md").write_bytes(b"# d1\n")
+        self.c.execute("UPDATE dispatch SET state='reconciled', reconciled_at=? WHERE run_id='d1'", (SNAP,))
+        dispatch.archive(SimpleNamespace(raw={}, dispatches=dispatches), self.c, "d1")
+        self.assertEqual(self.c.execute("SELECT state FROM dispatch WHERE run_id='d1'").fetchone()[0], "archived")
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))  # pane reservation retained through archive
+
+    def test_safe_terminal_releases_only_idle_pane_and_idle_home(self):
+        self.sent_terminal("d1", pane="pane-1")  # no route: the captain supervises pane-1
+        self.write_summary("factory-primary")  # positive proof: no children, no decisions
+        panes = {"result": {"panes": [{"pane_id": "pane-1", "agent": "omp", "agent_status": "idle"}]}}
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), ["d1"])
+        self.assertIsNone(scheduler.launch(self.c, "d1"))
+
+    def test_safe_terminal_keeps_busy_or_unknown_pane(self):
+        self.sent_terminal("d1", pane="pane-1")
+        self.write_summary("factory-primary")
+        for panes in ({"result": {"panes": [{"pane_id": "pane-1", "agent": "omp", "agent_status": "running"}]}},
+                      {"result": {"panes": []}}):
+            with mock.patch.object(dispatch, "_herdr", return_value=panes):
+                self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), [])
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))
+
+    def test_safe_terminal_keeps_missing_or_malformed_summary(self):
+        self.sent_terminal("d1", pane="pane-1")
+        panes = {"result": {"panes": [{"pane_id": "pane-1", "agent": "omp", "agent_status": "idle"}]}}
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), [])  # no summary at all
+        self.write_summary("factory-primary", text="{not valid json")  # malformed
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), [])
+        self.write_summary("factory-primary", text=json.dumps({"active_children": "nope", "decisions_open": []}))  # wrong type
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), [])
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))
+
+    def test_safe_terminal_captain_children_blocks_fallback(self):
+        self.sent_terminal("d1", pane="pane-1", route="fx-api")
+        # the lead's spawned pane is elsewhere, so the captain owns pane-1; a busy captain must block even when the
+        # route lead's own summary looks idle.
+        (self.homes / "factory-primary" / "state" / "fx-api.meta").write_text(
+            "kind=secondmate\nherdr_pane_id=other-pane\n")
+        self.write_summary("fx-api")  # lead looks idle
+        self.write_summary("factory-primary", children=["fx-api"])  # captain still has a busy child
+        panes = {"result": {"panes": [{"pane_id": "pane-1", "agent": "omp", "agent_status": "idle"}]}}
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), [])
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))
+
+    def test_safe_terminal_keeps_uncertain(self):
+        self.sent_terminal("d1", pane="pane-1")
+        self.c.execute("UPDATE dispatch_launch SET state='uncertain' WHERE run_id='d1'")  # sent -> uncertain
+        self.write_summary("factory-primary")
+        panes = {"result": {"panes": [{"pane_id": "pane-1", "agent": "omp", "agent_status": "idle"}]}}
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            self.assertEqual(dispatch.release_safe_terminal(SimpleNamespace(raw={}), self.c), [])  # uncertain never auto
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))
+
+    def test_release_unsent_refuses_busy_or_unknown_home(self):
+        _helpers.seed_dispatch(self.c, "d1", "draft")
+        _helpers.set_claims(self.c, "d1", {"repo:a", "route:fx-a"})
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' "
+                       "WHERE run_id='d1'")
+        self.c.execute("INSERT INTO dispatch_launch(run_id, pane_id, state, claimed_at) VALUES ('d1','pane-1','reserved',?)",
+                       (SNAP,))
+        panes = {"result": {"panes": [{"pane_id": "pane-1", "agent": "omp", "agent_status": "idle"}]}}
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):  # no captain summary: unknown home -> refuse
+            with self.assertRaises(dispatch.StageError):
+                dispatch.release_unsent(SimpleNamespace(raw={}), self.c, "d1", "user:cli", "confirmed unsent")
+        self.write_summary("factory-primary", children=["fx-api"])  # busy captain -> refuse
+        with mock.patch.object(dispatch, "_herdr", return_value=panes):
+            with self.assertRaises(dispatch.StageError):
+                dispatch.release_unsent(SimpleNamespace(raw={}), self.c, "d1", "user:cli", "confirmed unsent")
+        self.assertIsNotNone(scheduler.launch(self.c, "d1"))
 
 
 if __name__ == "__main__":

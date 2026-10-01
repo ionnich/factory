@@ -961,11 +961,40 @@ def _target(cfg: Config, d) -> tuple[dict, str]:
     return _executor(cfg.raw.get("executor", {}).get("workspace", "factory")), "factory-primary"
 
 
-def _lead_busy(route: str) -> bool:
-    """The lead still supervises crews or holds decisions: a /new now would drop what it has not written down."""
+def _home_summary(route: str) -> dict | None:
+    """The supervising home's summary as positive proof, or None when the file is missing, unreadable, malformed,
+    or its proof fields are absent/wrong-typed. None is never proof of idle (terminal cleanup fails closed)."""
     f = FLEET_HOMES / route / "state" / "home-summary.json"
-    s = json.loads(f.read_text()) if f.exists() else {}
-    return bool(s.get("active_children") or s.get("decisions_open"))
+    try:
+        s = json.loads(f.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(s, dict) or not isinstance(s.get("active_children"), list) \
+            or not isinstance(s.get("decisions_open"), list):
+        return None
+    return s
+
+
+def _lead_busy(route: str) -> bool:
+    """The lead still supervises crews or holds decisions: a /new now would drop what it has not written down.
+    A missing/unreadable summary is not proof of activity here — handoff separately verifies the pane is idle."""
+    s = _home_summary(route)
+    return bool(s and (s["active_children"] or s["decisions_open"]))
+
+
+def _home_idle(route: str) -> bool:
+    """Positive proof the supervising home is idle: summary present, both proof fields lists, and both empty.
+    Missing, malformed, unreadable or wrong-typed is NOT proof of idle (fail closed)."""
+    s = _home_summary(route)
+    return s is not None and not s["active_children"] and not s["decisions_open"]
+
+
+def _launch_home(route: str | None, pane_id: str) -> str:
+    """The real supervising home for a launch's pane: the route lead only when its spawned herdr pane matches the
+    reserved pane, else the captain (handoff may have fallen back to the captain)."""
+    if route and _lead_pane_id(route) == pane_id:
+        return route
+    return "factory-primary"
 
 
 def _safety_check(cfg: Config, conn, run_id: str) -> None:
@@ -1153,6 +1182,9 @@ def release_unsent(cfg: Config, conn, run_id: str, actor: str, reason: str) -> d
         raise StageError(f"pane {l['pane_id']} is unknown; refusing to release an unverified send")
     if pane.get("agent_status") not in ("idle", "done"):
         raise StageError(f"pane {l['pane_id']} is {pane.get('agent_status')}; not releasing a live executor")
+    route = conn.execute("SELECT route FROM dispatch WHERE run_id=?", (run_id,)).fetchone()["route"]
+    if not _home_idle(_launch_home(route, l["pane_id"])):  # busy/unknown supervising home: refuse (fail closed)
+        raise StageError("the supervising home is busy or its summary is unknown; not releasing an unverified send")
     with db.tx(conn):  # revalidate DB ownership/state under the lock; never release a changed/raced launch
         d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
         if d is None or d["state"] not in ("staged", "done", "reconciled", "archived"):
@@ -1168,8 +1200,8 @@ def release_unsent(cfg: Config, conn, run_id: str, actor: str, reason: str) -> d
 
 def release_safe_terminal(cfg: Config, conn) -> list[str]:
     """Conservative terminal cleanup (proposer surface): release a terminal dispatch's `sent`/`reserved` launch only
-    after its pane is proven idle and, for a routed lead, not supervising crews/decisions. An `uncertain` launch is
-    never auto-released. Returns the run ids released."""
+    when its pane is observed idle AND the real supervising home has positive proof of no children and no decisions.
+    A missing/malformed/busy summary or an `uncertain` launch is never auto-released. Returns the run ids released."""
     try:
         panes = {p["pane_id"]: p for p in _herdr("pane", "list")["result"]["panes"]}
     except (StageError, OSError, subprocess.TimeoutExpired):
@@ -1181,8 +1213,8 @@ def release_safe_terminal(cfg: Config, conn) -> list[str]:
         pane = panes.get(l["pane_id"])
         if pane is None or pane.get("agent_status") not in ("idle", "done"):
             continue  # busy/unknown pane: keep the reservation
-        if l["route"] and _lead_busy(l["route"]):
-            continue  # lead still supervising crews/decisions: keep
+        if not _home_idle(_launch_home(l["route"], l["pane_id"])):  # missing/malformed/busy home: fail closed, keep
+            continue
         with db.tx(conn):
             d2 = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (l["run_id"],)).fetchone()
             if d2 is None or d2["state"] not in ("done", "reconciled", "archived"):
@@ -1197,7 +1229,7 @@ def release_safe_terminal(cfg: Config, conn) -> list[str]:
 
 def archive(cfg: Config, conn, run_id: str) -> dict:
     """reconciled -> archived: unlock, move to _archived/, commit it to the factory repo, and release the resource
-    claims (the terminal done/reconciled states already freed the launch slot)."""
+    claims (terminal frees capacity via launch_active; the pane reservation is retained until release_safe_terminal)."""
     d = conn.execute("SELECT state FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
     if d is None or d["state"] != "reconciled":
         raise StageError(f"dispatch {run_id} is {d['state'] if d else 'unknown'}, not reconciled")
@@ -1211,7 +1243,8 @@ def archive(cfg: Config, conn, run_id: str) -> dict:
         conn.execute("UPDATE dispatch SET state='archived', archived_at=?, last_actor='factory:archive' WHERE run_id=?",
                      (db.now(), run_id))
         scheduler.release_claims(conn, run_id)  # archived: claims no longer conflict (claim_holders excludes it)
-        scheduler.release_terminal_launch(conn, run_id)  # reserved/sent only; uncertain retained for explicit recovery
+        # The pane reservation is retained through archive: release_safe_terminal releases it only after positive
+        # proof the pane is idle and its home free of children/decisions.
     return {"run_id": run_id, "path": str(dst), "committed": _commit_archived(cfg, run_id, f"archive dispatch {run_id}")}
 
 
@@ -1283,9 +1316,8 @@ def card(cfg: Config, conn, run_id: str, ident: str, kind: str, actor: str,
         if d["state"] != "executing":  # last card closed the dispatch: run-time questions no longer apply
             decide.void(conn, "run_id=? AND kind IN ('executor-gone','dispatch-stuck','ask')", (run_id,),
                         "the dispatch finished")
-            # Terminal frees capacity (launch_active), but a sent/reserved launch releases the pane slot only when
-            # positively safe; an uncertain launch is retained for explicit human recovery.
-            scheduler.release_terminal_launch(conn, run_id)
+            # Terminal frees capacity (launch_active) automatically; the pane reservation is retained until
+            # release_safe_terminal positively proves the pane idle and its home free of children/decisions.
     res = {"run_id": run_id, "identifier": ident, "event": kind,
            "card_status": conn.execute("SELECT card_status FROM dispatch_ticket WHERE run_id=? AND identifier=?",
                                        (run_id, ident)).fetchone()[0], "dispatch_state": d["state"]}
@@ -1362,7 +1394,8 @@ def propose(cfg: Config, conn) -> dict:
                 queued += 1
             except StageError as e:
                 result["blocked"].append({"brief_id": bid, "blocker": str(e)})
-    # Conservative terminal cleanup: release terminal sent/reserved launches whose pane is proven idle.
+    # Conservative terminal cleanup: release terminal sent/reserved launches whose pane is observed idle and whose
+    # real supervising home has positive proof of no children/decisions.
     result["released_terminal"] = release_safe_terminal(cfg, conn)
     return result
 
