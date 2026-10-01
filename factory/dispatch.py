@@ -1073,11 +1073,15 @@ def resume(cfg: Config, conn, run_id: str) -> dict:
         if l is not None:  # sent/reserved -> uncertain: the durable restart marker (second resume refuses)
             conn.execute("UPDATE dispatch_launch SET state='uncertain', pane_id=?, owner_pid=? WHERE run_id=?",
                          (pane["pane_id"], os.getpid(), run_id))
-        else:  # legacy run bootstrap: no launch yet; claim the pane with the same guards
+            conn.execute("UPDATE dispatch SET executor_pane=?, last_actor='factory:resume' WHERE run_id=?",
+                         (pane["pane_id"], run_id))
+        else:
+            # Legacy run bootstrap (no launch yet): pin the replacement executor_pane first so the reserve-state
+            # pane match passes, then insert the launch in the same transaction (a failed insert rolls both back).
+            conn.execute("UPDATE dispatch SET executor_pane=?, last_actor='factory:resume' WHERE run_id=?",
+                         (pane["pane_id"], run_id))
             conn.execute("INSERT INTO dispatch_launch(run_id, pane_id, state, owner_pid, claimed_at) "
                          "VALUES (?,?,?,?,?)", (run_id, pane["pane_id"], "uncertain", os.getpid(), db.now()))
-        conn.execute("UPDATE dispatch SET executor_pane=?, last_actor='factory:resume' WHERE run_id=?",
-                     (pane["pane_id"], run_id))
     if pane.get("agent_status") not in ("idle", "done"):  # our own stuck executor, after the marker is durable
         _herdr("pane", "send-keys", pane["pane_id"], "esc")
         time.sleep(2)

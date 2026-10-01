@@ -614,5 +614,38 @@ class TerminalPaneRetention(unittest.TestCase):
         self.assertIsNotNone(scheduler.launch(self.c, "d1"))
 
 
+class LegacyResumeBootstrap(unittest.TestCase):
+    """A legacy executing run with no dispatch_launch must still restart onto a replacement pane: the executor_pane
+    is pinned in the same transaction before the legacy launch INSERT so the reserve-state pane match passes."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tmp = Path(tmp.name)
+        self.c = db.connect(tmp / "t.db")
+        self.addCleanup(self.c.close)
+        _helpers.seed_dispatch(self.c, "d1", "draft")
+        _helpers.set_claims(self.c, "d1", {"repo:a", "route:fx-a"})
+        # legacy executing run with NO launch, on a pane that has since disappeared
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' "
+                       "WHERE run_id='d1'")
+        self.c.execute("UPDATE dispatch SET state='executing', executor_pane='old-pane', executing_at=? WHERE run_id='d1'",
+                       (SNAP,))
+
+    def test_resume_legacy_bootstrap_moves_to_replacement_pane(self):
+        replacement = {"pane_id": "w6M:p1", "agent": "omp", "agent_status": "idle"}
+        with mock.patch.object(dispatch, "_target", return_value=(replacement, "factory-primary")), \
+                mock.patch.object(dispatch, "_send") as send:
+            res = dispatch.resume(SimpleNamespace(), self.c, "d1")
+        self.assertEqual(res["executor_pane"], "w6M:p1")
+        self.assertEqual(self.c.execute("SELECT executor_pane FROM dispatch WHERE run_id='d1'").fetchone()[0],
+                         "w6M:p1")
+        launch = scheduler.launch(self.c, "d1")
+        self.assertIsNotNone(launch)
+        self.assertEqual(launch["pane_id"], "w6M:p1")
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[1], ["/new", "run dispatch-intake d1"])
+
+
 if __name__ == "__main__":
     unittest.main()
