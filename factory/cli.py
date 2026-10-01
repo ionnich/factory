@@ -26,16 +26,6 @@ def ingest(cfg, conn, full=False, only: set[str] | None = None) -> dict:
     return res
 
 
-def _repos_of(cfg, conn, identifiers) -> set[str]:
-    """Repos the named tickets map to now (unknown ones are refused later, with the reason)."""
-    found = set()
-    for i in identifiers:
-        s = conn.execute("SELECT * FROM linear_latest WHERE identifier=?", (i,)).fetchone()
-        if s is not None and (ctx := prune.map_context(cfg, s)[0]):
-            found.add(ctx.repo)
-    return found
-
-
 def _json_body(src: str) -> dict:
     """A brief body as a JSON object: inline JSON, a file path, or - for stdin (the verdict_put pattern)."""
     src = src.strip()
@@ -57,14 +47,15 @@ def cmd_candidates(cfg, conn, a):
 
 
 def cmd_stage(cfg, conn, a):
-    if a.brief_id is not None:  # an approved brief staged directly: no Linear re-read, evidence is refreshed later
+    if a.brief_id is not None:
         if a.identifiers:
             raise dispatch.StageError("stage --brief takes one brief id, not ticket identifiers")
         out(dispatch.stage_brief(cfg, conn, a.brief_id, a.actor))
         return
     if not a.identifiers:
         raise dispatch.StageError("name at least one ticket, or --brief <id>")
-    ingest(cfg, conn, only=_repos_of(cfg, conn, a.identifiers))  # stage against Linear and trunk as they are now
+    # `dispatch.stage` resolves an approved, unconsumed brief matching these identifiers against the cached snapshot
+    # and the exact-version verification (brief_verdict); it never re-reads Linear narratives. No ingest here.
     out(dispatch.stage(cfg, conn, a.identifiers, a.actor))
 
 
@@ -697,10 +688,11 @@ def main(argv=None):
     sub.add_parser("prune-gate", help="Hermes pre-check for the prune job").set_defaults(fn=cmd_prune_gate)
     sub.add_parser("candidates", help="stageable tickets (JSON), and why the rest are not").set_defaults(
         fn=cmd_candidates)
-    s = sub.add_parser("stage", help="ingest, then draft a dispatch for review (nothing starts until approved)")
+    s = sub.add_parser("stage", help="draft a dispatch from an approved brief for review (nothing starts until "
+                       "approved)")
     s.add_argument("identifiers", nargs="*")
     s.add_argument("--brief", type=int, dest="brief_id", help="stage the approved brief with this id (no Linear "
-                   "re-read; evidence is refreshed at review)")
+                   "re-read; it uses the cached snapshot and its recorded verification)")
     s.add_argument("--actor", default="user")
     s.set_defaults(fn=cmd_stage)
     s = sub.add_parser("handoff", help="reset the executor's omp session (/new) and tell it to run the dispatch")

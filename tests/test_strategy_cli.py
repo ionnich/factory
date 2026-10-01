@@ -1,151 +1,21 @@
-"""Strategy CLI/API slice: the `factory strategy …` commands, `stage --brief`, `recover-launch`, and `verdict put
---brief` are thin wiring to `factory.strategy`, `factory.scheduler`, `dispatch.stage_brief` and `prune.put`. These
-tests inject fake `factory.strategy`/`factory.scheduler` modules so the handlers' lazy imports resolve, and assert the
-exact arguments each command passes through."""
-import contextlib
+"""Strategy CLI slice: the boundary behaviors the CLI enforces on its own — the brief-body JSON parsing boundary,
+and the explicit human confirmations/refusals before a write. Everything wired through to `factory.strategy`,
+`factory.scheduler`, `dispatch.stage`/`stage_brief`/`release_unsent` and `prune.put` is covered by the parent's
+integration tests, not re-asserted here."""
 import io
-import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest import mock
 
 from factory import cli, dispatch
 
-SCHED_STATUS = {"max_parallel": 2, "capacity_used": 0, "running": [], "launches": [], "holders": []}
-
-
-def run_cli(fn, cfg, conn, a):
-    """A command's JSON output."""
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        fn(cfg, conn, a)
-    return json.loads(buf.getvalue())
-
-
-def fake_strategy():
-    """The briefs-slice interface, recorded so each test can assert the exact call it was handed."""
-    mod = ModuleType("factory.strategy")
-    mod.overview = mock.Mock(return_value={"briefs": [], "tickets": []})
-    mod.get = mock.Mock(return_value={"id": 1, "state": "draft", "body": {"title": "t"}})
-    mod.render = mock.Mock(return_value="# 1\n")
-    mod.ready = mock.Mock(return_value=[])
-    mod.create = mock.Mock(return_value={"id": 1, "state": "draft"})
-    mod.groom = mock.Mock(return_value={"id": 1, "state": "draft"})
-    mod.revise = mock.Mock(return_value={"id": 2, "state": "draft"})
-    mod.approve = mock.Mock(return_value={"id": 1, "state": "approved"})
-    mod.hold = mock.Mock(return_value={"id": 1, "state": "held"})
-    mod.unhold = mock.Mock(return_value={"id": 1, "state": "approved"})
-    return mod
-
-
-def fake_scheduler():
-    mod = ModuleType("factory.scheduler")
-    mod.status = mock.Mock(return_value=dict(SCHED_STATUS))
-    return mod
-
-
-def _install(name, mod):
-    prev = sys.modules.get(name)
-    sys.modules[name] = mod
-    return prev
-
-
-def _restore(name, prev):
-    if prev is None:
-        sys.modules.pop(name, None)
-    else:
-        sys.modules[name] = prev
-
-
-@contextlib.contextmanager
-def strategy_module():
-    """Install the fake `factory.strategy` for the handler's lazy `from . import strategy`."""
-    mod = fake_strategy()
-    prev = _install("factory.strategy", mod)
-    try:
-        yield mod
-    finally:
-        _restore("factory.strategy", prev)
-
-
-@contextlib.contextmanager
-def scheduler_module():
-    """Install the fake `factory.scheduler` for the handler's lazy `from . import scheduler`."""
-    mod = fake_scheduler()
-    prev = _install("factory.scheduler", mod)
-    try:
-        yield mod
-    finally:
-        _restore("factory.scheduler", prev)
-
-
-def a(**kw):
-    return SimpleNamespace(**kw)
-
-
-class StrategyCommands(unittest.TestCase):
-    """Each `factory strategy …` command passes the exact interface arguments through to the briefs slice."""
-
-    def test_list_is_overview_plus_scheduler_status(self):
-        with strategy_module() as mod, scheduler_module() as sch:
-            out = run_cli(cli.cmd_strategy, "cfg", "conn", a(scmd="list"))
-        mod.overview.assert_called_once_with("cfg", "conn")
-        sch.status.assert_called_once_with("conn")
-        self.assertEqual(out["briefs"], [])
-        self.assertEqual(out["tickets"], [])
-        self.assertEqual(out["scheduler"], SCHED_STATUS)
-
-    def test_show_is_get_without_render(self):
-        with strategy_module() as mod:
-            out = run_cli(cli.cmd_strategy, "cfg", "conn", a(scmd="show", brief_id=9, render=False))
-        mod.get.assert_called_once_with("conn", 9)
-        mod.render.assert_not_called()
-        self.assertEqual(out["id"], 1)
-
-    def test_show_with_render_returns_brief_and_markdown(self):
-        with strategy_module() as mod:
-            out = run_cli(cli.cmd_strategy, "cfg", "conn", a(scmd="show", brief_id=9, render=True))
-        mod.get.assert_called_once_with("conn", 9)
-        mod.render.assert_called_once_with("conn", 9)
-        self.assertEqual(set(out), {"brief", "render"})
-
-    def test_groom_passes_identifiers_and_actor(self):
-        with strategy_module() as mod:
-            run_cli(cli.cmd_strategy, "cfg", "conn", a(scmd="groom", identifiers=["FIN-1", "FIN-2"], actor="user"))
-        mod.groom.assert_called_once_with("cfg", "conn", ["FIN-1", "FIN-2"], "user")
-
-    def test_create_without_body_is_deterministic(self):
-        with strategy_module() as mod:
-            run_cli(cli.cmd_strategy, "cfg", "conn", a(scmd="create", identifiers=["FIN-1"], body=None, actor="u"))
-        mod.create.assert_called_once_with("cfg", "conn", ["FIN-1"], "u", body=None)
-
-    def test_create_with_inline_body(self):
-        body = {"title": "Fix", "outcome": "done", "acceptance": ["a"], "scope": ["s"]}
-        with strategy_module() as mod:
-            run_cli(cli.cmd_strategy, "cfg", "conn", a(scmd="create", identifiers=["FIN-1"], body=json.dumps(body), actor="u"))
-        mod.create.assert_called_once_with("cfg", "conn", ["FIN-1"], "u", body=body)
-
-    def test_revise_passes_body_and_reason(self):
-        body = {"title": "Fix"}
-        with strategy_module() as mod:
-            run_cli(cli.cmd_strategy, "cfg", "conn", a(scmd="revise", brief_id=3, body=json.dumps(body),
-                                                        reason="re-scope", actor="u"))
-        mod.revise.assert_called_once_with("cfg", "conn", 3, body, "re-scope", "u")
-
-    def test_approve_hold_unhold(self):
-        with strategy_module() as mod:
-            run_cli(cli.cmd_strategy, "cfg", "conn", a(scmd="approve", brief_id=5, actor="u"))
-            run_cli(cli.cmd_strategy, "cfg", "conn", a(scmd="hold", brief_id=5, reason="wait", actor="u"))
-            run_cli(cli.cmd_strategy, "cfg", "conn", a(scmd="unhold", brief_id=5, actor="u"))
-        mod.approve.assert_called_once_with("cfg", "conn", 5, "u")
-        mod.hold.assert_called_once_with("cfg", "conn", 5, "wait", "u")
-        mod.unhold.assert_called_once_with("cfg", "conn", 5, "u")
-
 
 class JsonBody(unittest.TestCase):
+    """`_json_body` parses the exact brief-body forms the CLI accepts and rejects the rest."""
+
     def test_inline_object(self):
         self.assertEqual(cli._json_body('{"title": "x"}'), {"title": "x"})
 
@@ -168,60 +38,19 @@ class JsonBody(unittest.TestCase):
             cli._json_body("{not json")
 
 
-class StageBrief(unittest.TestCase):
-    def test_brief_skips_ingest_and_calls_stage_brief(self):
-        with mock.patch.object(dispatch, "stage_brief", create=True, return_value={"run_id": "b"}) as sb, \
-             mock.patch.object(cli, "ingest") as ing:
-            out = run_cli(cli.cmd_stage, "cfg", "conn", a(brief_id=7, identifiers=[], actor="u"))
-        sb.assert_called_once_with("cfg", "conn", 7, "u")
-        ing.assert_not_called()  # brief-backed stage never re-reads Linear
-        self.assertEqual(out, {"run_id": "b"})
-
-    def test_brief_rejects_ticket_identifiers(self):
+class StageBoundary(unittest.TestCase):
+    def test_brief_refuses_mixed_ticket_identifiers(self):
+        # an explicit brief id and ticket identifiers are mutually exclusive, refused before anything is written
         with self.assertRaises(dispatch.StageError):
-            cli.cmd_stage("cfg", "conn", a(brief_id=7, identifiers=["FIN-1"], actor="u"))
-
-    def test_legacy_stage_still_ingests_then_stages(self):
-        with mock.patch.object(cli, "_repos_of", return_value=set()), \
-             mock.patch.object(cli, "ingest") as ing, \
-             mock.patch.object(dispatch, "stage", return_value={"run_id": "r"}) as st:
-            out = run_cli(cli.cmd_stage, "cfg", "conn", a(brief_id=None, identifiers=["FIN-1"], actor="u"))
-        ing.assert_called_once_with("cfg", "conn", only=set())
-        st.assert_called_once_with("cfg", "conn", ["FIN-1"], "u")
-        self.assertEqual(out, {"run_id": "r"})
+            cli.cmd_stage("cfg", "conn", SimpleNamespace(brief_id=7, identifiers=["FIN-1"], actor="u"))
 
 
-class RecoverLaunch(unittest.TestCase):
-    def test_confirm_unsent_calls_release_unsent(self):
-        with mock.patch.object(dispatch, "release_unsent", create=True, return_value={"run_id": "r"}) as rel:
-            out = run_cli(cli.cmd_recover_launch, "cfg", "conn",
-                          a(run_id="r", confirm_unsent=True, reason="never left the queue", actor="u"))
-        rel.assert_called_once_with("cfg", "conn", "r", "u", "never left the queue")
-        self.assertEqual(out, {"run_id": "r"})
-
+class RecoverLaunchBoundary(unittest.TestCase):
     def test_missing_confirm_unsent_is_refused(self):
+        # a human must attest the send never landed; without --confirm-unsent the recovery is refused
         with self.assertRaises(dispatch.StageError):
-            cli.cmd_recover_launch("cfg", "conn", a(run_id="r", confirm_unsent=False, reason="x", actor="u"))
-
-
-class VerdictPutBrief(unittest.TestCase):
-    EVID = '[{"type": "linear", "ref": "FIN-1"}]'
-
-    def test_brief_id_is_passed_as_a_keyword(self):
-        with mock.patch.object(cli.prune, "put", return_value=9) as put:
-            out = run_cli(cli.cmd_verdict_put, "cfg", "conn",
-                          a(identifier="FIN-1", kind="valid", reason="r", evidence=self.EVID, target=None,
-                            actor="agent", brief_id=5))
-        put.assert_called_once_with("cfg", "conn", "FIN-1", "valid", "r", [{"type": "linear", "ref": "FIN-1"}],
-                                    target=None, actor="agent", brief_id=5)
-        self.assertEqual(out, {"verdict_id": 9})
-
-    def test_no_brief_id_omits_the_keyword(self):
-        with mock.patch.object(cli.prune, "put", return_value=9) as put:
-            cli.cmd_verdict_put("cfg", "conn", a(identifier="FIN-1", kind="valid", reason="r", evidence=self.EVID,
-                                                 target=None, actor="agent", brief_id=None))
-        put.assert_called_once_with("cfg", "conn", "FIN-1", "valid", "r", [{"type": "linear", "ref": "FIN-1"}],
-                                    target=None, actor="agent")
+            cli.cmd_recover_launch("cfg", "conn",
+                                   SimpleNamespace(run_id="r", confirm_unsent=False, reason="x", actor="u"))
 
 
 if __name__ == "__main__":
