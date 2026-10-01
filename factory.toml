@@ -56,6 +56,11 @@ foreign_backlogs = ["~/.local/share/firstmate/homes/*/data/backlog.md"]
 # herdr workspace of factory-primary; `watch` flags inactivity except while an executor answer is pending.
 workspace = "factory"
 stuck_hours = 6
+# Bounded execution: at most `queue_cap` nonexecuting (draft/staged) brief-backed dispatches are prepared at once,
+# independent of whatever is executing/reconciling. `max_parallel` is synced into the DB execution_policy singleton
+# (the authoritative bound); lowering it never kills work in flight, it only tightens future admission.
+queue_cap = 3
+max_parallel = 2
 
 # ---------------------------------------------------------------- repos
 # auto = `factory propose` (cron) may stage and hand off this repo's tickets without a human: repos where

@@ -123,10 +123,18 @@ def staleness(cfg: Config, conn, snapshot, ctx: Context | None) -> str | None:
 
 
 def gate(cfg: Config, conn) -> dict:
-    """Hermes pre-check over owned tickets: auto-verdict unmapped ones, list the rest for the agent."""
+    """Hermes pre-check over owned tickets: auto-verdict unmapped ones, list the rest for the agent. Approved brief
+    sources enter prune even when their Linear source is Backlog: approved local intent allows verification without
+    changing Linear state, and the agent verifies from the brief narrative, not by re-reading the source ticket."""
     batch = cfg.raw.get("prune", {}).get("batch", 2)
+    briefs = _brief_sources(cfg, conn)
     todo, auto = [], 0
     rows = sorted(owned_in_scope(cfg, conn), key=lambda s: s["updated_at"], reverse=True)
+    seen = {s["identifier"] for s in rows}
+    for s in conn.execute("SELECT * FROM linear_latest WHERE in_scope=0 ORDER BY updated_at DESC"):
+        if s["identifier"] in briefs and s["identifier"] not in seen and owned(cfg, conn, s):
+            rows.append(s)
+            seen.add(s["identifier"])
     rows.sort(key=lambda s: json.loads(s["raw_json"])["priority"] or 5)  # stable: priority, then newest
     for s in rows:
         ctx, why = map_context(cfg, s)
@@ -144,13 +152,30 @@ def gate(cfg: Config, conn) -> dict:
             raw = json.loads(s["raw_json"])
             v = conn.execute("SELECT evidence_paths_json FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
                              (s["issue_id"],)).fetchone()
+            brief = briefs.get(s["identifier"])
+            intent = brief["narrative"] if brief else (raw.get("description") or "")
             todo.append({"identifier": s["identifier"], "title": raw["title"],
                          "why": reason, "context": ctx.name, "repo": ctx.repo,
                          "mirror": str(cfg.mirror_path(ctx.repo)), "trunk_sha": trunk["sha"] if trunk else None,
                          "witnesses": ctx.witnesses, **_recheck(cfg, conn, s, ctx, reason, trunk),
+                         **({"brief_id": brief["brief_id"], "brief": brief["narrative"]} if brief else {}),
                          "learnings": learn.relevant(conn, {ctx.repo}, json.loads(v[0]) if v else (),
-                                                     f"{raw['title']}\n{raw.get('description') or ''}")})
+                                                     f"{raw['title']}\n{intent}")})
     return {"wakeAgent": bool(todo), "context": {"tickets": todo, "auto_needs_clarification": auto}}
+
+
+def _brief_sources(cfg: Config, conn) -> dict:
+    """identifier -> {"brief_id", "narrative"} for approved, unconsumed brief sources. The prune agent verifies from
+    the brief's compiled intent (self-contained Markdown), never by re-reading the source ticket's Linear prose."""
+    from . import strategy
+    out = {}
+    for b in conn.execute("SELECT id, sources_json FROM work_brief WHERE state='approved' AND "
+                          "NOT EXISTS (SELECT 1 FROM dispatch d WHERE d.brief_id = work_brief.id)"):
+        narrative = strategy.render(conn, b["id"])
+        for src in json.loads(b["sources_json"]):
+            if src.get("identifier"):
+                out[src["identifier"]] = {"brief_id": b["id"], "narrative": narrative}
+    return out
 
 
 RECHECK_DIFF_CHARS = 8000
