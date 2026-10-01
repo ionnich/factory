@@ -152,9 +152,21 @@ class Briefs(unittest.TestCase):
 
     def test_dependency_cycle_rejected(self):
         a = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body(dependencies=["FIN-2"]))
-        self.assertIsNotNone(a)
+        strategy.approve(self.cfg, self.c, a["id"], "user:dashboard")  # published, so it is in the effective graph
+        with self.assertRaises(StageError):  # B depends on A while A (published) depends on B
+            strategy.create(self.cfg, self.c, ["FIN-2"], "user:cli", _body(dependencies=["FIN-1"]))
+
+    def test_dependency_cycle_uses_current_published(self):
+        # A v1 depends on B; B depends on A -> real current cycle
+        a = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body(dependencies=["FIN-2"]))
+        strategy.approve(self.cfg, self.c, a["id"], "user:dashboard")
         with self.assertRaises(StageError):
             strategy.create(self.cfg, self.c, ["FIN-2"], "user:cli", _body(dependencies=["FIN-1"]))
+        # publish A v2 removing the dependency -> the historical A v1 no longer blocks
+        a2 = strategy.revise(self.cfg, self.c, a["id"], _body(dependencies=[]), "remove dep", "user:cli")
+        strategy.approve(self.cfg, self.c, a2["id"], "user:dashboard")
+        b = strategy.create(self.cfg, self.c, ["FIN-2"], "user:cli", _body(dependencies=["FIN-1"]))
+        self.assertEqual(b["state"], "draft")  # allowed: A v2 removed the historical dependency
 
     def test_render_and_ticket_context_use_compiled_intent(self):
         b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body(outcome="the outcome"))
