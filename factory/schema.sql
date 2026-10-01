@@ -28,6 +28,18 @@ CREATE TABLE linear_due (
   FOREIGN KEY (issue_id, snapshot_updated_at) REFERENCES linear_snapshot(issue_id, updated_at)
 );
 
+-- v23: explicit Linear relationship snapshots, one complete row per owned source. Absence of a
+-- row means the source's links are unknown (never fetched), not empty; a known-empty graph is a
+-- row with edges_json='[]'. Endpoints may live outside the cached/owned universe, so this is
+-- keyed by identifier (not issue_id) and carries no snapshot FK. Both payloads are JSON arrays.
+CREATE TABLE linear_relationship (
+  identifier   TEXT PRIMARY KEY,            -- source issue identifier (e.g. FIN-123)
+  observed_at  TEXT NOT NULL,
+  edges_json   TEXT NOT NULL CHECK (json_valid(edges_json) AND json_type(edges_json) = 'array'),
+  nodes_json   TEXT NOT NULL CHECK (json_valid(nodes_json) AND json_type(nodes_json) = 'array'),
+  fingerprint  TEXT NOT NULL CHECK (length(fingerprint) > 0)
+);
+
 CREATE VIEW linear_latest AS
 SELECT s.* FROM linear_snapshot s
 WHERE s.updated_at = (SELECT max(updated_at) FROM linear_snapshot m WHERE m.issue_id = s.issue_id);

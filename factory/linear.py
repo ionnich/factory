@@ -133,4 +133,11 @@ def ingest(cfg: Config, conn, full: bool = False) -> dict:
             "INSERT INTO sync_cursor VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
             "updated_at_gt=excluded.updated_at_gt, last_run_at=excluded.last_run_at, last_count=excluded.last_count",
             (CURSOR, max_updated or fetched_at, fetched_at, inserted))
-    return {"fetched": fetched, "inserted": inserted, "cursor": max_updated}
+    res = {"fetched": fetched, "inserted": inserted, "cursor": max_updated}
+    # Relationship snapshots refresh AFTER the source snapshot tx committed: a link mutation
+    # may not bump issue updatedAt, so refresh runs every ingest. A failure propagates and
+    # leaves the already-committed source snapshot in place; the next ingest retries regardless
+    # of updatedAt. Imported locally to keep linear/prune import edges one-way.
+    from . import relationships
+    res["relationships"] = relationships.refresh(cfg, conn)
+    return res
