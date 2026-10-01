@@ -14,9 +14,9 @@
 // the source browser is a collapsed <details> with a paged list, so hundreds of sources never bury the review.
 //
 // <StrategyTab data view onViewChange onDone onNavigate />: data is the overview (its identity changes on every
-//   refresh, which re-fetches /strategy). view {q, picked, open, stateFilter, ctxFilter, busy, err} is the parent's
+//   refresh, which re-fetches /strategy). view {q, picked, open, stateFilter, ctxFilter, assigneeFilter, busy, err} is the parent's
 //   (one, kept while unmounted): q = source search, picked = source identifiers selected for grooming,
-//   stateFilter/ctxFilter = the source list's state/context filters, open = the selected brief id, busy/err = the
+//   stateFilter/ctxFilter/assigneeFilter = the source list's state/context/assignee filters, open = the selected brief id, busy/err = the
 //   in-flight action and its error. busy and err are live state, not location: leaving Strategy and coming back
 //   keeps them; a late reply patches only this view. onViewChange is the parent's React-style setter;
 //   onDone(result, null, toast) after a write; onNavigate({stage, run?, brief?, sources?}) owns history and the pane.
@@ -173,7 +173,8 @@ function Preview({ md, err, busy }) {
 
 export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const q = view?.q || "", picked = view?.picked || [], open = view?.open || null;
-  const stateFilter = view?.stateFilter || "all", ctxFilter = view?.ctxFilter || "all";
+  const stateFilter = view?.stateFilter || "all", ctxFilter = view?.ctxFilter || "all",
+        assigneeFilter = view?.assigneeFilter || "all";
   const busy = view?.busy || null, err = view?.err || null;
   const update = (patch) => onViewChange((v) => ({ ...v, ...patch }));
 
@@ -340,17 +341,24 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     if (r) onDone(r, null, "Sources refreshed");
   };
 
-  // Sources: searchable, filterable by state/context, compact, multi-select, paged inside a collapsed <details>.
+  // Sources: searchable, filterable by state/context/assignee, compact, multi-select, paged inside a collapsed <details>.
   const needle = q.trim().toLowerCase();
   const states = useMemo(() => [...new Set(tickets.map((t) => t.state).filter(Boolean))].sort(), [tickets]);
   const contexts = useMemo(() => [...new Set(tickets.map((t) => t.context).filter(Boolean))].sort(), [tickets]);
+  // Distinct non-empty assignee emails from the full source list (never the filtered one), sorted for the dropdown.
+  const assignees = useMemo(() => [...new Set(tickets.map((t) => t.assignee).filter(Boolean))].sort(), [tickets]);
+  // "Assigned to me" = a non-null/non-empty assignee equal to the ticket's lead; "unassigned" = null or empty.
+  const assigneeMatch = (t) => assigneeFilter === "all" ||
+    (assigneeFilter === "me" ? t.assignee != null && t.lead != null && t.assignee === t.lead :
+     assigneeFilter === "unassigned" ? !t.assignee : t.assignee === assigneeFilter);
   const filtered = tickets.filter((t) =>
     (stateFilter === "all" || t.state === stateFilter) &&
-    (ctxFilter === "all" || t.context === ctxFilter));
+    (ctxFilter === "all" || t.context === ctxFilter) &&
+    assigneeMatch(t));
   const list = needle ? filtered.filter((t) => `${t.identifier} ${t.title || ""}`.toLowerCase().includes(needle)) : filtered;
   const [srcOpen, setSrcOpen] = useState(false);
   const [limit, setLimit] = useState(PAGE);
-  useEffect(() => { setLimit(PAGE); }, [needle, stateFilter, ctxFilter]);
+  useEffect(() => { setLimit(PAGE); }, [needle, stateFilter, ctxFilter, assigneeFilter]);
   const shown = list.slice(0, limit);
   const pick = (id) => update({ picked: picked.includes(id) ? picked.filter((i) => i !== id) : [...picked, id] });
 
@@ -531,6 +539,13 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
                 <option value="all">All contexts</option>
                 {contexts.map((c) => <option key={c} value={c}>{c}</option>)}
               </select>
+              <select className="fx-select" value={assigneeFilter} aria-label="Assignee filter"
+                      onChange={(e) => update({ assigneeFilter: e.target.value })}>
+                <option value="all">All assignees</option>
+                <option value="me">Assigned to me</option>
+                <option value="unassigned">Unassigned</option>
+                {assignees.map((a) => <option key={a} value={a}>{a}</option>)}
+              </select>
             </div>
             <div className="fx-row">
               <Button size="sm" disabled={!picked.length || !!busy} onClick={groom}>
@@ -543,7 +558,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
               {!all && !loadErr ? <div className="fx-hint">Loading…</div>
                 : shown.length ? shown.map((t) => (
                   <SourceRow key={t.identifier} s={t} checked={picked.includes(t.identifier)} onToggle={() => pick(t.identifier)} />
-                )) : <div className="fx-empty">{needle || stateFilter !== "all" || ctxFilter !== "all" ? "No source matches." : "No sources yet; refresh sources first."}</div>}
+                )) : <div className="fx-empty">{needle || stateFilter !== "all" || ctxFilter !== "all" || assigneeFilter !== "all" ? "No source matches." : "No sources yet; refresh sources first."}</div>}
             </div>
             {list.length > shown.length ? (
               <div className="fx-row">
