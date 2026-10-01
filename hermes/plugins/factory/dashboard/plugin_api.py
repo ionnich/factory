@@ -205,3 +205,110 @@ async def ask(decision_id: int, body: Ask):
 @router.get("/metrics")
 async def metrics(days: int = Query(28, ge=1, le=365)):
     return await factory("metrics", "--days", str(days))
+
+
+# ---- strategy: source grooming and approved, versioned work briefs -------------------------------------------
+# GET /strategy is a pure cached DB read (no model, no network). Grooming runs real DeepSeek through the CLI
+# (long), so its timeout is generous and the dashboard shows busy/error, never a fake placeholder. The actor is
+# always the logged-in user (user:dashboard); a click here is human approval of intent, never execution.
+class Identifiers(BaseModel):
+    identifiers: list[str] = Field(min_length=1, max_length=20)
+
+
+class StrategyCreate(BaseModel):
+    identifiers: list[str] = Field(min_length=1, max_length=20)
+    body: dict | None = None  # a deterministic draft from captured sources when absent
+
+
+class StrategyRevise(BaseModel):
+    body: dict
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class StrategyHold(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+def idents_ok(identifiers: list[str]) -> list[str]:
+    bad = [i for i in identifiers if not IDENT.match(i)]
+    if bad:
+        raise HTTPException(422, f"not a ticket identifier: {', '.join(bad)}")
+    return identifiers
+
+
+def brief_json(body: dict) -> str:
+    text = json.dumps(body, separators=(",", ":"))
+    if len(text) > 65536:
+        raise HTTPException(422, "brief body too large")
+    return text
+
+
+@router.get("/strategy")
+async def strategy_list():
+    return await factory("strategy", "list")
+
+
+@router.post("/strategy/refresh")
+async def strategy_refresh():
+    # source intake before strategy (allowed): the existing ingest, no model or network on the briefs themselves
+    return await factory("ingest", timeout=300)
+
+
+@router.post("/strategy/groom")
+async def strategy_groom(body: Identifiers):
+    return await factory("strategy", "groom", *idents_ok(body.identifiers), "--actor", "user:dashboard", timeout=600)
+
+
+@router.post("/strategy/create")
+async def strategy_create(body: StrategyCreate):
+    args = ["strategy", "create", *idents_ok(body.identifiers)]
+    if body.body is not None:
+        args.append(f"--body={brief_json(body.body)}")
+    return await factory(*args, "--actor", "user:dashboard")
+
+
+@router.get("/strategy/{brief_id}")
+async def strategy_show(brief_id: int):
+    return await factory("strategy", "show", str(brief_id), "--render")
+
+
+@router.post("/strategy/{brief_id}/revise")
+async def strategy_revise(brief_id: int, body: StrategyRevise):
+    return await factory("strategy", "revise", str(brief_id), f"--body={brief_json(body.body)}",
+                         f"--reason={text_ok(body.reason, 'reason')}", "--actor", "user:dashboard")
+
+
+@router.post("/strategy/{brief_id}/approve")
+async def strategy_approve(brief_id: int):
+    return await factory("strategy", "approve", str(brief_id), "--actor", "user:dashboard")
+
+
+@router.post("/strategy/{brief_id}/hold")
+async def strategy_hold(brief_id: int, body: StrategyHold):
+    return await factory("strategy", "hold", str(brief_id), f"--reason={text_ok(body.reason, 'reason')}",
+                         "--actor", "user:dashboard")
+
+
+@router.post("/strategy/{brief_id}/unhold")
+async def strategy_unhold(brief_id: int):
+    return await factory("strategy", "unhold", str(brief_id), "--actor", "user:dashboard")
+
+
+@router.post("/strategy/{brief_id}/stage")
+async def strategy_stage(brief_id: int):
+    return await factory("stage", "--brief", str(brief_id), "--actor", "user:dashboard", timeout=120)
+
+
+class ReleaseUnsent(BaseModel):
+    confirm_unsent: bool
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/dispatch/{run_id}/release-unsent")
+async def release_unsent(run_id: str, body: ReleaseUnsent):
+    # A human explicitly attests the send never landed; there is no automatic replay. `release_unsent` still verifies
+    # the stored pane is idle before releasing, and refuses executing/sent/busy/unknown launches.
+    if not body.confirm_unsent:
+        raise HTTPException(422, "confirm_unsent must be true (a human attests the send never landed)")
+    return await factory("recover-launch", run_id_ok(run_id), "--confirm-unsent",
+                         f"--reason={text_ok(body.reason, 'reason')}", "--actor", "user:dashboard")

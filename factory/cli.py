@@ -26,14 +26,16 @@ def ingest(cfg, conn, full=False, only: set[str] | None = None) -> dict:
     return res
 
 
-def _repos_of(cfg, conn, identifiers) -> set[str]:
-    """Repos the named tickets map to now (unknown ones are refused later, with the reason)."""
-    found = set()
-    for i in identifiers:
-        s = conn.execute("SELECT * FROM linear_latest WHERE identifier=?", (i,)).fetchone()
-        if s is not None and (ctx := prune.map_context(cfg, s)[0]):
-            found.add(ctx.repo)
-    return found
+def _json_body(src: str) -> dict:
+    """A brief body as a JSON object: inline JSON, a file path, or - for stdin (the verdict_put pattern)."""
+    src = src.strip()
+    try:
+        body = json.loads(src if src[:1] in "{[" else sys.stdin.read() if src == "-" else open(src).read())
+    except (json.JSONDecodeError, OSError) as e:
+        raise dispatch.StageError(f"body: {e}") from None
+    if not isinstance(body, dict):
+        raise dispatch.StageError("body must be a JSON object")
+    return body
 
 
 def cmd_ingest(cfg, conn, a):
@@ -45,7 +47,15 @@ def cmd_candidates(cfg, conn, a):
 
 
 def cmd_stage(cfg, conn, a):
-    ingest(cfg, conn, only=_repos_of(cfg, conn, a.identifiers))  # stage against Linear and trunk as they are now
+    if a.brief_id is not None:
+        if a.identifiers:
+            raise dispatch.StageError("stage --brief takes one brief id, not ticket identifiers")
+        out(dispatch.stage_brief(cfg, conn, a.brief_id, a.actor))
+        return
+    if not a.identifiers:
+        raise dispatch.StageError("name at least one ticket, or --brief <id>")
+    # `dispatch.stage` resolves an approved, unconsumed brief matching these identifiers against the cached snapshot
+    # and the exact-version verification (brief_verdict); it never re-reads Linear narratives. No ingest here.
     out(dispatch.stage(cfg, conn, a.identifiers, a.actor))
 
 
@@ -303,6 +313,7 @@ def cmd_overview(cfg, conn, a):
 
 
 def status(cfg, conn) -> dict:
+    from . import scheduler  # capacity, running, launch reservations and held claims (a pure DB read)
     q = lambda sql, *p: [dict(r) for r in conn.execute(sql, p)]
     fresh = {"fresh": 0, "stale": 0, "unverified": 0}
     owned = prune.owned_in_scope(cfg, conn)
@@ -336,6 +347,8 @@ def status(cfg, conn) -> dict:
                           "v.kind, v.target, v.written_back_run run_id FROM verdict v JOIN linear_latest l USING (issue_id) "
                           "WHERE v.written_back_run LIKE 'sweep-%' AND v.superseded_at IS NULL "
                           "ORDER BY v.written_back_run DESC LIMIT 10"),
+        # the execution scheduler's read: capacity in use, running dispatches, launch reservations, held claims
+        "scheduler": scheduler.status(conn),
     }
 
 
@@ -347,6 +360,8 @@ def dispatch_status(cfg, conn, run_id):
     body = base.read_bytes() if base.exists() else None
     rd = decide.open_review(conn, run_id)
     due = rd["due_at"] if rd else None
+    launch = conn.execute("SELECT pane_id, state, error, claimed_at, sent_at FROM dispatch_launch WHERE run_id=?",
+                          (run_id,)).fetchone()
     return {
         **dict(d),
         "auto": d["drafted_by"] == dispatch.PROPOSE,
@@ -364,6 +379,10 @@ def dispatch_status(cfg, conn, run_id):
         "executor_deliveries": decide.executor_deliveries(conn, run_id),
         # Run tab: last real activity, blocker and next step, from the database alone (no pane check)
         "runtime": dispatch.runtime(conn, d) if d["state"] in ("staged", "executing") else None,
+        # the launch reservation (reserved|sent|uncertain) and the resource claims this dispatch holds, from the DB
+        "launch": dict(launch) if launch else None,
+        "resources": [r[0] for r in conn.execute(
+            "SELECT resource FROM dispatch_resource WHERE run_id=? ORDER BY resource", (run_id,))],
         "writes": reconcile.show(conn, run_id)["writes"],  # what reconcile wrote (or holds) in Linear
         # what the executor reported per card: step progress ("FIN-1/2 done") and the done summary, for the outline
         "events": [dict(r) for r in conn.execute(
@@ -593,7 +612,10 @@ def cmd_verdict_put(cfg, conn, a):
         evidence = json.loads(src if src.startswith("[") else sys.stdin.read() if src == "-" else open(src).read())
     except (json.JSONDecodeError, OSError) as e:
         raise prune.VerdictError(f"evidence: {e}") from None
-    vid = prune.put(cfg, conn, a.identifier, a.kind, a.reason, evidence, target=a.target, actor=a.actor)
+    kwargs = {"target": a.target, "actor": a.actor}
+    if a.brief_id is not None:  # binds the verdict to an exact approved brief version (brief_verdict)
+        kwargs["brief_id"] = a.brief_id
+    vid = prune.put(cfg, conn, a.identifier, a.kind, a.reason, evidence, **kwargs)
     out({"verdict_id": vid})
 
 
@@ -601,6 +623,42 @@ def cmd_witness(cfg, conn, a):
     res = witness.run(cfg, conn, a.name, a.query)
     out(res)
     return 0 if res["ok"] else 1
+
+
+# ---- strategy: source grooming and approved, versioned work briefs -------------------------------------------
+# `factory.strategy` owns the invariants and raises `dispatch.StageError` for refusals; this CLI wires each command
+# to it. `show --render` returns the brief plus its compiled Markdown intent/provenance; `list` appends the
+# execution scheduler's read (capacity, running, launch reservations, held claims). Grooming runs real DeepSeek.
+def cmd_strategy(cfg, conn, a):
+    from . import strategy
+    if a.scmd == "list":
+        from . import scheduler
+        return out({**strategy.overview(cfg, conn), "scheduler": scheduler.status(conn)})
+    if a.scmd == "show":
+        brief = strategy.get(conn, a.brief_id)
+        return out({"brief": brief, "render": strategy.render(conn, a.brief_id)} if a.render else brief)
+    if a.scmd == "groom":
+        return out(strategy.groom(cfg, conn, a.identifiers, a.actor))
+    if a.scmd == "create":
+        return out(strategy.create(cfg, conn, a.identifiers, a.actor, body=_json_body(a.body) if a.body else None))
+    if a.scmd == "revise":
+        return out(strategy.revise(cfg, conn, a.brief_id, _json_body(a.body), a.reason, a.actor))
+    if a.scmd == "approve":
+        return out(strategy.approve(cfg, conn, a.brief_id, a.actor))
+    if a.scmd == "hold":
+        return out(strategy.hold(cfg, conn, a.brief_id, a.reason, a.actor))
+    if a.scmd == "unhold":
+        return out(strategy.unhold(cfg, conn, a.brief_id, a.actor))
+    raise SystemExit(f"unknown strategy command {a.scmd}")
+
+
+def cmd_recover_launch(cfg, conn, a):
+    """Explicit, human-confirmed recovery for a launch that may not have been sent. The `--confirm-unsent` flag is a
+    person attesting the send never landed (no automatic replay); `dispatch.release_unsent` still verifies the pane
+    is idle before releasing. An executing, sent, busy or unknown launch is refused."""
+    if not a.confirm_unsent:
+        raise dispatch.StageError("recover-launch needs --confirm-unsent (a human attesting the send never landed)")
+    out(dispatch.release_unsent(cfg, conn, a.run_id, a.actor, a.reason))
 
 
 def main(argv=None):
@@ -630,13 +688,22 @@ def main(argv=None):
     sub.add_parser("prune-gate", help="Hermes pre-check for the prune job").set_defaults(fn=cmd_prune_gate)
     sub.add_parser("candidates", help="stageable tickets (JSON), and why the rest are not").set_defaults(
         fn=cmd_candidates)
-    s = sub.add_parser("stage", help="ingest, then draft a dispatch for review (nothing starts until approved)")
-    s.add_argument("identifiers", nargs="+")
+    s = sub.add_parser("stage", help="draft a dispatch from an approved brief for review (nothing starts until "
+                       "approved)")
+    s.add_argument("identifiers", nargs="*")
+    s.add_argument("--brief", type=int, dest="brief_id", help="stage the approved brief with this id (no Linear "
+                   "re-read; it uses the cached snapshot and its recorded verification)")
     s.add_argument("--actor", default="user")
     s.set_defaults(fn=cmd_stage)
     s = sub.add_parser("handoff", help="reset the executor's omp session (/new) and tell it to run the dispatch")
     s.add_argument("run_id")
     s.set_defaults(fn=cmd_handoff)
+    s = sub.add_parser("recover-launch", help="explicit recovery: release a staged launch known to be unsent/uncertain")
+    s.add_argument("run_id")
+    s.add_argument("--confirm-unsent", action="store_true", help="a human attests the send never landed (no auto replay)")
+    s.add_argument("--reason", required=True, help="why the send is known unsent")
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_recover_launch)
     s = sub.add_parser("propose", help="cron: draft the top `auto` candidate, hand off approved dispatches, take ★ on "
                                         "decisions whose time came, and tell the user (push / digest)")
     s.add_argument("--announce", action="store_true", help="print only the messages for the user (cron delivery)")
@@ -746,6 +813,7 @@ def main(argv=None):
     s.add_argument("--target")
     s.add_argument("--reason", required=True)
     s.add_argument("--evidence", required=True, help="inline JSON list, a path to one, or - for stdin")
+    s.add_argument("--brief", type=int, dest="brief_id", help="bind the verdict to this exact approved brief version")
     s.add_argument("--actor", default="agent:factory-prune")
     s.set_defaults(fn=cmd_verdict_put)
     s = sub.add_parser("witness", help="read-only query against a configured witness (logged)")
@@ -757,6 +825,43 @@ def main(argv=None):
     s2 = s.add_parser("sync", help="re-judge open plan/ask/review decisions and proposed learnings' relations "
                                    "(propose ticks do both)")
     s2.set_defaults(fn=cmd_jev)
+    st = sub.add_parser("strategy", help="source grooming and approved, versioned work briefs (a supporting "
+                        "workspace, separate from the lifecycle stages)").add_subparsers(dest="scmd", required=True)
+    s = st.add_parser("list", help="brief summaries, the source list, policy and active dispatches (JSON; no model "
+                       "or network)")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("show", help="one brief: full body and captured sources")
+    s.add_argument("brief_id", type=int)
+    s.add_argument("--render", action="store_true", help="also return the compiled Markdown intent/provenance")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("groom", help="run DeepSeek over the named sources into an editable draft brief")
+    s.add_argument("identifiers", nargs="+")
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("create", help="draft a brief from the named sources (deterministic; optional body)")
+    s.add_argument("identifiers", nargs="+")
+    s.add_argument("--body", help="brief JSON object (inline, a file path, or - for stdin)")
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("revise", help="a new draft revision (immutable versions; an amendment needs its reason)")
+    s.add_argument("brief_id", type=int)
+    s.add_argument("--body", required=True, help="brief JSON object (inline, a file path, or - for stdin)")
+    s.add_argument("--reason", required=True)
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("approve", help="approve the draft as intent (not execution; verification may stay pending)")
+    s.add_argument("brief_id", type=int)
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("hold", help="hold an approved brief (explicit readiness change)")
+    s.add_argument("brief_id", type=int)
+    s.add_argument("--reason", required=True)
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("unhold", help="release a hold (explicit readiness change)")
+    s.add_argument("brief_id", type=int)
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
 
     a = p.parse_args(argv)
     try:

@@ -20,6 +20,7 @@ import { Learnings } from "./learn.jsx";
 import { Plan, Quick } from "./plan.jsx";
 import { Jev } from "./jev.jsx";
 import { TicketsTab } from "./tickets.jsx";
+import { StrategyTab } from "./strategy.jsx";
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect, useCallback, useRef, useMemo } = SDK.hooks;
@@ -393,7 +394,7 @@ const Writes = ({ writes }) => (writes.length ? <ul className="fx-writes">{write
 // ---- lifecycle: one workspace per stage, dispatches as rows in an engineering table -------------------------------
 const STAGES = [["tickets", "Tickets"], ["verify", "Verify"], ["draft", "Draft"], ["plan", "Plan"], ["review", "Review"],
                 ["run", "Run"], ["reconcile", "Reconcile"], ["archive", "Archive"]];
-const SIDE = [["learn", "Learn"], ["costs", "Costs"]];  // supporting views beside the stages, not stages
+const SIDE = [["strategy", "Strategy"], ["learn", "Learn"], ["costs", "Costs"]];  // supporting views beside the stages, not stages
 const LABEL = Object.fromEntries([...STAGES, ...SIDE]);
 const IDS = new Set(Object.keys(LABEL));
 const TICKET_MODES = ["tickets", "verify", "draft"];  // tickets.jsx workspaces, each with its view kept by the page
@@ -408,18 +409,19 @@ const HEAD = { draft: "not offered to a planner yet", plan: "waiting on a plan",
                run: "staged or executing", reconcile: "done or written back", archive: "archived, newest first" };
 
 // Where the page is, in the URL: ?stage=<view>, run=<run_id> (the selected dispatch), decision=<id> (what a link points
-// at), ticket=<ID> (its open sheet); the host's own parameters (profile) stay. Older links still land:
-// ?view=review&run=<run_id> is Review with that dispatch, ?ticket=<ID> alone Tickets with that sheet.
+// at), ticket=<ID> (its open sheet), brief=<id> (Strategy's open brief); the host's own parameters (profile) stay.
+// Older links still land: ?view=review&run=<run_id> is Review with that dispatch, ?ticket=<ID> alone Tickets with that sheet.
 function readLoc() {
   const p = new URLSearchParams(location.search);
   return { stage: IDS.has(p.get("stage")) ? p.get("stage") : p.get("view") === "review" ? "review" : "tickets",
-           run: p.get("run") || null, decision: Number(p.get("decision")) || null, ticket: p.get("ticket")?.toUpperCase() || null };
+           run: p.get("run") || null, decision: Number(p.get("decision")) || null,
+           ticket: p.get("ticket")?.toUpperCase() || null, brief: Number(p.get("brief")) || null };
 }
 function locUrl(l) {
   const u = new URL(location.href);
   u.searchParams.delete("view");
   u.searchParams.set("stage", l.stage);
-  ["run", "decision", "ticket"].forEach((k) => (l[k] ? u.searchParams.set(k, l[k]) : u.searchParams.delete(k)));
+  ["run", "decision", "ticket", "brief"].forEach((k) => (l[k] ? u.searchParams.set(k, l[k]) : u.searchParams.delete(k)));
   return u.href;
 }
 
@@ -488,6 +490,96 @@ function Runtime({ r }) {
       <dt>Next</dt>
       <dd>{r.next_step}</dd>
     </dl>
+  );
+}
+
+// Run, beside the selected dispatch: the pinned Strategy brief (when the run came from an approved brief), linking
+// back to Strategy, and its resource claims. Nothing here is inferred: the server records both.
+function BriefLink({ d, onGo }) {
+  const b = d.brief_id, resources = d.resources || [];
+  if (!b && !resources.length) return null;
+  return (
+    <div className="fx-stack-v fx-line">
+      {b ? <div className="fx-row"><span className="fx-hint">Pinned brief</span>
+        <button className="fx-link-btn" onClick={() => onGo({ stage: "strategy", brief: b }, { jump: true })}>#{b} ›</button></div> : null}
+      {resources.length ? <div className="fx-hint">Claims: {resources.join(", ")}</div> : null}
+    </div>
+  );
+}
+
+// Run: the launch reservation (reserved|sent|uncertain), visible so an uncertain send is never silently replayed. An
+// uncertain or reserved launch offers an explicit recovery — a human attests the send never landed and names why —
+// which releases it for a normal handoff.
+function LaunchRecovery({ d, onDone }) {
+  const l = d.launch;
+  const [reason, setReason] = useState("");
+  const [armed, setArmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  if (!l) return null;
+  const uncertain = l.state === "uncertain";
+  const releasable = l.state === "reserved" || l.state === "uncertain";
+  const go = async () => {
+    if (!armed) { setArmed(true); return; }
+    if (!reason.trim()) return;
+    setBusy(true); setErr(null);
+    try {
+      const r = await post(`/dispatch/${encodeURIComponent(d.run_id)}/release-unsent`,
+                           { confirm_unsent: true, reason: reason.trim() });
+      setBusy(false); setArmed(false); setReason("");
+      onDone(r, null, `Released ${d.run_id}'s ${l.state} launch`);
+    } catch (e) {
+      setBusy(false); setErr(errText(e));
+    }
+  };
+  return (
+    <div className={`fx-stack-v fx-line${uncertain ? " fx-sw" : ""}`}>
+      <div className="fx-row"><Tone tone={uncertain ? "red" : l.state === "sent" ? "blue" : "amber"}>launch {l.state}</Tone>
+        <span className="fx-hint">pane {l.pane_id || "—"}</span></div>
+      {uncertain ? <div className="fx-err">The send to pane {l.pane_id} is uncertain and is not auto-replayed.</div> : null}
+      {l.error ? <Fold className="fx-hint" head="Send error: " text={l.error} /> : null}
+      {releasable ? (armed ? (
+        <div className="fx-row">
+          <Input autoFocus value={reason} maxLength={2000} disabled={busy} placeholder="Reason: why is the send known unsent?"
+                 onChange={(e) => setReason(e.target.value)} />
+          <Button size="sm" disabled={busy || !reason.trim()} onClick={go}>{busy ? "Releasing…" : "Confirm release"}</Button>
+        </div>
+      ) : (
+        <div><Button size="sm" ghost onClick={go}>Release unsent launch</Button></div>
+      )) : null}
+      {err ? <ActErr err={err} /> : null}
+    </div>
+  );
+}
+
+// Run: the execution scheduler's read (capacity in use, launch reservations, held resource claims), straight from the
+// DB — capacity shows even at zero, reservations/uncertain launches honestly, and held claims are distinct from
+// running slots (they persist through done/reconcile until archive).
+function SchedulerStatus({ s, onGo }) {
+  if (!s) return null;
+  const launches = s.launches || [], holders = s.holders || [];
+  const cap = s.max_parallel ?? 2, used = s.capacity_used ?? 0;
+  const uncertain = launches.filter((l) => l.state === "uncertain");
+  return (
+    <details className="fx-sec fx-fold">
+      <summary>Scheduling <span className="fx-count">{used}/{cap}</span></summary>
+      <div className="fx-hint fx-line">parallel cap {cap} · {used} in use · {plural(launches.length, "launch reservation")}</div>
+      {uncertain.length ? (
+        <div className="fx-err fx-line">{plural(uncertain.length, "launch")} uncertain — open the run to confirm unsent and release it.</div>
+      ) : null}
+      {launches.length ? (
+        <div className="fx-hint fx-line">{launches.map((l) => (
+          <span key={l.run_id}>
+            <button className="fx-link-btn" onClick={() => onGo({ stage: "run", run: l.run_id })}>{l.run_id} ›</button>
+            {` ${l.state} (pane ${l.pane_id || "—"})`}
+            {" · "}
+          </span>
+        ))}</div>
+      ) : null}
+      {holders.length ? (
+        <div className="fx-hint fx-line">held claims (not running): {holders.map((h) => `${h.resource}@${h.run_id}:${h.state}`).join(", ")}</div>
+      ) : null}
+    </details>
   );
 }
 
@@ -703,6 +795,12 @@ function FactoryPage() {
   // one stable React-style setter per workspace (a next view or an updater): a late reply patches its own mode's view
   const setView = useMemo(() => Object.fromEntries(TICKET_MODES.map((m) => [m, (next) =>
     setViews((vs) => ({ ...vs, [m]: typeof next === "function" ? next(vs[m]) : next }))])), []);
+  // Strategy's own view, kept here so it outlives leaving the tab (a pending groom or its error included)
+  const [strat, setStrat] = useState(() => {
+    const l = readLoc();
+    return { q: "", picked: [], open: l.stage === "strategy" ? l.brief : null, busy: null, err: null };
+  });
+  const setStrategy = (next) => setStrat((s) => ({ ...s, ...(typeof next === "function" ? next(s) : next) }));
   const [arch, setArch] = useState({ rows: null, err: null });  // GET /archive, kept while elsewhere
   const root = useRef(null);
   const strip = useRef(null);
@@ -710,7 +808,7 @@ function FactoryPage() {
   const after = useRef({ focus: true });  // what the next navigation's render does: focus its target, restore a scroll
   const canon = useRef(false);
   const latest = useRef(null);            // this render's state, for handlers that run later (Back, a late reply)
-  latest.current = { loc, views, data, arch };
+  latest.current = { loc, views, data, arch, strat };
   const [, tick] = useState(0);
   const inflight = useRef(false);
   const again = useRef(false);
@@ -743,6 +841,7 @@ function FactoryPage() {
       mem.current[cur.stage] = { run: cur.run, scroll: root.current ? scroller(root.current).scrollTop : 0 };
       const l = readLoc();
       if (TICKET_MODES.includes(l.stage)) setViews((vs) => ({ ...vs, [l.stage]: { ...vs[l.stage], open: l.ticket } }));
+      if (l.stage === "strategy") setStrat((s) => ({ ...s, open: l.brief }));
       setLoc(l);
       setNav((n) => n + 1);
       after.current = { scroll: history.state?.fx?.scroll ?? mem.current[l.stage]?.scroll ?? 0 };
@@ -772,7 +871,8 @@ function FactoryPage() {
     after.current = null;
     if (a.focus && a.scroll != null) scroller(root.current).scrollTop = a.scroll;
     const el = a.focus && ((loc.decision && document.getElementById(`fx-d-${loc.decision}`))
-      || (loc.run && document.getElementById(`fx-run-${loc.run}`)));
+      || (loc.run && document.getElementById(`fx-run-${loc.run}`))
+      || (loc.brief && document.getElementById(`fx-brief-${loc.brief}`)));
     if (el) return void el.focus();
     if (a.scroll != null) return settle(root.current, a.scroll);
   }, [nav, !data]);
@@ -792,7 +892,7 @@ function FactoryPage() {
   // history is the user's to pick from).
   const go = (to, { jump = false } = {}) => {
     if (!IDS.has(to.stage)) return;  // a stage this page doesn't have: stay put
-    const { loc: cur, views: vs, data: dt, arch: ar } = latest.current;
+    const { loc: cur, views: vs, data: dt, arch: ar, strat: st } = latest.current;
     const y = root.current ? scroller(root.current).scrollTop : 0, same = to.stage === cur.stage;
     mem.current[cur.stage] = { run: cur.run, scroll: y };
     const first = to.stage !== "archive" && stageRows(dt, ar, to.stage)?.[0];
@@ -801,6 +901,7 @@ function FactoryPage() {
       run: to.run !== undefined ? to.run : same ? cur.run : mem.current[to.stage]?.run || first?.run_id || null,
       decision: to.decision || null,
       ticket: to.ticket !== undefined ? to.ticket?.toUpperCase() || null : vs[to.stage]?.open || null,
+      brief: to.stage === "strategy" ? (to.brief !== undefined ? to.brief || null : st.open || null) : null,
     };
     const url = locUrl(next);
     if (url !== location.href) {  // this entry keeps its scroll for Back; the router's own state rides along
@@ -808,6 +909,8 @@ function FactoryPage() {
       history.pushState({ ...history.state, fx: null }, "", url);
     }
     if (to.ticket !== undefined && vs[to.stage]) setView[to.stage]((v) => ({ ...v, open: next.ticket }));
+    if (to.brief !== undefined) setStrategy({ open: to.brief });
+    if (to.sources) setStrategy((s) => ({ ...s, picked: to.sources, q: "" }));  // a Draft handoff pre-selects sources
     setLoc(next);
     setNav((n) => n + 1);
     after.current = jump ? { focus: true, scroll: same ? null : 0 } : same ? null : { scroll: mem.current[to.stage]?.scroll || 0 };
@@ -886,7 +989,9 @@ function FactoryPage() {
     plan: () => <><JobLine jobs={data.jobs} name="[bot:planner] Plan drafts" of="draft" />{table("plan", planning)}</>,
     review: () => table("review", plan),
     run: () => <>{deckOf("run")}<ExecutorDeliveries items={deliveries} onDone={done} />
-      {table("run", (d) => <><Runtime r={d.runtime} />{plan(d)}</>)}</>,
+      <SchedulerStatus s={data.status.scheduler} onGo={go} />
+      {table("run", (d) => <><Runtime r={d.runtime} /><LaunchRecovery d={d} onDone={done} /><BriefLink d={d} onGo={go} />{plan(d)}</>)}</>,
+    strategy: () => <StrategyTab data={data} view={strat} onViewChange={setStrategy} onDone={done} onNavigate={go} />,
     reconcile: () => <><JobLine jobs={data.jobs} name="factory-reconcile" of="dispatch" />{deckOf("reconcile")}
       <Writebacks rows={data.writebacks || []} onGo={go} />{table("reconcile", plan)}</>,
     archive: () => (arch.rows ? <>
