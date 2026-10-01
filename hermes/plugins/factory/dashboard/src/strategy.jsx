@@ -10,17 +10,17 @@
 //   Publishing (approve) is intent only, distinct from staging (execution) — each its own action with a
 //   resource-review warning. Holding/unholding is an explicit readiness change.
 //
-// Layout: the brief list and the selected brief's editor come first (a deep link to a brief lands on it at once);
-// the source browser is a collapsed <details>: grouped-first by default (the backend's typed relationship groups as a
-// native collapsed outline), with a Flat list and a desktop Dependency DAG alternative, so hundreds of sources never
-// bury the review.
+// Layout: sources are the default landing surface, with grouped relationship-aware browsing first. The brief list is
+// opened intentionally, and a selected brief replaces browsing until the operator returns to sources. Grouped mode
+// uses the backend's typed relationship groups as a native collapsed outline, with Flat and desktop Dependency DAG
+// alternatives.
 //
 // <StrategyTab data view onViewChange onDone onNavigate />: data is the overview (its identity changes on every
 //   refresh, which re-fetches /strategy). view {q, picked, open, stateFilter, ctxFilter, assigneeFilter, sort,
-//   sourceMode, expandedGroups, srcOpen, limit, busy, err} is the parent's (one, kept while unmounted): q = source
-//   search, picked = source identifiers selected for grooming, stateFilter/ctxFilter/assigneeFilter = the source list's
-//   state/context/assignee filters, sort = its order (priority by default), sourceMode = groups|flat|dag,
-//   expandedGroups = open group ids, srcOpen = the browser is unfolded, limit = pagination, open = the selected brief
+//   sourceMode, expandedGroups, limit, busy, err} is the parent's (one, kept while unmounted): q = source search,
+//   picked = source identifiers selected for grooming, stateFilter/ctxFilter/assigneeFilter = source filters,
+//   sort = source order (priority by default), sourceMode = groups|flat|dag, expandedGroups = open group ids,
+//   briefsOpen = whether the operator intentionally opened the brief index, limit = pagination, open = selected brief
 //   id, busy/err = the in-flight action and its error. busy and err are live state, not location: leaving Strategy and
 //   coming back keeps them; a late reply patches only this view. onViewChange is the parent's React-style setter;
 //   onDone(result, null, toast) after a write; onNavigate({stage, run?, brief?, sources?}) owns history and the pane.
@@ -87,11 +87,11 @@ function sortSources(rows, sort) {
 // Group kind: the backend enum is exactly parent/dependency/related/project/context. An unknown kind keeps a truthful
 // fallback label (its raw kind), never an invented relationship. `type` is the single type/reason shown in a summary.
 const GROUP_KIND = {
-  parent: { type: "Parent family · parent/child links" },
-  dependency: { type: "Dependency chain · blocking links" },
-  related: { type: "Related candidate · one-hop related links" },
-  project: { type: "Project bucket (organizational)" },
-  context: { type: "Context bucket (organizational)" },
+  parent: { type: "Parent family", detail: "parent/child links" },
+  dependency: { type: "Dependency chain", detail: "blocking links" },
+  related: { type: "Related candidate", detail: "one-hop related links" },
+  project: { type: "Project bucket", detail: "organizational" },
+  context: { type: "Context bucket", detail: "organizational" },
 };
 const GROUP_KINDS = new Set(Object.keys(GROUP_KIND));
 function groupKind(g) {
@@ -304,7 +304,7 @@ function BriefRow({ b, selected, onSelect, onDispatch }) {
 
 function Field({ label, value, onChange, kind, disabled }) {
   return (
-    <label className="fx-field">
+    <label className="fx-field fx-brief-section">
       <span className="fx-k">{label}</span>
       {kind === "one"
         ? <Input value={value} maxLength={200} disabled={disabled} onChange={(e) => onChange(e.target.value)} />
@@ -340,32 +340,27 @@ function Preview({ md, err, busy }) {
   return <pre className="fx-pre">{md}</pre>;
 }
 
-// ---- grouped source browsing ----------------------------------------------------------------------------------
-// A group's one-line summary: actual title, a single type/reason, count (N matching / M in group when filtered),
-// highest priority, earliest real due date, readiness counts (not ready / linked prerequisite / dependency-blocked /
-// not checked / outdated), and cross-assignee / cross-repo labels. Context nodes are never counted as selectable work.
+// A closed group's summary stays scannable: title, relationship kind, matching size, nearest due date and the most
+// relevant truthful readiness state. The complete priority/readiness/ownership picture is shown after expansion.
 function GroupSummary({ d }) {
-  const meta = GROUP_KIND[d.kind] || { type: String(d.g.kind || "Group") };
+  const meta = GROUP_KIND[d.kind] || { type: String(d.g.kind || "Group"), detail: "unrecognized relationship kind" };
   const n = d.matchingMembers.length, m = d.memberTickets.length;
-  const [pLabel, pTone] = d.highestPriority;
+  const readiness = d.depBlocked ? `${d.depBlocked} dependency-blocked`
+    : d.notReady ? `${d.notReady} not ready`
+    : d.outdated ? `${d.outdated} outdated`
+    : d.notChecked ? `${d.notChecked} not checked`
+    : `${n} ready`;
   return (
     <div className="fx-group-summary">
       <div className="fx-group-head">
         <span className="fx-ttitle clamp">{d.g.title || d.g.id || "Untitled group"}</span>
       </div>
       <div className="fx-group-meta">
-        <span className="fx-k">{meta.type}</span>
-        <Tone tone={pTone}>{pLabel}</Tone>
-        {d.earliestDue ? <span className="fx-hint">due {d.earliestDue}</span> : null}
-        <span className="fx-count">{n !== m ? `${n} matching / ${m} in group` : m}</span>
-        {d.notReady ? <Tone tone="red">{d.notReady} not ready</Tone> : null}
-        {d.linkedPrereq ? <Tone tone="gray">{d.linkedPrereq} linked prerequisite</Tone> : null}
-        {d.depBlocked ? <Tone tone="amber">{d.depBlocked} dependency-blocked</Tone> : null}
-        {d.notChecked ? <Tone tone="gray">{d.notChecked} not checked</Tone> : null}
-        {d.outdated ? <Tone tone="gray">{d.outdated} outdated</Tone> : null}
-        {d.assigneeCount > 1 ? <span className="fx-hint">{d.assigneeCount} assignees</span> : null}
-        {d.repoCount > 1 ? <span className="fx-hint">{d.repoCount} repos</span> : null}
-        {d.g.continued ? <Tone tone="gray">continuation</Tone> : null}
+        <span>{meta.type}</span>
+        <span>{n !== m ? `${n} matching / ${m} members` : plural(m, "member")}</span>
+        <span>{readiness}</span>
+        {d.earliestDue ? <span>Due {d.earliestDue}</span> : null}
+        {d.g.continued ? <span>Continuation</span> : null}
       </div>
     </div>
   );
@@ -529,7 +524,7 @@ function DagGraph({ gid, blocks, nodeTitle, statusOf }) {
 function GroupCard({ d, open, sourceMode, pickedSet, onPick, onSelectMatching, onToggle, nodeInfo, reasonOf, statusOf }) {
   const cycle = d.cycleIds.size > 0 || d.hasBlockCycle;
   return (
-    <details className="fx-group" open={open}
+    <details className="fx-group" data-kind={d.g.kind} open={open}
              onToggle={(e) => { if (e.target !== e.currentTarget || e.target.open === open) return; onToggle(d.g.id, e.target.open); }}>
       <summary><GroupSummary d={d} /></summary>
       {open ? (
@@ -540,9 +535,27 @@ function GroupCard({ d, open, sourceMode, pickedSet, onPick, onSelectMatching, o
               edge list, not a DAG.
             </div>
           ) : null}
-          <div className="fx-k">{d.matchingMembers.length
-            ? `Sources · ${d.matchingMembers.length} matching / ${d.memberTickets.length} in group`
-            : `No matching source · ${d.memberTickets.length} in group`}</div>
+          <div className="fx-group-stats">
+            <span className="fx-k">{(GROUP_KIND[d.kind] || { detail: "unrecognized relationship kind" }).detail}</span>
+            <Tone tone={d.highestPriority[1]}>{d.highestPriority[0]}</Tone>
+            {d.notReady ? <Tone tone="red">{d.notReady} not ready</Tone> : null}
+            {d.linkedPrereq ? <Tone tone="gray">{d.linkedPrereq} linked prerequisite</Tone> : null}
+            {d.depBlocked ? <Tone tone="amber">{d.depBlocked} dependency-blocked</Tone> : null}
+            {d.notChecked ? <Tone tone="gray">{d.notChecked} not checked</Tone> : null}
+            {d.outdated ? <Tone tone="gray">{d.outdated} outdated</Tone> : null}
+            {d.assigneeCount > 1 ? <span className="fx-hint">{d.assigneeCount} assignees</span> : null}
+            {d.repoCount > 1 ? <span className="fx-hint">{d.repoCount} repos</span> : null}
+          </div>
+          <div className="fx-group-sources-head">
+            <span className="fx-k">{d.matchingMembers.length
+              ? `${d.matchingMembers.length} matching / ${d.memberTickets.length} in group`
+              : `No matching source · ${d.memberTickets.length} in group`}</span>
+            {d.matchingMembers.length ? (
+              <button className="fx-link-btn" onClick={() => onSelectMatching(d)}>
+                Select matching ({d.matchingMembers.length})
+              </button>
+            ) : null}
+          </div>
           {d.matchingMembers.length ? (
             <div className="fx-member-list">
               {d.kind === "parent"
@@ -555,11 +568,6 @@ function GroupCard({ d, open, sourceMode, pickedSet, onPick, onSelectMatching, o
                     <SourceRow key={t.identifier} s={t} cycle={d.cycleIds.has(t.identifier)}
                                checked={pickedSet.has(t.identifier)} onToggle={() => onPick(t.identifier)} />
                   ))}
-            </div>
-          ) : null}
-          {d.matchingMembers.length ? (
-            <div className="fx-row">
-              <button className="fx-link-btn" onClick={() => onSelectMatching(d)}>Select matching ({d.matchingMembers.length})</button>
             </div>
           ) : null}
           {sourceMode === "dag" ? (
@@ -812,7 +820,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const relationships = all?.relationships || null;  // {complete, observed_at, missing:[identifier]}
   const sourceMode = view?.sourceMode === "flat" ? "flat" : view?.sourceMode === "dag" ? "dag" : "groups";
   const expandedGroups = view?.expandedGroups || [];
-  const srcOpen = !!view?.srcOpen;
+  const briefsOpen = !!view?.briefsOpen;
   const limit = view?.limit || (sourceMode === "flat" ? PAGE_FLAT : PAGE_GROUPS);
 
   const needle = q.trim().toLowerCase();
@@ -937,6 +945,17 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
 
   const pageDefault = (mode) => (mode === "flat" ? PAGE_FLAT : PAGE_GROUPS);
   const changeFilter = (patch) => update({ ...patch, limit: pageDefault(patch.sourceMode ?? sourceMode) });
+  const activeFilters = [
+    needle ? `Search “${q.trim()}”` : null,
+    stateFilter !== "all" ? `State: ${stateFilter}` : null,
+    ctxFilter !== "all" ? `Context: ${ctxFilter}` : null,
+    assigneeFilter !== "all"
+      ? `Assignee: ${assigneeFilter === "me" ? "me" : assigneeFilter === "unassigned" ? "unassigned" : assigneeFilter}`
+      : null,
+  ].filter(Boolean);
+  const clearFilters = () => changeFilter({
+    q: "", stateFilter: "all", ctxFilter: "all", assigneeFilter: "all",
+  });
 
   const setExpanded = (id, open) => onViewChange((v) => {
     const cur = v.expandedGroups || [];
@@ -949,129 +968,249 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   });
 
   const openBrief = (id) => onNavigate({ stage: "strategy", brief: id });
+  const showSources = () => {
+    update({ briefsOpen: false });
+    if (open != null) onNavigate({ stage: "strategy", brief: null });
+  };
+  const showBriefs = () => {
+    update({ briefsOpen: true });
+    if (open != null) onNavigate({ stage: "strategy", brief: null });
+  };
   const openDispatch = (d) => onNavigate({ stage: d.phase || DISPATCH_STAGE[d.state] || "draft", run: d.run_id });
 
   return (
-    <div className="fx-stack-v">
-      <div className="fx-hint">Strategy grooms sources into approved work briefs (intent). Factory keeps verification,
-        planning and execution; publishing intent never starts work.</div>
+    <div className="fx-stack-v fx-strategy">
+      <header className="fx-strategy-heading">
+        <div>
+          <h2>Strategy</h2>
+          <div className="fx-hint">Groom sources into approved intent. Publishing never starts work.</div>
+        </div>
+        {briefsOpen && open == null
+          ? <Button size="sm" ghost onClick={showSources}>Back to sources</Button>
+          : <Button size="sm" ghost onClick={showBriefs}>View briefs <span className="fx-count">{briefs.length}</span></Button>}
+      </header>
 
       {loadErr ? <div className="fx-err" role="alert">{all ? `Refreshing strategy failed: ${loadErr}. Showing the last loaded.` : `Strategy did not load: ${loadErr}`}</div> : null}
       {busy ? <div className="fx-hint" role="status">{busy === "groom" ? "Grooming with DeepSeek (this takes a while)…" : "Working…"}</div> : null}
       {err ? <div className="fx-err" role="alert">{err}</div> : null}
 
-      {/* ---- briefs: compact list, then the selected detail (a deep link lands here at once) ---- */}
-      <div className="fx-k">{plural(briefs.length, "brief")}</div>
-      <div className="fx-list">
-        {briefs.length ? briefs.map((b) => (
-          <BriefRow key={b.id} b={b} selected={open === b.id}
-                    onSelect={() => openBrief(b.id)} onDispatch={openDispatch} />
-        )) : <div className="fx-empty">No briefs yet. Groom a source, or create one from the CLI.</div>}
-      </div>
-
-      {/* ---- selected brief: editable body, provenance, preview, actions ---- */}
-      {open != null && !current && !detailErr ? <div className="fx-hint">Loading brief #{open}…</div>
-        : detailErr ? <div className="fx-err" role="alert">Brief #{open} did not load: {detailErr}</div>
-        : current && edit ? (
-        <section className="fx-sec fx-stack-v" aria-label={`Brief #${current.id}`}>
-          <div className="fx-row between">
-            <div className="fx-row">
-              <span className="fx-id">#{current.id}</span><span className="fx-hint">revision {current.revision}</span>
-              <Tone tone={STATE_TONE[current.state] || "gray"}>{stateLabel(current)}</Tone>
-              {summary?.readiness === "superseded" ? <Tone tone="gray">superseded</Tone> : null}
-              {summary?.source_changed?.length ? <Tone tone="red">needs amendment</Tone> : null}
-            </div>
-            <div className="fx-hint">{current.created_by} · {ago(current.created_at)}
-              {current.approved_by ? ` · approved by ${current.approved_by} ${ago(current.approved_at)}` : ""}</div>
+      {open != null ? (
+        <>
+          <div className="fx-row">
+            <Button size="sm" ghost onClick={showSources}>← Back to sources</Button>
           </div>
-          {current.amendment_reason ? <div className="fx-why">Amended: {current.amendment_reason}</div> : null}
-          {current.hold_reason ? <div className="fx-why">Hold: {current.hold_reason}</div> : null}
-          {summary?.readiness === "superseded" ? (
-            <div className="fx-err">Superseded — a newer revision exists; a draft with a child cannot be published.</div>
-          ) : null}
-          {summary?.source_changed?.length ? (
-            <div className="fx-err">A source changed since this brief was captured: {summary.source_changed.join(", ")}. Amend to re-capture, or review the discrepancy before dispatching.</div>
-          ) : null}
-          {summary?.blockers?.length ? <div className="fx-err">Not ready: {summary.blockers.join("; ")}</div> : null}
-          {current.state === "approved" ? (
-            <div className="fx-why">Approved is intent only. Execution needs its own review and fresh verification; publishing does not start work.</div>
-          ) : null}
-
-          {FIELDS.map(([key, label, kind]) => (
-            <Field key={key} label={label} kind={kind} value={edit[key]} disabled={!!busy}
-                   onChange={(v) => editField(key, v)} />
-          ))}
-          {dirty ? (current.state === "draft"
-            ? <div className="fx-hint">Unsaved edits.</div>
-            : <div className="fx-err">Unsaved edits are not the approved intent — amend (with a reason) before staging.</div>
-          ) : null}
-
-          <div className="fx-k">Captured sources (server-captured, not model-edited)</div>
-          <Provenance sources={current.sources} />
-          {current.relationship_warnings?.length ? (
-            <div className="fx-err">Relationships: {current.relationship_warnings.join("; ")}</div>
-          ) : null}
-
-          <details className="fx-sec fx-fold">
-            <summary>Compiled preview (self-contained intent)</summary>
-            <Preview md={detail?.render} err={detailErr} busy={current != null && detail?.render == null && !detailErr} />
-          </details>
-
-          <div className="fx-stack-v">
-            {current.state === "draft" ? (
-              <>
+          {!current && !detailErr ? <div className="fx-hint">Loading brief #{open}…</div>
+            : detailErr ? <div className="fx-err" role="alert">Brief #{open} did not load: {detailErr}</div>
+            : current && edit ? (
+            <section className="fx-sec fx-stack-v fx-brief-section" aria-label={`Brief #${current.id}`}>
+              <div className="fx-row between">
                 <div className="fx-row">
-                  <Button size="sm" disabled={!!busy || !dirty} onClick={save}>{busy === "save" ? "Saving…" : "Save draft"}</Button>
-                  {summary?.readiness !== "superseded"
-                    ? <Button size="sm" disabled={!!busy} onClick={publish}>{busy === "publish" ? "Publishing…" : arm === "publish" ? "Confirm publish" : "Publish"}</Button>
-                    : null}
+                  <span className="fx-id">#{current.id}</span><span className="fx-hint">revision {current.revision}</span>
+                  <Tone tone={STATE_TONE[current.state] || "gray"}>{stateLabel(current)}</Tone>
+                  {summary?.readiness === "superseded" ? <Tone tone="gray">superseded</Tone> : null}
+                  {summary?.source_changed?.length ? <Tone tone="red">needs amendment</Tone> : null}
                 </div>
-                {arm === "publish" ? (
-                  <div className="fx-sw">
-                    <div className="fx-sw-q">Publish as approved intent?</div>
-                    <div className="fx-sw-detail">This approves the exact version above as the brief's intent. It does not
-                      start execution, override missing evidence, answer questions, or change Linear. Unreviewed resources
-                      default to <code>global:*</code> (serializes everything) until you review them.</div>
-                  </div>
-                ) : null}
-              </>
-            ) : null}
+                <div className="fx-hint">{current.created_by} · {ago(current.created_at)}
+                  {current.approved_by ? ` · approved by ${current.approved_by} ${ago(current.approved_at)}` : ""}</div>
+              </div>
+              {current.amendment_reason ? <div className="fx-why">Amended: {current.amendment_reason}</div> : null}
+              {current.hold_reason ? <div className="fx-why">Hold: {current.hold_reason}</div> : null}
+              {summary?.readiness === "superseded" ? (
+                <div className="fx-err">Superseded — a newer revision exists; a draft with a child cannot be published.</div>
+              ) : null}
+              {summary?.source_changed?.length ? (
+                <div className="fx-err">A source changed since this brief was captured: {summary.source_changed.join(", ")}. Amend to re-capture, or review the discrepancy before dispatching.</div>
+              ) : null}
+              {summary?.blockers?.length ? <div className="fx-err">Not ready: {summary.blockers.join("; ")}</div> : null}
+              {current.state === "approved" ? (
+                <div className="fx-why">Approved is intent only. Execution needs its own review and fresh verification; publishing does not start work.</div>
+              ) : null}
 
-            {current.state !== "draft" ? (
-              <>
-                <div className="fx-row">
-                  <Button size="sm" disabled={!!busy} onClick={amend}>{busy === "amend" ? "Amending…" : arm === "amend" ? "Confirm amendment" : "Amend"}</Button>
-                  {current.state === "held"
-                    ? <Button size="sm" disabled={!!busy} onClick={unhold}>{busy === "unhold" ? "…" : "Unhold"}</Button>
-                    : <Button size="sm" ghost disabled={!!busy} onClick={hold}>{busy === "hold" ? "…" : arm === "hold" ? "Confirm hold" : "Hold"}</Button>}
-                  {current.state === "approved"
-                    ? <Button size="sm" disabled={!!busy || dirty} onClick={stage}>{busy === "stage" ? "Staging…" : arm === "stage" ? "Confirm stage" : "Stage"}</Button>
-                    : null}
-                </div>
-                {(arm === "amend" || arm === "hold") ? (
-                  <div className="fx-row">
-                    <Input autoFocus value={reason} maxLength={2000} disabled={!!busy} placeholder="Reason (required)"
-                           onChange={(e) => setReason(e.target.value)} />
-                    <Button size="sm" disabled={!!busy || !reason.trim()} onClick={arm === "amend" ? amend : hold}>
-                      {arm === "amend" ? "Create amendment" : "Hold"}
-                    </Button>
-                  </div>
+              <div className="fx-brief-fields">
+                {FIELDS.map(([key, label, kind]) => (
+                  <Field key={key} label={label} kind={kind} value={edit[key]} disabled={!!busy}
+                         onChange={(v) => editField(key, v)} />
+                ))}
+              </div>
+              {dirty ? (current.state === "draft"
+                ? <div className="fx-hint">Unsaved edits.</div>
+                : <div className="fx-err">Unsaved edits are not the approved intent — amend (with a reason) before staging.</div>
+              ) : null}
+
+              <div className="fx-k">Captured sources (server-captured, not model-edited)</div>
+              <Provenance sources={current.sources} />
+              {current.relationship_warnings?.length ? (
+                <div className="fx-err">Relationships: {current.relationship_warnings.join("; ")}</div>
+              ) : null}
+
+              <details className="fx-sec fx-fold">
+                <summary>Compiled preview (self-contained intent)</summary>
+                <Preview md={detail?.render} err={detailErr} busy={current != null && detail?.render == null && !detailErr} />
+              </details>
+
+              <div className="fx-stack-v">
+                {current.state === "draft" ? (
+                  <>
+                    <div className="fx-row">
+                      <Button size="sm" disabled={!!busy || !dirty} onClick={save}>{busy === "save" ? "Saving…" : "Save draft"}</Button>
+                      {summary?.readiness !== "superseded"
+                        ? <Button size="sm" disabled={!!busy} onClick={publish}>{busy === "publish" ? "Publishing…" : arm === "publish" ? "Confirm publish" : "Publish"}</Button>
+                        : null}
+                    </div>
+                    {arm === "publish" ? (
+                      <div className="fx-sw">
+                        <div className="fx-sw-q">Publish as approved intent?</div>
+                        <div className="fx-sw-detail">This approves the exact version above as the brief's intent. It does not
+                          start execution, override missing evidence, answer questions, or change Linear. Unreviewed resources
+                          default to <code>global:*</code> (serializes everything) until you review them.</div>
+                      </div>
+                    ) : null}
+                  </>
                 ) : null}
-                {arm === "stage" ? (
-                  <div className="fx-sw">
-                    <div className="fx-sw-q">Stage this approved brief for execution?</div>
-                    <div className="fx-sw-detail">Staging pins this brief and hands it to the draft review flow; nothing
-                      runs until the review is approved. Verification may run first, and fresh code/data evidence is
-                      required.</div>
-                  </div>
+
+                {current.state !== "draft" ? (
+                  <>
+                    <div className="fx-row">
+                      <Button size="sm" disabled={!!busy} onClick={amend}>{busy === "amend" ? "Amending…" : arm === "amend" ? "Confirm amendment" : "Amend"}</Button>
+                      {current.state === "held"
+                        ? <Button size="sm" disabled={!!busy} onClick={unhold}>{busy === "unhold" ? "…" : "Unhold"}</Button>
+                        : <Button size="sm" ghost disabled={!!busy} onClick={hold}>{busy === "hold" ? "…" : arm === "hold" ? "Confirm hold" : "Hold"}</Button>}
+                      {current.state === "approved"
+                        ? <Button size="sm" disabled={!!busy || dirty} onClick={stage}>{busy === "stage" ? "Staging…" : arm === "stage" ? "Confirm stage" : "Stage"}</Button>
+                        : null}
+                    </div>
+                    {(arm === "amend" || arm === "hold") ? (
+                      <div className="fx-row">
+                        <Input autoFocus value={reason} maxLength={2000} disabled={!!busy} placeholder="Reason (required)"
+                               onChange={(e) => setReason(e.target.value)} />
+                        <Button size="sm" disabled={!!busy || !reason.trim()} onClick={arm === "amend" ? amend : hold}>
+                          {arm === "amend" ? "Create amendment" : "Hold"}
+                        </Button>
+                      </div>
+                    ) : null}
+                    {arm === "stage" ? (
+                      <div className="fx-sw">
+                        <div className="fx-sw-q">Stage this approved brief for execution?</div>
+                        <div className="fx-sw-detail">Staging pins this brief and hands it to the draft review flow; nothing
+                          runs until the review is approved. Verification may run first, and fresh code/data evidence is
+                          required.</div>
+                      </div>
+                    ) : null}
+                  </>
                 ) : null}
-              </>
-            ) : null}
+              </div>
+            </section>
+          ) : null}
+        </>
+      ) : briefsOpen ? (
+        <section className="fx-brief-section" aria-label="Work briefs">
+          <div className="fx-k">{plural(briefs.length, "brief")}</div>
+          <div className="fx-list">
+            {briefs.length ? briefs.map((b) => (
+              <BriefRow key={b.id} b={b} selected={false}
+                        onSelect={() => openBrief(b.id)} onDispatch={openDispatch} />
+            )) : <div className="fx-empty">No briefs yet. Groom a source, or create one from the CLI.</div>}
           </div>
         </section>
-      ) : null}
+      ) : (
+        <section className="fx-stack-v" aria-label="Sources">
+          <div className="fx-strategy-toolbar">
+            <Input className="fx-search" type="search" placeholder="Search source id or title" value={q}
+                   onChange={(e) => changeFilter({ q: e.target.value })} />
+            <details className="fx-filter-panel">
+              <summary>Filters{activeFilters.length ? ` (${activeFilters.length})` : ""}</summary>
+              <div className="fx-row fx-filters">
+                <select className="fx-select" value={stateFilter} aria-label="State filter"
+                        onChange={(e) => changeFilter({ stateFilter: e.target.value })}>
+                  <option value="all">All states</option>
+                  {states.map((s) => <option key={s} value={s}>{s}</option>)}
+                </select>
+                <select className="fx-select" value={ctxFilter} aria-label="Context filter"
+                        onChange={(e) => changeFilter({ ctxFilter: e.target.value })}>
+                  <option value="all">All contexts</option>
+                  {contexts.map((c) => <option key={c} value={c}>{c}</option>)}
+                </select>
+                <select className="fx-select" value={assigneeFilter} aria-label="Assignee filter"
+                        onChange={(e) => changeFilter({ assigneeFilter: e.target.value })}>
+                  <option value="all">All assignees</option>
+                  <option value="me">Assigned to me</option>
+                  <option value="unassigned">Unassigned</option>
+                  {assignees.map((a) => <option key={a} value={a}>{a}</option>)}
+                </select>
+              </div>
+            </details>
+            <label className="fx-row">
+              <span className="fx-k">Sort</span>
+              <select className="fx-select" value={sort} aria-label="Source sort"
+                      onChange={(e) => changeFilter({ sort: e.target.value })}>
+                <option value="priority">Priority</option>
+                <option value="due">Due soon</option>
+                <option value="oldest">Oldest created</option>
+                <option value="newest">Newest created</option>
+                <option value="updated">Recently updated</option>
+              </select>
+            </label>
+            <div className="fx-seg fx-mode" role="group" aria-label="Source view">
+              <button className={sourceMode === "groups" ? "on" : ""} aria-pressed={sourceMode === "groups"} title="Grouped outline" onClick={() => changeFilter({ sourceMode: "groups" })}>Groups</button>
+              <button className={sourceMode === "flat" ? "on" : ""} aria-pressed={sourceMode === "flat"} title="Flat list" onClick={() => changeFilter({ sourceMode: "flat" })}>Flat</button>
+              <button className={sourceMode === "dag" ? "on" : ""} aria-pressed={sourceMode === "dag"} title="Dependency DAG (desktop)" onClick={() => changeFilter({ sourceMode: "dag" })}>DAG</button>
+            </div>
+            <Button size="sm" ghost disabled={!!busy} onClick={refresh}>{busy === "refresh" ? "Refreshing…" : "Refresh"}</Button>
+          </div>
 
-      {/* ---- capacity and scheduling (real scheduler.status, shown even at zero use) ---- */}
+          {activeFilters.length ? (
+            <div className="fx-active-filters">
+              <span>{activeFilters.join(" · ")}</span>
+              <button className="fx-link-btn" aria-label="Clear source filters" onClick={clearFilters}>Clear</button>
+            </div>
+          ) : null}
+
+          <RelationshipStatus relationships={relationships} missingIds={missingIds} />
+          {picked.length ? (
+            <RelationshipReview picked={picked} memberGroupId={memberGroupId} groupById={groupById}
+                                missingIds={missingIds} relationships={relationships} nodeInfo={nodeInfo} reasonOf={reasonOf} />
+          ) : null}
+
+          <div className="fx-hint">
+            {sourceMode === "flat"
+              ? `Showing ${shownCount} of ${matching} matching · ${total} total`
+              : `Showing ${shownCount} of ${visibleGroups.length} groups · ${matching} matching sources · ${total} total`}
+          </div>
+          {sourceMode === "flat" ? (
+            <div className="fx-list">
+              {!all && !loadErr ? <div className="fx-hint">Loading…</div>
+                : shown.length ? shown.map((t) => (
+                  <SourceRow key={t.identifier} s={t} checked={pickedSet.has(t.identifier)} onToggle={() => pick(t.identifier)} />
+                )) : <div className="fx-empty">{filteredActive ? "No source matches." : "No sources yet; refresh sources first."}</div>}
+            </div>
+          ) : (
+            <div className="fx-groups">
+              {!all && !loadErr ? <div className="fx-hint">Loading…</div>
+                : shownGroups.length ? shownGroups.map((d) => (
+                  <GroupCard key={d.g.id} d={d} open={expandedGroups.includes(d.g.id)} sourceMode={sourceMode}
+                             pickedSet={pickedSet} onPick={pick} onSelectMatching={selectGroupMatching}
+                             onToggle={setExpanded} nodeInfo={nodeInfo} reasonOf={reasonOf} statusOf={statusOf} />
+                )) : <div className="fx-empty">{filteredActive ? "No group has a matching source." : "No groups yet; refresh sources first."}</div>}
+            </div>
+          )}
+          {moreCount > 0 ? (
+            <div className="fx-row">
+              <Button size="sm" ghost onClick={() => update({ limit: limit + pageDefault(sourceMode) })}>Show {moreCount} more</Button>
+            </div>
+          ) : null}
+
+          {picked.length ? (
+            <div className="fx-selection-bar" role="region" aria-label="Selected sources">
+              <span><strong>{plural(picked.length, "source")} selected</strong>{hiddenPicked ? ` · ${hiddenPicked} hidden` : ""}</span>
+              <Button size="sm" ghost onClick={() => update({ picked: [] })}>Clear</Button>
+              <Button size="sm" disabled={!!busy} onClick={groom}>
+                {busy === "groom" ? "Grooming…" : `Groom ${picked.length}`}
+              </Button>
+            </div>
+          ) : null}
+        </section>
+      )}
+
       {all ? (
         <details className="fx-sec fx-fold">
           <summary>Capacity & scheduling <span className="fx-count">{capUsed}/{capMax}</span></summary>
@@ -1109,91 +1248,6 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
           </> : null}
         </details>
       ) : null}
-
-      {/* ---- sources: collapsed, grouped-first browser (never buries the brief review above) ---- */}
-      <details className="fx-sec fx-fold" open={srcOpen}
-               onToggle={(e) => { if (e.target !== e.currentTarget || e.target.open === srcOpen) return; update({ srcOpen: e.target.open }); }}>
-        <summary>Sources <span className="fx-count">{filteredActive ? `${matching}/${total}` : total}</span>
-          {picked.length ? ` · ${picked.length} picked` : ""}{hiddenPicked ? ` · ${hiddenPicked} hidden` : ""}</summary>
-        {srcOpen ? (
-          <>
-            <Input className="fx-search" type="search" placeholder="Search source id or title" value={q}
-                   onChange={(e) => changeFilter({ q: e.target.value })} />
-            <div className="fx-seg fx-mode" role="group" aria-label="Source view">
-              <button className={sourceMode === "groups" ? "on" : ""} aria-pressed={sourceMode === "groups"} title="Grouped outline" onClick={() => changeFilter({ sourceMode: "groups" })}>Groups</button>
-              <button className={sourceMode === "flat" ? "on" : ""} aria-pressed={sourceMode === "flat"} title="Flat list" onClick={() => changeFilter({ sourceMode: "flat" })}>Flat</button>
-              <button className={sourceMode === "dag" ? "on" : ""} aria-pressed={sourceMode === "dag"} title="Dependency DAG (desktop)" onClick={() => changeFilter({ sourceMode: "dag" })}>DAG</button>
-            </div>
-            <div className="fx-row fx-filters">
-              <select className="fx-select" value={stateFilter} aria-label="State filter"
-                      onChange={(e) => changeFilter({ stateFilter: e.target.value })}>
-                <option value="all">All states</option>
-                {states.map((s) => <option key={s} value={s}>{s}</option>)}
-              </select>
-              <select className="fx-select" value={ctxFilter} aria-label="Context filter"
-                      onChange={(e) => changeFilter({ ctxFilter: e.target.value })}>
-                <option value="all">All contexts</option>
-                {contexts.map((c) => <option key={c} value={c}>{c}</option>)}
-              </select>
-              <select className="fx-select" value={assigneeFilter} aria-label="Assignee filter"
-                      onChange={(e) => changeFilter({ assigneeFilter: e.target.value })}>
-                <option value="all">All assignees</option>
-                <option value="me">Assigned to me</option>
-                <option value="unassigned">Unassigned</option>
-                {assignees.map((a) => <option key={a} value={a}>{a}</option>)}
-              </select>
-              <select className="fx-select" value={sort} aria-label="Source sort"
-                      onChange={(e) => changeFilter({ sort: e.target.value })}>
-                <option value="priority">Priority</option>
-                <option value="due">Due soon</option>
-                <option value="oldest">Oldest created</option>
-                <option value="newest">Newest created</option>
-                <option value="updated">Recently updated</option>
-              </select>
-            </div>
-            <RelationshipStatus relationships={relationships} missingIds={missingIds} />
-            {picked.length ? (
-              <RelationshipReview picked={picked} memberGroupId={memberGroupId} groupById={groupById}
-                                  missingIds={missingIds} relationships={relationships} nodeInfo={nodeInfo} reasonOf={reasonOf} />
-            ) : null}
-            <div className="fx-row">
-              <Button size="sm" disabled={!picked.length || !!busy} onClick={groom}>
-                {busy === "groom" ? "Grooming…" : `Groom ${picked.length} source${picked.length === 1 ? "" : "s"}`}
-              </Button>
-              <Button size="sm" ghost disabled={!!busy} onClick={refresh}>{busy === "refresh" ? "Refreshing…" : "Refresh sources"}</Button>
-              {picked.length ? <Button size="sm" ghost onClick={() => update({ picked: [] })}>Clear</Button> : null}
-            </div>
-            {hiddenPicked ? <div className="fx-hint">{hiddenPicked} picked hidden by current filters (kept)</div> : null}
-            <div className="fx-hint">
-              {sourceMode === "flat"
-                ? `Showing ${shownCount} of ${matching} matching · ${total} total`
-                : `Showing ${shownCount} of ${visibleGroups.length} groups · ${matching} matching sources · ${total} total`}
-            </div>
-            {sourceMode === "flat" ? (
-              <div className="fx-list">
-                {!all && !loadErr ? <div className="fx-hint">Loading…</div>
-                  : shown.length ? shown.map((t) => (
-                    <SourceRow key={t.identifier} s={t} checked={pickedSet.has(t.identifier)} onToggle={() => pick(t.identifier)} />
-                  )) : <div className="fx-empty">{filteredActive ? "No source matches." : "No sources yet; refresh sources first."}</div>}
-              </div>
-            ) : (
-              <div className="fx-groups">
-                {!all && !loadErr ? <div className="fx-hint">Loading…</div>
-                  : shownGroups.length ? shownGroups.map((d) => (
-                    <GroupCard key={d.g.id} d={d} open={expandedGroups.includes(d.g.id)} sourceMode={sourceMode}
-                               pickedSet={pickedSet} onPick={pick} onSelectMatching={selectGroupMatching}
-                               onToggle={setExpanded} nodeInfo={nodeInfo} reasonOf={reasonOf} statusOf={statusOf} />
-                  )) : <div className="fx-empty">{filteredActive ? "No group has a matching source." : "No groups yet; refresh sources first."}</div>}
-              </div>
-            )}
-            {moreCount > 0 ? (
-              <div className="fx-row">
-                <Button size="sm" ghost onClick={() => update({ limit: limit + pageDefault(sourceMode) })}>Show {moreCount} more</Button>
-              </div>
-            ) : null}
-          </>
-        ) : null}
-      </details>
     </div>
   );
 }
