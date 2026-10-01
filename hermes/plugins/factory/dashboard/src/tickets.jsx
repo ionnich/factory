@@ -88,13 +88,12 @@ function Row({ t, why, phase, pick, onOpen }) {
   return (
     <div className={`fx-trow${pick?.checked ? " picked" : ""}`} onClick={onOpen} role="button" tabIndex={0}
          onKeyDown={(e) => e.key === "Enter" && e.target === e.currentTarget && onOpen()}>
-      {pick ? <input type="checkbox" className="fx-pick" checked={pick.checked} disabled={pick.disabled} onClick={stop}
-                     onChange={pick.toggle} aria-label={`Select ${t.identifier}`} /> : null}
+      {pick ? <label className="fx-check-target" onClick={stop}><input type="checkbox" className="fx-pick" checked={pick.checked} disabled={pick.disabled} onChange={pick.toggle} aria-label={`Select ${t.identifier}`} /></label> : null}
       <div className="fx-grow">
-        <div className="fx-row"><span className="fx-id">{t.identifier}</span><span className="fx-hint">{t.linear_state}</span>
+        <div className="fx-row fx-row-meta"><span className="fx-id">{t.identifier}</span><span className="fx-hint">{t.linear_state}</span>
           <span className="fx-grow" /><span className="fx-hint">{ago(t.last_at)}</span></div>
-        <div className="fx-ttitle">{t.title}</div>
-        <div className="fx-row fx-tmeta">
+        <div className="fx-row-title fx-ttitle">{t.title}</div>
+        <div className="fx-row fx-row-status">
           {phase ? <Tone tone="blue">{phase}</Tone> : null}
           {v ? <Tone tone={VERDICT_TONE[v.kind] || "gray"}>{v.kind}</Tone> : null}
           {t.freshness && t.freshness !== "fresh" ? <Tone tone="amber">{t.freshness}</Tone> : null}

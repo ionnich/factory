@@ -10,7 +10,7 @@ const { React } = SDK;
 const { useMemo } = SDK.hooks;
 const h = React.createElement;
 const Fragment = React.Fragment;
-const ROW = 34;
+const ROW = 44;
 
 // The nodes on a pick's path.
 export const pathOf = (qs, pick) => new Set(["now", "result",

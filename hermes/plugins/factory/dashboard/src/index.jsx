@@ -296,8 +296,8 @@ function ExecutorDelivery({ item, onDone }) {
   const sending = action.busy || item.state === "sending";
   return (
     <div className="fx-stack-v" id={`fx-d-${item.decision_id}`} tabIndex={-1}>
-      <div className="fx-row"><Tone tone="amber">{sending ? "Sending to executor" : "Executor answer not delivered"}</Tone><span className="fx-id">{item.run_id} · #{item.decision_id}</span></div>
-      <div>{item.question}</div>
+      <div className="fx-row fx-row-status"><Tone tone="amber">{sending ? "Sending to executor" : "Executor answer not delivered"}</Tone><span className="fx-id">{item.run_id} · #{item.decision_id}</span></div>
+      <div className="fx-row-title">{item.question}</div>
       <div>Recorded answer: <b>{item.answer}</b>. This answer will not be changed.</div>
       <ActErr err={item.error} />
       <ActErr err={action.err} />

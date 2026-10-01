@@ -133,22 +133,28 @@ function SourceRow({ s, checked, onToggle }) {
   const [pLabel, pTone] = priorityOf(s.priority);
   return (
     <div className="fx-trow">
-      <input type="checkbox" className="fx-pick" checked={checked} onChange={onToggle}
-             aria-label={`Select ${s.identifier}`} />
       <div className="fx-grow">
-        <div className="fx-row fx-tmeta">
-          <Ext href={s.url}>{s.identifier}</Ext>
-          <Tone tone={pTone}>{pLabel}</Tone>
-          {s.state ? <Tone tone="gray">{s.state}</Tone> : null}
-          {s.repo ? <Tone tone="blue">{s.repo}</Tone> : null}
-          {s.assignee ? <span className="fx-hint">{s.assignee}</span> : null}
+        <div className="fx-row fx-row-title">
+          <div className="fx-ttitle clamp">{s.title}</div>
+          <span className="fx-row fx-row-status">
+            <Tone tone={pTone}>{pLabel}</Tone>
+            {s.state ? <Tone tone="gray">{s.state}</Tone> : null}
+          </span>
         </div>
-        <div className="fx-ttitle clamp">{s.title}</div>
-        {s.reason ? <div className="fx-hint">{s.reason}</div> : null}
+        <div className="fx-row">
+          <label className="fx-check-target">
+            <input type="checkbox" className="fx-pick" checked={checked} onChange={onToggle}
+                   aria-label={`Select ${s.identifier}`} />
+          </label>
+          {s.reason ? <span className="fx-hint">{s.reason}</span> : null}
+        </div>
         {!s.verdict ? <div className="fx-hint">Not checked</div>
           : s.stale ? <div className="fx-hint">Check outdated · {s.stale} · prior verdict {s.verdict}</div>
           : <div className="fx-hint">verdict {s.verdict}{s.verdict_at ? ` · checked ${ago(s.verdict_at)}` : ""}</div>}
-        <div className="fx-row fx-tmeta">
+        <div className="fx-row fx-row-meta">
+          <Ext href={s.url}>{s.identifier}</Ext>
+          {s.repo ? <span className="fx-hint">{s.repo}</span> : null}
+          {s.assignee ? <span className="fx-hint">{s.assignee}</span> : null}
           {s.created_at ? <span className="fx-hint" title={exactTime(s.created_at)}>Created {ago(s.created_at)}</span>
                         : <span className="fx-hint">Created unknown</span>}
           {s.updated_at ? <span className="fx-hint" title={exactTime(s.updated_at)}>Updated {ago(s.updated_at)}</span>
@@ -169,14 +175,14 @@ function BriefRow({ b, selected, onSelect, onDispatch }) {
          aria-current={selected ? "true" : undefined} onClick={onSelect}
          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { stop(e); onSelect(); } }}>
       <div className="fx-grow">
-        <div className="fx-row fx-tmeta">
+        <div className="fx-row fx-row-status">
           <Tone tone={STATE_TONE[b.state] || "gray"}>{stateLabel(b)}</Tone>
           {superseded ? <Tone tone="gray">superseded</Tone> : null}
           {b.source_changed?.length ? <Tone tone="red">needs amendment</Tone> : null}
           {blockers.length ? <Tone tone="amber">{plural(blockers.length, "blocker")}</Tone> : null}
         </div>
-        <div className="fx-ttitle clamp">{b.title || `Brief #${b.id}`}</div>
-        <div className="fx-hint">#{b.id} · revision {b.revision}{b.created_by ? ` · ${b.created_by}` : ""}
+        <div className="fx-row-title fx-ttitle clamp">{b.title || `Brief #${b.id}`}</div>
+        <div className="fx-row-meta fx-hint">#{b.id} · revision {b.revision}{b.created_by ? ` · ${b.created_by}` : ""}
           {b.created_at ? ` · ${ago(b.created_at)}` : ""}
           {b.sources?.length ? ` · ${plural(b.sources.length, "source")}` : ""}</div>
         {blockers.length ? <div className="fx-hint">{clip(blockers.join("; "), 120)}</div> : null}
