@@ -100,7 +100,8 @@ class Ingest(unittest.TestCase):
             linear.ingest(self.cfg(), c)
         # raw_json stays byte-for-byte (no dueDate key added); the due sidecar carries the real fetched due
         self.assertEqual(c.execute("SELECT raw_json FROM linear_snapshot WHERE issue_id='i1'").fetchone()[0], raw)
-        self.assertEqual(c.execute("SELECT due_date FROM linear_due WHERE issue_id='i1' AND snapshot_updated_at=?").fetchone()["due_date"], "2026-10-15")
+        self.assertEqual(c.execute("SELECT due_date FROM linear_due WHERE issue_id='i1' AND snapshot_updated_at=?",
+                                   (self.T0,)).fetchone()["due_date"], "2026-10-15")
 
     def test_due_sidecar_ingest_is_idempotent(self):
         c = db.connect(Path(tempfile.mkdtemp()) / "t.db")

@@ -413,12 +413,14 @@ class Briefs(unittest.TestCase):
                        (SNAP,))
         raw = json.loads(_raw(ident="FIN-4"))
         raw["description"] = "Domain: Other Domain\n"
+        # the verdict's pinned snapshot version must exist (FK), then the ticket changes to a newer version
         self.c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,'unstarted',1,?)",
-                       ("fin-4", "FIN-4", "2026-09-02T00:00:00Z", "2026-09-02T00:00:00Z", json.dumps(raw)))
-        # a verdict captured at the older snapshot; the ticket has since changed -> stale
+                       ("fin-4", "FIN-4", SNAP, SNAP, json.dumps(raw)))
         self.c.execute("INSERT INTO verdict(issue_id,snapshot_updated_at,context,repo,kind,reason,evidence_json,"
                        "created_at,created_by) VALUES ('fin-4',?,NULL,'Finks-ai/finks-ddd','valid','r','[\"e\"]',?,"
                        "'t')", (SNAP, SNAP))
+        self.c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,'unstarted',1,?)",
+                       ("fin-4", "FIN-4", "2026-09-02T00:00:00Z", "2026-09-02T00:00:00Z", json.dumps(raw)))
         fin4 = next(t for t in strategy.overview(self.cfg, self.c)["tickets"] if t["identifier"] == "FIN-4")
         self.assertIsNone(fin4["context"])                  # unmapped: no context for "Other Domain"
         self.assertEqual(fin4["verdict"], "valid")
