@@ -37,9 +37,14 @@ const localTime = (iso) => new Date(iso).toLocaleString([], { hour: "2-digit", m
 const exactTime = (iso) => new Date(iso).toLocaleString([], { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const stop = (e) => e.stopPropagation();
 // A source's calendar due date is exactly YYYY-MM-DD (never a timestamp), so it compares lexically and never shifts a
-// day across a timezone parse. Only a real, well-formed value is a due date.
+// day across a timezone parse. Only a real, valid calendar date (e.g. not 2026-02-30) counts; the original string is
+// kept for display and sorting, never a locally-parsed date.
 const DUE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const isDue = (d) => typeof d === "string" && DUE_RE.test(d);
+const isDue = (d) => {
+  if (typeof d !== "string" || !DUE_RE.test(d)) return false;
+  const dt = new Date(`${d}T00:00:00Z`);  // UTC parse: no local-time shift; the roundtrip rejects impossible days
+  return !Number.isNaN(dt.getTime()) && dt.toISOString().slice(0, 10) === d;
+};
 // A real timestamp (epoch number or parseable ISO string), else null: missing/invalid dates sort last in BOTH
 // directions and are never guessed from fetched/updated.
 const ts = (v) => {
@@ -53,9 +58,9 @@ const priorityOf = (p) => PRIORITY[p] || ["No priority", "gray"];
 const PRIORITY_RANK = { 1: 1, 2: 2, 3: 3, 4: 4 };
 const pRank = (p) => PRIORITY_RANK[p] ?? 5;
 const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
-// Null keys are missing/invalid dates and go last in both directions (ascending or descending).
+// Null keys are missing/invalid dates and go last in both directions; real keys then compare ascending or descending.
 const byAsc = (a, b) => (a == null && b == null ? 0 : a == null ? 1 : b == null ? -1 : cmp(a, b));
-const byDesc = (a, b) => byAsc(b, a);
+const byDesc = (a, b) => (a == null && b == null ? 0 : a == null ? 1 : b == null ? -1 : cmp(b, a));
 // Stable, deterministic sort over an already-filtered copy. Filter first, sort second, paginate third.
 function sortSources(rows, sort) {
   const key = (t) => ({
