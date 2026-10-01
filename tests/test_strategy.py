@@ -361,6 +361,32 @@ class Briefs(unittest.TestCase):
         self.c.execute("UPDATE dispatch_launch SET state='uncertain' WHERE run_id='d1'")  # sent -> uncertain restart
         self.c.execute("UPDATE dispatch_launch SET state='sent', sent_at=? WHERE run_id='d1'", (SNAP,))  # success
 
+    def test_backlog_source_visible_and_groomable_but_not_execution_ready(self):
+        # an OWNED raw Backlog ticket (in_scope=0), foreign-assigned — must still be a visible source
+        self.c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,'backlog',0,?)",
+                       ("fin-3", "FIN-3", SNAP, SNAP,
+                        _raw(ident="FIN-3", state="Backlog", assignee={"email": "niko@example.com"})))
+        tickets = strategy.overview(self.cfg, self.c)["tickets"]
+        fin3 = next(t for t in tickets if t["identifier"] == "FIN-3")
+        self.assertEqual(fin3["state_type"], "backlog")
+        self.assertEqual(fin3["reason"], "assigned to someone else")  # truthful blocker, not silently hidden
+        # a foreign-domain (not owned) ticket is never a source (scope safeguard)
+        self.c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,'backlog',0,?)",
+                       ("fin-9", "FIN-9", SNAP, SNAP,
+                        json.dumps({"title": "t9", "url": "https://linear/FIN-9", "identifier": "FIN-9",
+                                    "description": "Domain: Other Domain\n", "state": {"name": "Backlog"},
+                                    "assignee": None, "priority": 3, "labels": {"nodes": []},
+                                    "team": {"key": "TEAM"}})))
+        self.assertNotIn("FIN-9", {t["identifier"] for t in strategy.overview(self.cfg, self.c)["tickets"]})
+        # the Backlog source is groomable into an unapproved draft (approve is still human-only + validation)...
+        b = strategy.create(self.cfg, self.c, ["FIN-3"], "user:cli", _body())
+        self.assertEqual(b["state"], "draft")
+        strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")
+        # ...but is NOT execution-eligible: the foreign-assignee safeguard still blocks readiness
+        (row,) = strategy.ready(self.cfg, self.c)
+        self.assertFalse(row["ready"])
+        self.assertTrue(any("assigned to" in blk for blk in row["blockers"]))
+
 
 if __name__ == "__main__":
     unittest.main()

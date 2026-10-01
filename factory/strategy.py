@@ -690,33 +690,41 @@ def _stale_db(conn, s, ctx) -> str | None:
 
 
 def _ticket_list(cfg: Config, conn) -> list[dict]:
-    """The Strategy source list (owned in-scope tickets incl. Backlog), with state/readiness reasons. Pure DB read."""
+    """The Strategy source list: every cached OWNED source (any Linear state — Backlog, active, QA, live, completed)
+    with truthful readiness blockers. Selection is by canonical domain ownership (prune.owned), never the `in_scope`
+    flag, which excludes raw Backlog until it is already active (circular for grooming). Pure DB read; no network."""
     lead = cfg.linear["lead"]
-    try:
-        scope = prune.owned_in_scope(cfg, conn)
-    except prune.NotOwned:
-        return []
+    if not conn.execute("SELECT 1 FROM linear_project LIMIT 1").fetchone():
+        return []  # no canonical Domain projects yet: nothing to list
+    review = {k: t.get("review_state") for k, t in cfg.linear.get("team", {}).items()}
     live = {r[0] for r in conn.execute(
         "SELECT t.issue_id FROM dispatch_ticket t JOIN dispatch d USING (run_id) WHERE d.state <> 'archived'")}
     out = []
-    for s in scope:
+    for s in conn.execute("SELECT * FROM linear_latest ORDER BY updated_at"):
         raw = json.loads(s["raw_json"])
+        if raw.get("archivedAt") is not None:
+            continue  # archived tickets are not a source
+        if not prune.owned(cfg, conn, s):
+            continue  # canonical domain safeguard: only the lead's Domain projects are listed
         ident = raw["identifier"]
         ctx, _ = prune.map_context(cfg, s)
         v = conn.execute("SELECT * FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
                          (s["issue_id"],)).fetchone()
         assignee = (raw["assignee"] or {}).get("email")
         owner = ctx.owner(prune.issue_fields(s)[0]) if ctx else None
-        reason = ("unmapped" if ctx is None
+        state_name = raw["state"]["name"]
+        reason = ("completed" if s["state_type"] == "completed"
+                  else "in QA review" if state_name == review.get(raw["team"]["key"])
+                  else "in a live dispatch" if s["issue_id"] in live
+                  else "unmapped" if ctx is None
                   else "no factory-fleet owner (route)" if owner is None
+                  else "assigned to someone else" if assignee not in (None, lead)
                   else "no verdict" if v is None
                   else f"verdict {v['kind']}" if v["kind"] != "valid"
                   else f"verdict stale ({r})" if (r := _stale_db(conn, s, ctx))
-                  else "in a live dispatch" if s["issue_id"] in live
-                  else "assigned to someone else" if assignee not in (None, lead)
                   else None)
         out.append({"identifier": ident, "title": raw["title"], "url": raw["url"],
-                    "state": raw["state"]["name"], "state_type": s["state_type"],
+                    "state": state_name, "state_type": s["state_type"],
                     "assignee": assignee, "lead": lead,
                     "repo": (v["repo"] if v else None) or (ctx.repo if ctx else None),
                     "context": (v["context"] if v else None) or (ctx.name if ctx else None),
