@@ -236,6 +236,9 @@ class StrategyHold(BaseModel):
     reason: str = Field(min_length=1, max_length=2000)
 
 
+class InvestigationRequest(BaseModel):
+    pass
+
 def idents_ok(identifiers: list[str]) -> list[str]:
     bad = [i for i in identifiers if not IDENT.match(i)]
     if bad:
@@ -273,6 +276,11 @@ async def strategy_create(body: StrategyCreate):
     if body.body is not None:
         args.append(f"--body={brief_json(body.body)}")
     return await factory(*args, "--actor", "user:dashboard")
+
+@router.post("/strategy/{brief_id}/investigate")
+async def strategy_investigate(brief_id: int, body: InvestigationRequest):
+    # Returns the durable pending/running row immediately; a detached read-only agent writes the eventual result.
+    return await factory("strategy", "investigate", str(brief_id))
 
 
 @router.get("/strategy/{brief_id}")

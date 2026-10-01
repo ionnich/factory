@@ -422,6 +422,8 @@ def overview(cfg: Config, conn) -> dict:
     ready_by_id = {item["id"]: item for item in ready(cfg, conn)}
     current = set(_current_published(conn))
     children = {r[0] for r in conn.execute("SELECT parent_id FROM work_brief WHERE parent_id IS NOT NULL")}
+    from . import brief_investigate
+    investigations = brief_investigate.rows(conn)
     briefs = []
     for row in conn.execute("SELECT * FROM work_brief ORDER BY id").fetchall():
         body = json.loads(row["body_json"])
@@ -458,7 +460,7 @@ def overview(cfg: Config, conn) -> dict:
                        "blockers": blockers, "dependencies": deps,
                        "readiness_facts": facts, "replacement": replacement,
                        "dispatch": {"run_id": link["run_id"], "state": link["state"], "phase": link["phase"]}
-                       if link else None})
+                       if link else None, "investigation": investigations.get(row["id"])})
     tickets = _ticket_list(cfg, conn)
     snapshots = {t["identifier"]: relationships.snapshot(conn, t["identifier"]) for t in tickets}
     groups = workgroups.build(tickets, snapshots)

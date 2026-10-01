@@ -510,7 +510,7 @@ class Relationships(unittest.TestCase):
         self.assertFalse(any(seen))
 
 
-# A genuine v22 database: only what migration 23 touches (it only adds linear_relationship).
+# A minimal genuine v22 database: migrations 23 and 24 add only tables and indexes.
 V22 = """
 CREATE TABLE linear_snapshot (
   issue_id    TEXT NOT NULL,
@@ -537,7 +537,7 @@ CREATE TABLE linear_due (
 
 
 class Migration(unittest.TestCase):
-    def test_v22_to_v23_preserves_snapshots_and_adds_relationship_table(self):
+    def test_v22_to_current_preserves_snapshots_and_adds_new_tables(self):
         path = Path(tempfile.mkdtemp()) / "t.db"
         raw = sqlite3.connect(path)
         raw.executescript(V22 + "PRAGMA user_version=22;")
@@ -546,9 +546,10 @@ class Migration(unittest.TestCase):
         raw.close()
         conn = db.connect(path)
         self.addCleanup(conn.close)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 23)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 24)
         self.assertEqual(conn.execute("SELECT raw_json FROM linear_snapshot WHERE issue_id='i1'").fetchone()[0], '{"a":1}')
         self.assertEqual(conn.execute("SELECT count(*) FROM linear_relationship").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT count(*) FROM brief_investigation").fetchone()[0], 0)
         with self.assertRaises(sqlite3.IntegrityError):
             conn.execute("UPDATE linear_snapshot SET identifier='X' WHERE issue_id='i1'")
 

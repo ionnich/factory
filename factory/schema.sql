@@ -176,6 +176,26 @@ BEGIN SELECT RAISE(ABORT, 'hold audit is append-only'); END;
 CREATE TRIGGER work_brief_hold_append_only_d BEFORE DELETE ON work_brief_hold
 BEGIN SELECT RAISE(ABORT, 'hold audit is append-only'); END;
 
+-- Durable read-only agent investigations. Active work is unique per parent; a successful investigation may append
+-- one unapproved child revision, while no-work outcomes retain only their structured explanation.
+CREATE TABLE brief_investigation (
+  id                INTEGER PRIMARY KEY,
+  brief_id          INTEGER NOT NULL REFERENCES work_brief(id),
+  status            TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+  requested_at      TEXT NOT NULL,
+  started_at        TEXT,
+  completed_at      TEXT,
+  error             TEXT,
+  proposal_brief_id INTEGER REFERENCES work_brief(id),
+  result_json       TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+  context_json      TEXT NOT NULL CHECK (json_valid(context_json)),
+  CHECK (status IN ('pending', 'running') OR completed_at IS NOT NULL),
+  CHECK (status <> 'completed' OR result_json IS NOT NULL),
+  CHECK (status <> 'failed' OR error IS NOT NULL)
+);
+CREATE UNIQUE INDEX brief_investigation_active ON brief_investigation(brief_id)
+WHERE status IN ('pending', 'running');
+
 -- Exact version -> verdict bridge, written by the prune slice. A source is verified for a specific brief VERSION,
 -- never borrowed from a prior version: each newly approved version/amendment must be explicitly re-pruned. One
 -- verdict per (version, source); re-prune upserts the same key. No guessed ticket FK (linear_snapshot's PK is
