@@ -279,14 +279,22 @@ PHASE = ("CASE WHEN state = 'draft' AND planned_at IS NOT NULL THEN 'review' "
          "WHEN state IN ('done', 'reconciled') THEN 'reconcile' ELSE 'archive' END")
 
 
+def _current_published_heads(conn) -> set[int]:
+    """The authoritative head-of-lineage ids from Strategy. Reused verbatim (lazy import preserves the
+    dispatch<->strategy cycle design); no local recursive query or head convention is duplicated here."""
+    from . import strategy
+    return set(strategy._current_published(conn))
+
+
 def _approved_unconsumed(conn) -> list:
-    """Approved, current (head-of-lineage), unconsumed briefs in stable approved order. A superseded version (one
-    with a published child) is never offered."""
+    """Approved, current (head-of-lineage), unconsumed briefs in stable approved order. Supersession is decided by
+    the authoritative Strategy heads: an intermediate DRAFT revision does not re-activate an approved ancestor, and
+    any later published descendant (even past a draft) supersedes it."""
+    heads = _current_published_heads(conn)
     return [dict(r) for r in conn.execute(
         "SELECT * FROM work_brief WHERE state='approved' AND "
-        "NOT EXISTS (SELECT 1 FROM dispatch d WHERE d.brief_id = work_brief.id) AND "
-        "NOT EXISTS (SELECT 1 FROM work_brief c WHERE c.parent_id = work_brief.id AND c.state IN ('approved','held')) "
-        "ORDER BY (approved_at IS NULL), approved_at, id")]
+        "NOT EXISTS (SELECT 1 FROM dispatch d WHERE d.brief_id = work_brief.id) "
+        "ORDER BY (approved_at IS NULL), approved_at, id") if r["id"] in heads]
 
 
 def _resolve_brief(conn, identifiers: list[str]) -> int:
@@ -307,8 +315,7 @@ def _load_approved_brief(conn, brief_id: int) -> dict:
     brief = _brief(conn, brief_id)
     if brief.get("state") != "approved":
         raise StageError(f"brief #{brief_id} is {brief.get('state', 'unknown')}, not approved")
-    if conn.execute("SELECT 1 FROM work_brief WHERE parent_id=? AND state IN ('approved','held')",
-                    (brief_id,)).fetchone():
+    if brief_id not in _current_published_heads(conn):  # superseded by any later published descendant
         raise StageError(f"brief #{brief_id} was superseded by a newer revision; use the current version")
     if consumed := conn.execute("SELECT run_id FROM dispatch WHERE brief_id=?", (brief_id,)).fetchone():
         raise StageError(f"brief #{brief_id} is already dispatched as {consumed['run_id']}")
@@ -397,8 +404,7 @@ def _create_brief_draft(cfg: Config, conn, identifiers: list[str], actor: str, e
         row = conn.execute("SELECT state, body_json, sources_json FROM work_brief WHERE id=?", (brief_id,)).fetchone()
         if row is None or row["state"] != "approved":
             raise StageError(f"brief #{brief_id} changed while staging; nothing was written")
-        if conn.execute("SELECT 1 FROM work_brief c WHERE c.parent_id=? AND c.state IN ('approved','held')",
-                        (brief_id,)).fetchone():
+        if brief_id not in _current_published_heads(conn):
             raise StageError(f"brief #{brief_id} was superseded while staging; nothing was written")
         if conn.execute("SELECT 1 FROM dispatch WHERE brief_id=?", (brief_id,)).fetchone():
             raise StageError(f"brief #{brief_id} was consumed while staging; nothing was written")

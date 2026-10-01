@@ -375,5 +375,61 @@ class PruneBacklogBrief(unittest.TestCase):
         self.assertIn("brief_id", items["FIN-1"])
 
 
+class IntentVersionLineage(unittest.TestCase):
+    """An approved ancestor superseded by a later approved descendant THROUGH an intermediate draft revision must
+    never be re-offered or accepted. Lineage: #1 APPROVED -> #2 DRAFT -> #3 APPROVED; authoritative head is #3."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tmp = Path(tmp.name)
+        self.c = db.connect(tmp / "t.db")
+        self.addCleanup(self.c.close)
+        _helpers.seed_project(self.c)
+        _helpers.seed_trunk(self.c)
+        _helpers.seed_snapshot(self.c, "i1", "FIN-1")
+        self.verdict = _helpers.seed_verdict(self.c, "i1")
+        self.cfg = _helpers.mkcfg(tmp)
+        from factory import strategy
+        self.b1 = strategy.approve(self.cfg, self.c,
+                                   strategy.create(self.cfg, self.c, ["FIN-1"], _helpers.HUMAN,
+                                                   body=_helpers.body(title="v1"))["id"], _helpers.HUMAN)
+        self.b2 = strategy.revise(self.cfg, self.c, self.b1["id"], _helpers.body(title="v2"),
+                                  "amend to a draft", _helpers.HUMAN)  # still a draft: does not supersede
+        self.b3 = strategy.approve(self.cfg, self.c,
+                                   strategy.revise(self.cfg, self.c, self.b2["id"], _helpers.body(title="v3"),
+                                                   "amend again", _helpers.HUMAN)["id"], _helpers.HUMAN)
+
+    def test_identifier_resolution_selects_current_head_not_ambiguous(self):
+        self.assertEqual([b["id"] for b in dispatch._approved_unconsumed(self.c)], [self.b3["id"]])
+        self.assertEqual(dispatch._resolve_brief(self.c, ["FIN-1"]), self.b3["id"])
+
+    def test_explicit_stage_of_superseded_ancestor_refuses(self):
+        with self.assertRaises(dispatch.StageError):
+            dispatch.stage_brief(self.cfg, self.c, self.b1["id"], "user")
+
+    def test_prune_put_superseded_ancestor_refuses_without_mutation(self):
+        before_verdicts = self.c.execute("SELECT count(*) FROM verdict").fetchone()[0]
+        before_links = self.c.execute("SELECT count(*) FROM brief_verdict").fetchone()[0]
+        with self.assertRaises(prune.VerdictError):
+            prune.put(self.cfg, self.c, "FIN-1", "valid", "r", [], brief_id=self.b1["id"])
+        self.assertEqual(self.c.execute("SELECT count(*) FROM verdict").fetchone()[0], before_verdicts)
+        self.assertEqual(self.c.execute("SELECT count(*) FROM brief_verdict").fetchone()[0], before_links)
+
+    def test_current_head_stages_once_its_own_version_is_verified(self):
+        _helpers.associate(self.c, self.b3["id"], "i1", self.verdict)
+        res = dispatch.stage_brief(self.cfg, self.c, self.b3["id"], "user")
+        self.assertEqual(res["brief_id"], self.b3["id"])
+
+    def test_writing_transaction_revalidates_supersession(self):
+        # Bypass the read gate (as a concurrent amend could) and drive the inner writer directly: its transaction
+        # re-validation must still refuse the superseded ancestor even though the ancestor is itself approved+verified.
+        _helpers.associate(self.c, self.b1["id"], "i1", self.verdict)
+        with self.assertRaises(dispatch.StageError):
+            dispatch._create_brief_draft(self.cfg, self.c, ["FIN-1"], "user", False, self.b1["id"],
+                                         dispatch._brief(self.c, self.b1["id"]))
+        self.assertEqual(self.c.execute("SELECT count(*) FROM dispatch").fetchone()[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

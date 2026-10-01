@@ -129,14 +129,15 @@ def staleness(cfg: Config, conn, snapshot, ctx: Context | None) -> str | None:
 
 
 def _approved_head_brief(conn, brief_id: int) -> dict:
-    """An approved, current (head-of-lineage) brief: not held, not superseded by a newer published revision."""
+    """An approved, current (head-of-lineage) brief: not held, and not superseded by ANY later published descendant
+    (an intermediate DRAFT revision does not re-activate it). Supersession reuses the authoritative Strategy heads."""
+    from . import strategy
     row = conn.execute("SELECT * FROM work_brief WHERE id=?", (brief_id,)).fetchone()
     if row is None:
         raise VerdictError(f"no brief #{brief_id}")
     if row["state"] != "approved":
         raise VerdictError(f"brief #{brief_id} is {row['state']}, not approved")
-    if conn.execute("SELECT 1 FROM work_brief WHERE parent_id=? AND state IN ('approved','held')",
-                    (brief_id,)).fetchone():
+    if brief_id not in strategy._current_published(conn):
         raise VerdictError(f"brief #{brief_id} was superseded by a newer revision; use the current one")
     return {"id": row["id"], "sources": json.loads(row["sources_json"])}
 
