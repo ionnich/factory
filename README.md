@@ -293,6 +293,16 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
   remaining eligible sources and lists exclusions, then uses the normal relationship-review/grooming flow.
   If none remain, **Browse other work** opens browsing with no picks; empty grooming is unavailable.
   The original approved brief remains immutable, and replacement creation, approval and execution stay separate.
+- **Investigate blockers:** one click starts a durable, read-only DeepSeek investigation of an approved/held
+  blocked brief (`factory strategy investigate ID`, POST `/strategy/{id}/investigate` with `{}`).
+  Unlike **Hold**, this is an agent request: it reads recorded source/blocker facts and repository mirrors,
+  then returns evidence and either an unapproved corrected revision or explicit human follow-up proposals.
+  Completed/QA/unowned sources cannot be smuggled into the replacement; source and relationship freshness,
+  dependency provenance and conservative resources are rechecked before creating it. The original brief and
+  Linear stay unchanged. Use **Open proposed brief** to review a result; nothing is automatically approved or run.
+  Status survives refresh/navigation and updates through the existing stream. Duplicate requests reuse the job;
+  failures are visible and retryable, including vanished workers after the bounded run expires.
+  Evidence names cached timestamps/SHAs; the agent cannot claim fresh production checks it did not perform.
 - **Immutable versions & amendments:** published briefs are immutable. An amendment creates a new draft revision
   with a parent link and reason. A dispatch already staged on a version is never silently changed; if a captured
   source changed since capture, the brief is flagged **needs-amendment** before any new dispatch — an executing

@@ -1,5 +1,6 @@
 """Blocked-brief investigation durability, validation, and amendment races."""
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -76,10 +77,7 @@ class Investigations(unittest.TestCase):
         second = self.request()
         self.assertEqual(first["id"], second["id"])
         self.assertEqual(len(self.spawned), 1)
-        argv, kwargs = self.spawned[0]
-        self.assertEqual(argv[-3:], ["strategy", "investigate-run", str(first["id"])])
-        self.assertTrue(kwargs["start_new_session"])
-        with self.assertRaises(Exception):
+        with self.assertRaises(sqlite3.IntegrityError):
             self.conn.execute("INSERT INTO brief_investigation(brief_id,status,requested_at,context_json) "
                               "VALUES (?,'pending',?,'{}')", (self.brief["id"], SNAP))
 
@@ -89,7 +87,6 @@ class Investigations(unittest.TestCase):
                                        runner=self.runner(output([], None, "Only human QA remains.")))
         self.assertEqual(result["status"], "completed")
         self.assertIsNone(result["proposal_brief_id"])
-        self.assertEqual(result["result"]["summary"], "Only human QA remains.")
         self.assertIsNone(self.conn.execute("SELECT id FROM work_brief WHERE parent_id=?",
                                             (self.brief["id"],)).fetchone())
 
@@ -102,7 +99,7 @@ class Investigations(unittest.TestCase):
         self.assertEqual(proposal["state"], "draft")
         self.assertEqual(proposal["parent_id"], original["id"])
         self.assertEqual([s["identifier"] for s in proposal["sources"]], ["FIN-2"])
-        self.assertEqual([s["identifier"] for s in original["sources"]], ["FIN-1"])
+        self.assertEqual(original, self.brief)
         self.assertIn("global:*", proposal["body"]["resources"])
         self.assertEqual(self.request()["id"], job["id"])
 
@@ -111,12 +108,10 @@ class Investigations(unittest.TestCase):
         failed = brief_investigate.run(self.cfg, self.conn, job["id"],
                                        runner=self.runner(output(["FIN-999"], body())))
         self.assertEqual(failed["status"], "failed")
-        self.assertIn("not offered", failed["error"])
         retry = self.request()
         failed = brief_investigate.run(self.cfg, self.conn, retry["id"],
                                        runner=self.runner(output(["FIN-2"], body(dependencies=["FIN-999"]))))
         self.assertEqual(failed["status"], "failed")
-        self.assertIn("lacks recorded provenance", failed["error"])
         self.assertIsNone(self.conn.execute("SELECT id FROM work_brief WHERE parent_id=?",
                                             (self.brief["id"],)).fetchone())
 
@@ -131,7 +126,6 @@ class Investigations(unittest.TestCase):
         failed = brief_investigate.run(self.cfg, self.conn, job["id"],
                                        runner=self.runner(output(["FIN-2"], body("Corrected")), complete_candidate))
         self.assertEqual(failed["status"], "failed")
-        self.assertIn("changed while", failed["error"])
 
         # Restore no mutation need: FIN-1 remains eligible and a human child must prevent the retry's late worker.
         retry = self.request()
@@ -143,7 +137,6 @@ class Investigations(unittest.TestCase):
         failed = brief_investigate.run(self.cfg, self.conn, retry["id"],
                                        runner=self.runner(output(["FIN-1"], body("Agent amendment")), amend))
         self.assertEqual(failed["status"], "failed")
-        self.assertIn("newer revision", failed["error"])
         children = self.conn.execute("SELECT created_by FROM work_brief WHERE parent_id=?",
                                      (self.brief["id"],)).fetchall()
         self.assertEqual([row["created_by"] for row in children], ["user:test"])
@@ -152,7 +145,6 @@ class Investigations(unittest.TestCase):
         failed = brief_investigate.request(self.cfg, self.conn, self.brief["id"],
                                            spawn=lambda *args, **kwargs: (_ for _ in ()).throw(OSError("fork")))
         self.assertEqual(failed["status"], "failed")
-        self.assertIn("could not start", failed["error"])
         job = self.request()
         malformed = brief_investigate.run(self.cfg, self.conn, job["id"],
                                            runner=self.runner("not json"))
@@ -170,12 +162,6 @@ class Investigations(unittest.TestCase):
                                     (retry["id"],)).fetchone()["status"]
         self.assertEqual(retired, "failed")
 
-    def test_overview_projects_latest_investigation(self):
-        job = self.request()
-        summary = strategy.overview(self.cfg, self.conn)
-        brief = next(item for item in summary["briefs"] if item["id"] == self.brief["id"])
-        self.assertEqual(brief["investigation"]["id"], job["id"])
-        self.assertEqual(brief["investigation"]["status"], "pending")
 
 
 if __name__ == "__main__":

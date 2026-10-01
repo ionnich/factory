@@ -381,8 +381,8 @@ function InvestigationPanel({ investigation, eligible, dirty, busy, onInvestigat
         <div className="fx-k">Agent blocker investigation</div>
         {statusLabel ? <Tone tone={failed ? "red" : completed ? "green" : "amber"}>{statusLabel}</Tone> : null}
       </div>
-      <div className="fx-hint">A read-only agent checks recorded evidence, code, and database facts, then proposes a corrected
-        draft or explains the remaining human work. It does not change this approved brief or anything in Linear.</div>
+      <div className="fx-hint">A read-only agent investigates blockers and proposes a corrected draft or human follow-up.
+        It uses cached snapshots and repository mirrors, not live production checks. This brief and Linear stay unchanged.</div>
       {active ? (
         <div className="fx-hint" role="status">
           {status === "pending" ? "Investigation queued" : "Investigation in progress"}
