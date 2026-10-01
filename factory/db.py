@@ -496,8 +496,8 @@ BEGIN SELECT RAISE(ABORT, 'dispatch resources are pinned while the dispatch is a
 CREATE TRIGGER dispatch_resource_no_update BEFORE UPDATE ON dispatch_resource
 BEGIN SELECT RAISE(ABORT, 'dispatch resources are immutable'); END;
 CREATE TRIGGER dispatch_resource_held_to_archive BEFORE DELETE ON dispatch_resource
-WHEN (SELECT state FROM dispatch WHERE run_id = OLD.run_id) IS NOT 'archived'
-BEGIN SELECT RAISE(ABORT, 'dispatch resources are held until the dispatch is archived'); END;
+WHEN (SELECT state FROM dispatch WHERE run_id = OLD.run_id) NOT IN ('draft', 'archived')
+BEGIN SELECT RAISE(ABORT, 'dispatch resources are immutable in staged/executing/done/reconciled'); END;
 
 CREATE TABLE execution_policy (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -555,7 +555,8 @@ WHERE c.resource = o.resource
 
 CREATE TRIGGER launch_reserve_guard BEFORE INSERT ON dispatch_launch
 WHEN (SELECT count(DISTINCT run_id) FROM launch_active) + 1 > (SELECT max_parallel FROM execution_policy WHERE id = 1)
-  OR EXISTS (SELECT 1 FROM launch_active WHERE pane_id = NEW.pane_id)
+  OR EXISTS (SELECT 1 FROM dispatch_launch WHERE pane_id = NEW.pane_id)
+  OR EXISTS (SELECT 1 FROM dispatch WHERE executor_pane = NEW.pane_id AND state = 'executing')
   OR ((SELECT route FROM dispatch WHERE run_id = NEW.run_id) IS NOT NULL
       AND EXISTS (SELECT 1 FROM claim_holders WHERE route = (SELECT route FROM dispatch WHERE run_id = NEW.run_id)))
   OR EXISTS (SELECT 1 FROM resource_conflicts rc WHERE rc.a = NEW.run_id
@@ -567,7 +568,9 @@ CREATE TRIGGER dispatch_execute_guard BEFORE UPDATE OF state ON dispatch
 WHEN OLD.state = 'staged' AND NEW.state = 'executing' AND (
   (SELECT count(DISTINCT run_id) FROM launch_active WHERE run_id <> NEW.run_id) + 1
       > (SELECT max_parallel FROM execution_policy WHERE id = 1)
-  OR EXISTS (SELECT 1 FROM launch_active WHERE pane_id = NEW.executor_pane AND run_id <> NEW.run_id)
+  OR EXISTS (SELECT 1 FROM dispatch_launch WHERE pane_id = NEW.executor_pane AND run_id <> NEW.run_id)
+  OR EXISTS (SELECT 1 FROM dispatch WHERE executor_pane = NEW.executor_pane AND state = 'executing'
+             AND run_id <> NEW.run_id)
   OR (NEW.route IS NOT NULL AND EXISTS (SELECT 1 FROM claim_holders WHERE route = NEW.route AND run_id <> NEW.run_id))
   OR EXISTS (SELECT 1 FROM resource_conflicts rc WHERE rc.a = NEW.run_id
              AND rc.b IN (SELECT run_id FROM claim_holders WHERE run_id <> NEW.run_id))
