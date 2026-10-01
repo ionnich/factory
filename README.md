@@ -228,6 +228,22 @@ One-time, by hand:
 (Tickets, Verify, Draft, Plan, Review, Run, Reconcile, Archive) are unchanged. Linear snapshots are source and
 provenance plus reconciliation ids, not the runtime instruction source for a brief-backed dispatch.
 
+- **Grouped browsing (default):** browse collapsed parent families, dependency chains, one-hop related candidates,
+  then explicitly organizational project/context buckets. Related links never form transitive mega-groups;
+  a source with only outside related links stays in its project bucket with those links retained as context.
+  Each source appears once, with at most 12 sources per group; larger families/chains have labelled continuations.
+  Summaries show matching ticket count, highest priority, earliest due date, readiness and independent validity counts,
+  plus cross-assignee/repo counts. Group order follows the chosen source sort; prerequisites precede dependents inside
+  a dependency group, with the chosen sort breaking ties. Parent families retain their outline.
+  **Flat** keeps the paged ticket list; **DAG** adds a desktop blocks-only graph to each opened group.
+  Cycles remain explicit edge lists, never fabricated DAGs. Typed links and outside-filter/source context expand
+  separately; context is read-only and never silently selected. **Select matching** selects only matching group members.
+  Source view, group expansion and picks survive workspace switches; hidden picks remain visible in the count.
+- **Recorded relationships:** schema v23 caches each owned source's parent, children, blocks, related and duplicate
+  links, including descriptive metadata for outside endpoints. Normal ingest refreshes the complete paginated graph
+  even when issue timestamps do not change. Refresh is atomic; failures keep the previous graph and report the error.
+  Missing cache is explicitly unknown, not known-empty. Reads use only the cache; no model-inferred links or Linear
+  mutations. Relation source/target direction is preserved; related links are undirected.
 - **Sources:** combine search, state, context and assignee filters. Assignee choices are **All assignees**
   (default), **Assigned to me** (the configured Factory lead), **Unassigned**, and individual emails.
   Filters and sorting survive workspace switches; changing either preserves picked sources and resets pagination.
@@ -240,9 +256,13 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
   and execution blockers; these labels do not run a new scan. Counts distinguish displayed, matching and total sources.
 - A **brief** is an approved, self-contained, versioned work brief: title, outcome, acceptance, scope, exclusions,
   decisions, dependencies, resources, risks, evidence — plus server-captured source snapshots (issue id, repo,
-  context, route, verdict id/evidence, trunk anchors). Briefs are groomed from cached snapshots by DeepSeek, edited
+  context, route, verdict id/evidence, trunk anchors and recorded relationships).
+  Briefs are groomed from cached sources by DeepSeek, edited
   by a human, and published as an exact version. Publishing intent does **not** approve execution, override missing
   evidence, answer questions or mutate Linear.
+  Selected links are reviewed before grooming; only explicit incoming blocking links from outside the selected work
+  qualify as model-proposed dependencies. A human can edit dependencies. Compiled intent retains captured links and
+  outside context, not later relationship-cache contents.
 - **Approval boundary:** a human approves a brief (`factory strategy approve` or the API, actor
   `user:dashboard` / an explicit CLI user); agents can never approve or silence-publish a brief. Approving a brief
   authorizes verification and planning from it, not execution. Dispatching still passes the existing review
@@ -255,6 +275,9 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
   intent. Hold/unhold is an explicit readiness change, never an intent or version change. Duplicate publish/stage
   is refused by SQLite transaction/unique constraints; empty or contradictory required fields and dependency cycles
   are rejected.
+  Relationship-only changes also require amendment before publishing, drafting a dispatch, approving execution or
+  handing off. Observation-time-only refreshes do not. Legacy briefs without relationship captures keep their frozen
+  content and show an unknown-context warning.
 - **Bounds:** the proposer prepares up to **3** nonexecuting drafts/staged briefs per pass, in stable approved
   order; execution runs at **max_parallel = 2** by default. Reservations are conservative: per-repo claims
   (`repo:OWNER/NAME`, serial per repo), route exclusivity (`route:home`), pane exclusivity (at most one dispatch

@@ -232,7 +232,7 @@ def _related_groups(remaining, edges):
     rem = set(remaining)
     out = []
     while True:
-        seeds = [m for m in rem if adj.get(m)]
+        seeds = [m for m in rem if any(n != m and n in rem for n in adj.get(m, ()))]
         if not seeds:
             break
         seed = min(seeds)

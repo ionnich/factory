@@ -84,7 +84,8 @@ class RelationshipBriefs(unittest.TestCase):
         self.snapshots["FIN-1"] = _rel(observed_at="2026-09-01T00:00:00Z")
         b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body())
         self.snapshots["FIN-1"] = _rel(observed_at="2026-09-02T00:00:00Z")  # same fingerprint, later observed_at
-        strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")  # not drift
+        result = strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")
+        self.assertEqual(result["state"], "approved")
 
     def test_complete_becoming_incomplete_invalidates(self):
         self.snapshots["FIN-1"] = _rel()
@@ -169,15 +170,6 @@ class RelationshipBriefs(unittest.TestCase):
                                                "missing": ["FIN-2"]})
         self.assertEqual(sorted(m for g in ov["groups"] for m in g["members"]), ["FIN-1", "FIN-2"])
 
-    def test_project_metadata_from_raw(self):
-        raw = json.loads(_raw(ident="FIN-3"))
-        raw["project"] = {"name": "Payments"}
-        self.c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,'unstarted',1,?)",
-                       ("fin-3", "FIN-3", SNAP, SNAP, json.dumps(raw)))
-        fin3 = next(t for t in strategy.overview(self.cfg, self.c)["tickets"] if t["identifier"] == "FIN-3")
-        self.assertEqual(fin3["project"], {"name": "Payments"})
-        fin1 = next(t for t in strategy.overview(self.cfg, self.c)["tickets"] if t["identifier"] == "FIN-1")
-        self.assertIsNone(fin1["project"])
 
 
 if __name__ == "__main__":

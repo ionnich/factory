@@ -53,7 +53,16 @@ class Build(unittest.TestCase):
             "C": _snap(nodes=[_node("C")]),
         }
         self.assertEqual(_kinds(workgroups.build(tickets, snaps)),
-                         [("related", ["A", "B"]), ("related", ["C"])])  # C never pulled transitively
+                         [("related", ["A", "B"]), ("context", ["C"])])  # C never pulled transitively
+
+    def test_external_related_links_stay_context_in_project_bucket(self):
+        tickets = [_ticket(i, project="P") for i in ("A", "B")]
+        snapshots = {i: _snap(edges=[{"kind": "related", "source": i, "target": "EXT"}],
+                              nodes=[_node("EXT")]) for i in ("A", "B")}
+        (group,) = workgroups.build(tickets, snapshots)
+        self.assertEqual((group["kind"], group["members"]), ("project", ["A", "B"]))
+        self.assertEqual([n["identifier"] for n in group["context"]], ["EXT"])
+        self.assertEqual(len(group["edges"]), 2)
 
     def test_external_context_not_source(self):
         tickets = [_ticket("A")]
