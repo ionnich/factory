@@ -362,6 +362,83 @@ function ReadinessPanel({ summary }) {
   );
 }
 
+function InvestigationPanel({ investigation, eligible, dirty, busy, onInvestigate, onOpenProposal }) {
+  const status = investigation?.status || null;
+  const active = status === "pending" || status === "running";
+  const failed = status === "failed";
+  const completed = status === "completed";
+  const result = investigation?.result || null;
+  const evidence = result?.evidence || [];
+  const followups = result?.followups || [];
+  const statusLabel = status === "pending" ? "queued"
+    : status === "running" ? "investigating"
+    : status === "completed" ? "completed"
+    : status === "failed" ? "failed"
+    : status;
+  return (
+    <section className="fx-sec fx-stack-v" aria-label="Agent blocker investigation">
+      <div className="fx-row between">
+        <div className="fx-k">Agent blocker investigation</div>
+        {statusLabel ? <Tone tone={failed ? "red" : completed ? "green" : "amber"}>{statusLabel}</Tone> : null}
+      </div>
+      <div className="fx-hint">A read-only agent checks recorded evidence, code, and database facts, then proposes a corrected
+        draft or explains the remaining human work. It does not change this approved brief or anything in Linear.</div>
+      {active ? (
+        <div className="fx-hint" role="status">
+          {status === "pending" ? "Investigation queued" : "Investigation in progress"}
+          {investigation.requested_at ? ` · requested ${ago(investigation.requested_at)}` : ""}
+        </div>
+      ) : null}
+      {failed ? (
+        <div className="fx-err" role="alert">
+          Investigation failed{investigation.error ? `: ${investigation.error}` : "."}
+        </div>
+      ) : null}
+      {completed ? (
+        <>
+          {result?.summary
+            ? <div className="fx-why">{result.summary}</div>
+            : <div className="fx-err">Investigation completed without a result summary.</div>}
+          {evidence.length ? (
+            <details className="fx-fold">
+              <summary>Evidence ({evidence.length})</summary>
+              <ul className="fx-src">{evidence.map((item, i) => <li key={i}>{item}</li>)}</ul>
+            </details>
+          ) : null}
+          {followups.length ? (
+            <details className="fx-fold">
+              <summary>Follow-up proposals ({followups.length})</summary>
+              <div className="fx-stack-v">
+                {followups.map((item, i) => (
+                  <div key={i}>
+                    <div className="fx-k">{item.title}</div>
+                    <div className="fx-hint">{item.description}</div>
+                  </div>
+                ))}
+              </div>
+            </details>
+          ) : null}
+          {investigation.proposal_brief_id ? (
+            <div className="fx-row">
+              <Button size="sm" onClick={() => onOpenProposal(investigation.proposal_brief_id)}>
+                Open proposed brief #{investigation.proposal_brief_id}
+              </Button>
+            </div>
+          ) : <div className="fx-hint">No corrected draft was created.</div>}
+        </>
+      ) : null}
+      {eligible && (!investigation || failed) ? (
+        <div className="fx-row">
+          <Button size="sm" disabled={!!busy || dirty} onClick={onInvestigate}>
+            {busy === "investigate" ? "Starting…" : failed ? "Retry investigation" : "Investigate blockers"}
+          </Button>
+          {dirty ? <span className="fx-hint">Save or discard edits first.</span> : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function Field({ label, value, onChange, kind, disabled }) {
   return (
     <label className="fx-field fx-brief-section">
@@ -766,6 +843,9 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     : summary?.readiness === "dispatched" ? "This brief already has a dispatch."
     : summary?.readiness === "superseded" ? "Use the current approved revision."
     : !summary ? "Readiness is still loading." : null;
+  const investigation = summary?.investigation || null;
+  const investigationEligible = !!summary && ["approved", "held"].includes(current?.state) &&
+    !summary.dispatch && summary.readiness !== "superseded" && (summary.blockers || []).length > 0;
 
   const call = async (path, body, what) => {  // one write at a time; busy/err live in the parent view (survive leaving)
     update({ busy: what, err: null });
@@ -875,6 +955,17 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     onDone(r, null, `Created draft dispatch ${r.run_id || ""} for review`);
     // Redirect only if the operator is still on this brief (nav token) and the tab is still mounted (lifecycle).
     if (r.run_id && alive.current && NAV_TOKEN === atNav) onNavigate({ stage: "draft", run: r.run_id });
+  };
+
+  const investigate = async () => {
+    const briefId = current.id;
+    const r = await call(`/strategy/${briefId}/investigate`, {}, "investigate");
+    if (!r) return;
+    // POST returns the durable job immediately. Patch only its parent summary; SSE refresh supplies later worker states.
+    setAll((prev) => prev ? {
+      ...prev,
+      briefs: (prev.briefs || []).map((b) => b.id === briefId ? { ...b, investigation: r } : b),
+    } : prev);
   };
 
   const reviewReplacement = () => {
@@ -1070,7 +1161,10 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
       </header>
 
       {loadErr ? <div className="fx-err" role="alert">{all ? `Refreshing strategy failed: ${loadErr}. Showing the last loaded.` : `Strategy did not load: ${loadErr}`}</div> : null}
-      {busy ? <div className="fx-hint" role="status">{busy === "groom" ? "Grooming with DeepSeek (this takes a while)…" : "Working…"}</div> : null}
+      {busy ? <div className="fx-hint" role="status">
+        {busy === "groom" ? "Grooming with DeepSeek (this takes a while)…"
+          : busy === "investigate" ? "Starting blocker investigation…" : "Working…"}
+      </div> : null}
       {err ? <div className="fx-err" role="alert">{err}</div> : null}
 
       {open != null ? (
@@ -1098,6 +1192,10 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
                 <div className="fx-err">Superseded — a newer revision exists; a draft with a child cannot be approved.</div>
               ) : null}
               <ReadinessPanel summary={summary} />
+              {(investigation || investigationEligible) ? (
+                <InvestigationPanel investigation={investigation} eligible={investigationEligible} dirty={dirty}
+                                    busy={busy} onInvestigate={investigate} onOpenProposal={openBrief} />
+              ) : null}
               {current.state === "approved" ? (
                 <div className="fx-why">Approval freezes scope for planning only. It does not authorize or start execution.</div>
               ) : null}
