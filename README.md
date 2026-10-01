@@ -222,6 +222,9 @@ One-time, by hand:
 (Tickets, Verify, Draft, Plan, Review, Run, Reconcile, Archive) are unchanged. Linear snapshots are source and
 provenance plus reconciliation ids, not the runtime instruction source for a brief-backed dispatch.
 
+- **Sources:** combine search, state, context and assignee filters. Assignee choices are **All assignees**
+  (default), **Assigned to me** (the configured Factory lead), **Unassigned**, and individual emails.
+  Filters survive workspace switches; changing filters preserves picked sources and resets pagination.
 - A **brief** is an approved, self-contained, versioned work brief: title, outcome, acceptance, scope, exclusions,
   decisions, dependencies, resources, risks, evidence — plus server-captured source snapshots (issue id, repo,
   context, route, verdict id/evidence, trunk anchors). Briefs are groomed from cached snapshots by DeepSeek, edited
