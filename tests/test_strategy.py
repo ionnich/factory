@@ -387,6 +387,64 @@ class Briefs(unittest.TestCase):
         self.assertFalse(row["ready"])
         self.assertTrue(any("assigned to" in blk for blk in row["blockers"]))
 
+    def test_repo_only_opt_out_and_explicit_global(self):
+        # a human can opt out of global:* with a repo/route-only list (no invented extra key)
+        b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli",
+                            _body(resources=["repo:Finks-ai/finks-ddd", "route:fx-news"]))
+        self.assertEqual(b["body"]["resources"], ["repo:Finks-ai/finks-ddd", "route:fx-news"])
+        strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")  # re-merge preserves the reviewed opt-out
+        self.assertEqual(strategy.get(self.c, b["id"])["body"]["resources"],
+                         ["repo:Finks-ai/finks-ddd", "route:fx-news"])
+        b2 = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body(resources=["global:*"]))
+        self.assertIn("global:*", b2["body"]["resources"])  # explicit global:* stays
+
+    def test_approve_rejects_draft_with_child(self):
+        b = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body())
+        b2 = strategy.revise(self.cfg, self.c, b["id"], _body(title="T2"), "edit", "user:cli")
+        with self.assertRaises(StageError):  # b is superseded by b2; approve only the latest
+            strategy.approve(self.cfg, self.c, b["id"], "user:dashboard")
+        strategy.approve(self.cfg, self.c, b2["id"], "user:dashboard")
+        self.assertEqual(strategy.get(self.c, b2["id"])["state"], "approved")
+
+    def test_overview_marks_superseded_and_carries_phase(self):
+        a = strategy.create(self.cfg, self.c, ["FIN-1"], "user:cli", _body())
+        strategy.approve(self.cfg, self.c, a["id"], "user:dashboard")
+        a2 = strategy.revise(self.cfg, self.c, a["id"], _body(title="T2"), "amended", "user:cli")
+        strategy.approve(self.cfg, self.c, a2["id"], "user:dashboard")
+        self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at,brief_id) "
+                       "VALUES ('d1','draft','[]','x',?,?)", (SNAP, a2["id"]))
+        briefs = {b["id"]: b for b in strategy.overview(self.cfg, self.c)["briefs"]}
+        self.assertEqual(briefs[a["id"]]["readiness"], "superseded")   # historical published
+        self.assertEqual(briefs[a2["id"]]["readiness"], "dispatched")  # current but consumed
+        self.assertEqual(briefs[a2["id"]]["dispatch"]["phase"], "draft")
+
+    def test_reserve_guard_admits_only_staged(self):
+        self.c.execute("DROP TRIGGER dispatch_execute_guard")  # simulate pre-guard migration: both runs get global:*
+        # r2: legacy draft -> done holding global:*
+        self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) VALUES ('r2','draft','[]','x',?)",
+                       (SNAP,))
+        self.c.execute("INSERT INTO dispatch_resource VALUES ('r2','global:*')")
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u' WHERE run_id='r2'")
+        self.c.execute("UPDATE dispatch SET state='executing', executing_at=?, executor_pane='p2' WHERE run_id='r2'", (SNAP,))
+        self.c.execute("UPDATE dispatch SET state='done', done_at=? WHERE run_id='r2'", (SNAP,))
+        # r1: legacy draft -> executing holding global:*
+        self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) VALUES ('r1','draft','[]','x',?)",
+                       (SNAP,))
+        self.c.execute("INSERT INTO dispatch_resource VALUES ('r1','global:*')")
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u' WHERE run_id='r1'")
+        self.c.execute("UPDATE dispatch SET state='executing', executing_at=?, executor_pane='p1' WHERE run_id='r1'", (SNAP,))
+        # a NEW staged run is still refused against r2's held global claim
+        self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) VALUES ('r3','draft','[]','x',?)",
+                       (SNAP,))
+        self.c.execute("INSERT INTO dispatch_resource VALUES ('r3','global:*')")
+        self.c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u' WHERE run_id='r3'")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.c.execute("INSERT INTO dispatch_launch(run_id,pane_id,state,claimed_at) VALUES ('r3','p3','reserved',?)",
+                           (SNAP,))
+        # the executing legacy run's resume bootstrap is NOT re-admitted against r2's claim
+        self.c.execute("INSERT INTO dispatch_launch(run_id,pane_id,state,claimed_at) VALUES ('r1','p1','reserved',?)",
+                       (SNAP,))
+
 
 if __name__ == "__main__":
     unittest.main()

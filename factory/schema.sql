@@ -606,13 +606,14 @@ CREATE TABLE dispatch_launch (
   sent_at    TEXT,
   error      TEXT
 );
--- A launch is reserved for a staged dispatch, or for a preexisting legacy executing run at its own executor pane
--- (the explicit restart protocol reserves a durable slot before the /new send).
+-- A launch is reserved for a staged dispatch, or for a preexisting LEGACY (NULL brief) executing run at its own
+-- executor pane (the explicit restart protocol reserves a durable slot before the /new send).
 CREATE TRIGGER launch_reserve_state BEFORE INSERT ON dispatch_launch
 WHEN (SELECT state FROM dispatch WHERE run_id = NEW.run_id) NOT IN ('staged', 'executing')
   OR ((SELECT state FROM dispatch WHERE run_id = NEW.run_id) = 'executing'
-      AND (SELECT executor_pane FROM dispatch WHERE run_id = NEW.run_id) IS NOT NEW.pane_id)
-BEGIN SELECT RAISE(ABORT, 'a launch is reserved for a staged dispatch, or an executing dispatch at its own executor pane'); END;
+      AND ((SELECT executor_pane FROM dispatch WHERE run_id = NEW.run_id) IS NOT NEW.pane_id
+           OR (SELECT brief_id FROM dispatch WHERE run_id = NEW.run_id) IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'a launch is reserved for a staged dispatch, or a legacy executing dispatch at its own executor pane'); END;
 CREATE TRIGGER launch_edges BEFORE UPDATE OF state ON dispatch_launch
 WHEN NEW.state IS NOT OLD.state AND (OLD.state, NEW.state) NOT IN (VALUES
   ('reserved', 'sent'), ('reserved', 'uncertain'), ('uncertain', 'sent'), ('uncertain', 'reserved'),
@@ -665,18 +666,22 @@ WHERE c.resource = o.resource
 -- it (reserved/sent/uncertain, even on a terminal/archived dispatch: a terminal slot release frees capacity but a
 -- retained uncertain/sent row means the pane is not yet confirmed safe) or a running dispatch's executor pane. Raw
 -- sqlite3 cannot bypass.
+-- Capacity/route/resource/claim admission is for a NEW (staged) run only; an already-EXECUTING legacy run was
+-- admitted once and its resume/restart bootstrap must not re-admit it against done/reconciled holders. Pane
+-- exclusivity (another owner's retained launch or running pane) applies to BOTH staged and executing reservations.
 CREATE TRIGGER launch_reserve_guard BEFORE INSERT ON dispatch_launch
-WHEN (SELECT count(DISTINCT run_id) FROM launch_active WHERE run_id <> NEW.run_id) + 1
-      > (SELECT max_parallel FROM execution_policy WHERE id = 1)
+WHEN ((SELECT state FROM dispatch WHERE run_id = NEW.run_id) = 'staged' AND (
+    (SELECT count(DISTINCT run_id) FROM launch_active WHERE run_id <> NEW.run_id) + 1
+        > (SELECT max_parallel FROM execution_policy WHERE id = 1)
+    OR ((SELECT route FROM dispatch WHERE run_id = NEW.run_id) IS NOT NULL
+        AND EXISTS (SELECT 1 FROM claim_holders WHERE route = (SELECT route FROM dispatch WHERE run_id = NEW.run_id)
+                    AND run_id <> NEW.run_id))
+    OR EXISTS (SELECT 1 FROM resource_conflicts rc WHERE rc.a = NEW.run_id
+               AND rc.b IN (SELECT run_id FROM claim_holders))
+    OR NOT EXISTS (SELECT 1 FROM dispatch_resource WHERE run_id = NEW.run_id)))
   OR EXISTS (SELECT 1 FROM dispatch_launch WHERE pane_id = NEW.pane_id AND run_id <> NEW.run_id)
   OR EXISTS (SELECT 1 FROM dispatch WHERE executor_pane = NEW.pane_id AND state = 'executing'
              AND run_id <> NEW.run_id)
-  OR ((SELECT route FROM dispatch WHERE run_id = NEW.run_id) IS NOT NULL
-      AND EXISTS (SELECT 1 FROM claim_holders WHERE route = (SELECT route FROM dispatch WHERE run_id = NEW.run_id)
-                  AND run_id <> NEW.run_id))
-  OR EXISTS (SELECT 1 FROM resource_conflicts rc WHERE rc.a = NEW.run_id
-             AND rc.b IN (SELECT run_id FROM claim_holders))
-  OR NOT EXISTS (SELECT 1 FROM dispatch_resource WHERE run_id = NEW.run_id)
 BEGIN SELECT RAISE(ABORT, 'launch conflicts with capacity, pane, route or a held resource, or the run has no claims'); END;
 
 -- staged -> executing re-checks the same rules for every run (legacy included, so a direct execute cannot bypass
