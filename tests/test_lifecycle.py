@@ -4,6 +4,7 @@ that owns it, and each stage counts its own unit (tickets before grouping, every
 import contextlib
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,29 @@ from factory.config import Config, Context
 SNAP = "2026-09-01T00:00:00Z"
 PLAN = [{"id": "root", "result": "r"}, {"id": "FIN-1", "result": "r"}, {"id": "FIN-1/1", "title": "a"}]
 RUN = ("staged", "executing")
+
+# A genuine v19 dispatch table (v20 minus planning_requested_at/planning_error): only what migrations 20/21 touch.
+# one_executing and the v19 dispatch_frozen trigger must exist so migration 21 can drop them.
+V19_DISPATCH = """
+CREATE TABLE dispatch (
+  run_id        TEXT PRIMARY KEY,
+  state         TEXT NOT NULL CHECK (state IN ('draft', 'staged', 'executing', 'done', 'reconciled', 'archived')),
+  body_sha256   TEXT,
+  repos_json    TEXT NOT NULL CHECK (json_valid(repos_json)),
+  last_actor    TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  staged_at     TEXT, executing_at TEXT, done_at TEXT, reconciled_at TEXT, archived_at TEXT,
+  executor_pane TEXT, route TEXT, drafted_by TEXT, planned_at TEXT, held_reason TEXT,
+  approved_by   TEXT, rejected_reason TEXT,
+  emergency     INTEGER NOT NULL DEFAULT 0,
+  CHECK (state = 'draft' OR body_sha256 IS NOT NULL)
+);
+CREATE UNIQUE INDEX one_executing ON dispatch(state) WHERE state = 'executing';
+CREATE TRIGGER dispatch_frozen BEFORE UPDATE ON dispatch
+WHEN OLD.state <> 'draft' AND (NEW.body_sha256 IS NOT OLD.body_sha256 OR NEW.repos_json IS NOT OLD.repos_json
+  OR NEW.run_id IS NOT OLD.run_id OR NEW.created_at IS NOT OLD.created_at OR NEW.route IS NOT OLD.route)
+BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;
+"""
 
 
 def raw(ident, domain="API"):
@@ -111,21 +135,20 @@ class Phases(unittest.TestCase):
 
     def test_upgrade_records_no_offer_an_old_draft_never_had(self):
         path = self.tmp / "v19.db"
-        c = db.connect(path)
-        for col in ("planning_requested_at", "planning_error"):  # back to the v19 dispatch table
-            c.execute(f"ALTER TABLE dispatch DROP COLUMN {col}")
-        c.execute("PRAGMA user_version=19")
-        c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) "
-                  "VALUES ('old','draft','[]','x',?)", (SNAP,))
-        c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at,planned_at) "
-                  "VALUES ('planned','draft','[]','x',?,?)", (SNAP, SNAP))
-        c.close()
-        c = db.connect(path)
+        raw = sqlite3.connect(path)  # a genuine v19 database (no planning columns, no v21 objects)
+        raw.executescript(V19_DISPATCH + "PRAGMA user_version=19;")
+        raw.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) VALUES ('old','draft','[]','x',?)",
+                    (SNAP,))
+        raw.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at,planned_at) "
+                    "VALUES ('planned','draft','[]','x',?,?)", (SNAP, SNAP))
+        raw.commit()
+        raw.close()
+        c = db.connect(path)  # upgrade v19 -> v21 through migrations 20 and 21
         self.addCleanup(c.close)
-        self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 20)
-        got = {r: cli.dispatch_status(self.cfg, c, r) for r in ("old", "planned")}
-        self.assertEqual({r: (d["phase"], d["planning_requested_at"], d["planning_error"]) for r, d in got.items()},
-                         {"old": ("draft", None, None), "planned": ("review", None, None)})
+        self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 21)
+        got = {r: tuple(c.execute(f"SELECT {dispatch.PHASE}, planning_requested_at, planning_error "
+                                  "FROM dispatch WHERE run_id=?", (r,)).fetchone()) for r in ("old", "planned")}
+        self.assertEqual(got, {"old": ("draft", None, None), "planned": ("review", None, None)})
 
     def test_each_decision_is_asked_in_the_stage_that_owns_it(self):
         opts = [decide.option("a", "A", "leads to a"), decide.option("b", "B", "leads to b")]

@@ -1,8 +1,13 @@
 """factory.db invariants hold against raw SQL, not just through the CLI. Run: .venv/bin/python -m unittest"""
+import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(__file__))
+import _v21  # noqa: E402
 
 from factory import db
 from factory.witness import graphql_read_ok, sql_statement_ok
@@ -13,6 +18,7 @@ SNAP = "2026-09-01T00:00:00Z"
 class Invariants(unittest.TestCase):
     def setUp(self):
         self.c = db.connect(Path(tempfile.mkdtemp()) / "t.db")
+        _v21.ensure_schema(self.c)
         for i in (1, 2):
             self.c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,?,1,'{}')", (f"i{i}", f"FIN-{i}", SNAP, SNAP, "unstarted"))
             self.c.execute("INSERT INTO verdict(issue_id,snapshot_updated_at,kind,reason,evidence_json,created_at,created_by) "
@@ -42,8 +48,9 @@ class Invariants(unittest.TestCase):
             with self.subTest(sql=sql), self.assertRaises(sqlite3.DatabaseError):
                 self.x(sql)
 
-    def test_one_executing_and_auto_done(self):
+    def test_capacity_guard_and_auto_done(self):
         self.stage("d1"), self.stage("d2")
+        self.x("UPDATE execution_policy SET max_parallel=1")  # one_executing replaced by the bounded capacity guard
         self.x("UPDATE dispatch SET state='executing', last_actor='fm-main' WHERE run_id='d1'")
         with self.assertRaises(sqlite3.IntegrityError):
             self.x("UPDATE dispatch SET state='executing', last_actor='fm-main' WHERE run_id='d2'")
@@ -51,7 +58,33 @@ class Invariants(unittest.TestCase):
         self.assertEqual(self.x("SELECT state FROM dispatch WHERE run_id='d1'").fetchone()[0], "done")
         with self.assertRaises(sqlite3.DatabaseError):
             self.x("UPDATE dispatch_ticket SET card_status='running' WHERE run_id='d1'")
-        self.x("UPDATE dispatch SET state='executing', last_actor='fm-main' WHERE run_id='d2'")
+        self.x("UPDATE dispatch SET state='executing', last_actor='fm-main' WHERE run_id='d2'")  # d1 done: slot freed
+
+    def test_launch_reserve_state_and_edges(self):
+        with self.assertRaises(sqlite3.DatabaseError):  # a launch is reserved only for a staged dispatch
+            self.x("INSERT INTO dispatch_launch(run_id,pane_id,state,claimed_at) VALUES ('d1','p1','reserved',?)", SNAP)
+        self.stage("d1")
+        self.x("INSERT INTO dispatch_launch(run_id,pane_id,state,claimed_at) VALUES ('d1','p1','reserved',?)", SNAP)
+        self.x("UPDATE dispatch_launch SET state='sent' WHERE run_id='d1'")  # reserved -> sent
+        with self.assertRaises(sqlite3.IntegrityError):  # sent has no outgoing edge
+            self.x("UPDATE dispatch_launch SET state='uncertain' WHERE run_id='d1'")
+
+    def test_launch_release_guard(self):
+        self.stage("d1")
+        self.x("INSERT INTO dispatch_launch(run_id,pane_id,state,claimed_at) VALUES ('d1','p1','reserved',?)", SNAP)
+        self.x("UPDATE dispatch_launch SET state='uncertain' WHERE run_id='d1'")  # reserved -> uncertain
+        with self.assertRaises(sqlite3.DatabaseError):  # uncertain delete only once terminal
+            self.x("DELETE FROM dispatch_launch WHERE run_id='d1'")
+        self.x("UPDATE dispatch_launch SET state='reserved' WHERE run_id='d1'")  # uncertain -> reserved (recovery)
+        self.x("DELETE FROM dispatch_launch WHERE run_id='d1'")  # reserved deletes anytime
+
+    def test_resource_held_to_archive(self):
+        self.x("INSERT INTO dispatch_resource(run_id, resource) VALUES ('d1','repo:a')")  # draft: pinned
+        self.stage("d1")
+        with self.assertRaises(sqlite3.DatabaseError):  # claims held until archive
+            self.x("DELETE FROM dispatch_resource WHERE run_id='d1'")
+        with self.assertRaises(sqlite3.DatabaseError):  # immutable after draft
+            self.x("INSERT INTO dispatch_resource(run_id, resource) VALUES ('d1','repo:b')")
 
     def test_no_double_booking(self):
         with self.assertRaises(sqlite3.DatabaseError):

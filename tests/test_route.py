@@ -3,33 +3,21 @@ that runs it may take it (execute)."""
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+sys.path.insert(0, os.path.dirname(__file__))
+import _v21  # noqa: E402
+
 from factory import db, dispatch, scheduler
 from factory.config import Context
 
 SNAP = "2026-09-01T00:00:00Z"
 LEAD, CAPTAIN = {"pane_id": "w6X:p2", "agent": "omp", "agent_status": "done"}, {"pane_id": "w6M:p1", "agent_status": "idle"}
-
-
-def ensure_schema(c):
-    """Execution tables the briefs slice owns (contract minimum), created here so routing tests run standalone."""
-    have = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    if "dispatch_resource" not in have:
-        c.execute("CREATE TABLE dispatch_resource (run_id TEXT NOT NULL REFERENCES dispatch(run_id), "
-                  "resource TEXT NOT NULL, PRIMARY KEY (run_id, resource));")
-    if "execution_policy" not in have:
-        c.executescript("CREATE TABLE execution_policy (id INTEGER PRIMARY KEY CHECK (id=1), "
-                        "max_parallel INTEGER NOT NULL DEFAULT 2);"
-                        "INSERT INTO execution_policy(id, max_parallel) VALUES (1, 2);")
-    if "dispatch_launch" not in have:
-        c.execute("CREATE TABLE dispatch_launch (run_id TEXT PRIMARY KEY REFERENCES dispatch(run_id), "
-                  "pane_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('reserved','sent','uncertain')), "
-                  "owner_pid INTEGER, claimed_at TEXT NOT NULL, sent_at TEXT, error TEXT);")
 
 
 class Route(unittest.TestCase):
@@ -39,19 +27,20 @@ class Route(unittest.TestCase):
         (self.homes / "factory-primary" / "state").mkdir(parents=True)
         (self.homes / "fx-news-pipeline" / "state").mkdir(parents=True)
         self.c = db.connect(tmp / "f.db")
-        ensure_schema(self.c)
+        _v21.ensure_schema(self.c)
         self.cfg = SimpleNamespace(raw={}, dispatches=tmp / "dispatches")
         body = b"# Dispatch d1\n"
         (self.cfg.dispatches / "d1").mkdir(parents=True)
         (self.cfg.dispatches / "d1" / "dispatch.md").write_bytes(body)
         self.c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at,route) "
                        "VALUES ('d1','draft','[]','x',?,'fx-news-pipeline')", (SNAP,))
+        scheduler.set_claims(self.c, "d1", {"repo:o/api", "route:fx-news-pipeline"})  # pinned while draft
         self.c.execute("UPDATE dispatch SET state='staged', body_sha256=?, approved_by='u', last_actor='p' "
                        "WHERE run_id='d1'", (hashlib.sha256(body).hexdigest(),))
-        scheduler.set_claims(self.c, "d1", {"repo:o/api", "route:fx-news-pipeline"})
         patches = [mock.patch.object(dispatch, "FLEET_HOMES", self.homes),
                    mock.patch.object(dispatch, "_herdr", return_value={"result": {"panes": [LEAD, CAPTAIN]}}),
-                   mock.patch.object(dispatch, "_executor", return_value=CAPTAIN)]
+                   mock.patch.object(dispatch, "_executor", return_value=CAPTAIN),
+                   mock.patch.object(dispatch, "_safety_check")]  # freshness is tested elsewhere
         for p in patches:
             p.start()
             self.addCleanup(p.stop)

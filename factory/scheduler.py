@@ -54,12 +54,14 @@ def _parts(key: str) -> tuple[str, str]:
 
 
 def resources_conflict(a: str, b: str) -> bool:
-    """Two resource keys conflict if equal, one is ``global:*``, or they share a namespace and one path is a
-    slash ancestor/descendant of the other."""
-    if a == b or a == GLOBAL or b == GLOBAL:
+    """Two resource keys conflict if equal, one is in the `global` namespace (conflicts with everything), or they
+    share a namespace and one path is a slash ancestor/descendant of the other."""
+    if a == b:
         return True
     an, ap = _parts(a)
     bn, bp = _parts(b)
+    if an == "global" or bn == "global":
+        return True
     if an != bn:
         return False
     return ap == bp or ap.startswith(bp.rstrip("/") + "/") or bp.startswith(ap.rstrip("/") + "/")

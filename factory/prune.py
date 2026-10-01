@@ -94,10 +94,9 @@ def latest(conn, identifier: str):
     return row
 
 
-def staleness(cfg: Config, conn, snapshot, ctx: Context | None) -> str | None:
-    """None when the current verdict still holds, else why it must be redone."""
-    v = conn.execute("SELECT * FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
-                     (snapshot["issue_id"],)).fetchone()
+def verdict_staleness(cfg: Config, conn, snapshot, ctx: Context | None, v) -> str | None:
+    """Freshness of a specific verdict `v` against the current snapshot/trunk (the shared staleness rules). Used by
+    staleness() for the current verdict, and by brief-backed staging for the exact associated verdict."""
     if v is None:
         return "new"
     if v["snapshot_updated_at"] != snapshot["updated_at"] and not conn.execute(
@@ -122,19 +121,70 @@ def staleness(cfg: Config, conn, snapshot, ctx: Context | None) -> str | None:
     return None
 
 
+def staleness(cfg: Config, conn, snapshot, ctx: Context | None) -> str | None:
+    """None when the current verdict still holds, else why it must be redone."""
+    v = conn.execute("SELECT * FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
+                     (snapshot["issue_id"],)).fetchone()
+    return verdict_staleness(cfg, conn, snapshot, ctx, v)
+
+
+def _approved_head_brief(conn, brief_id: int) -> dict:
+    """An approved, current (head-of-lineage) brief: not held, not superseded by a newer published revision."""
+    row = conn.execute("SELECT * FROM work_brief WHERE id=?", (brief_id,)).fetchone()
+    if row is None:
+        raise VerdictError(f"no brief #{brief_id}")
+    if row["state"] != "approved":
+        raise VerdictError(f"brief #{brief_id} is {row['state']}, not approved")
+    if conn.execute("SELECT 1 FROM work_brief WHERE parent_id=? AND state IN ('approved','held')",
+                    (brief_id,)).fetchone():
+        raise VerdictError(f"brief #{brief_id} was superseded by a newer revision; use the current one")
+    return {"id": row["id"], "sources": json.loads(row["sources_json"])}
+
+
+def _has_association(conn, brief_id: int, issue_id: str) -> bool:
+    """True when brief_verdict already pins a current (non-superseded) verdict for this exact brief version+issue."""
+    bv = conn.execute("SELECT verdict_id FROM brief_verdict WHERE brief_id=? AND issue_id=?",
+                      (brief_id, issue_id)).fetchone()
+    if bv is None:
+        return False
+    v = conn.execute("SELECT superseded_at FROM verdict WHERE id=?", (bv["verdict_id"],)).fetchone()
+    return v is not None and v["superseded_at"] is None
+
+
+def _brief_verify_targets(cfg: Config, conn) -> list[dict]:
+    """Sources of approved, current, unconsumed briefs that still lack an exact-version verification association.
+    A new approved brief (or amendment) needs a fresh prune from its compiled intent even when the source already
+    carries a fresh generic verdict. Held briefs, superseded versions and source-drifted briefs are excluded."""
+    from . import strategy
+    out = []
+    for b in conn.execute(
+            "SELECT id FROM work_brief WHERE state='approved' AND "
+            "NOT EXISTS (SELECT 1 FROM dispatch d WHERE d.brief_id = work_brief.id) AND "
+            "NOT EXISTS (SELECT 1 FROM work_brief c WHERE c.parent_id = work_brief.id AND c.state IN ('approved','held')) "
+            "ORDER BY id"):
+        sources = json.loads(conn.execute("SELECT sources_json FROM work_brief WHERE id=?", (b["id"],)).fetchone()[0])
+        for src in sources:
+            ident = src.get("identifier")
+            if not ident:
+                continue
+            cur = conn.execute("SELECT updated_at FROM linear_latest WHERE issue_id=?", (src["issue_id"],)).fetchone()
+            if cur is not None and cur["updated_at"] != src["snapshot_updated_at"]:
+                continue  # source drifted since capture: amendment, not verification
+            if _has_association(conn, b["id"], src["issue_id"]):
+                continue
+            out.append({"brief_id": b["id"], "identifier": ident, "issue_id": src["issue_id"],
+                        "narrative": strategy.render(conn, b["id"])})
+    return out
+
+
 def gate(cfg: Config, conn) -> dict:
-    """Hermes pre-check over owned tickets: auto-verdict unmapped ones, list the rest for the agent. Approved brief
-    sources enter prune even when their Linear source is Backlog: approved local intent allows verification without
-    changing Linear state, and the agent verifies from the brief narrative, not by re-reading the source ticket."""
+    """Hermes pre-check over owned tickets: auto-verdict unmapped ones, list the rest for the agent. A brief-backed
+    source is verified from the brief narrative (never the raw Linear prose) and carries its brief_id so the agent
+    writes the exact-version association; a new approved brief/amendment forces work even when the source already
+    has a fresh generic verdict."""
     batch = cfg.raw.get("prune", {}).get("batch", 2)
-    briefs = _brief_sources(cfg, conn)
     todo, auto = [], 0
     rows = sorted(owned_in_scope(cfg, conn), key=lambda s: s["updated_at"], reverse=True)
-    seen = {s["identifier"] for s in rows}
-    for s in conn.execute("SELECT * FROM linear_latest WHERE in_scope=0 ORDER BY updated_at DESC"):
-        if s["identifier"] in briefs and s["identifier"] not in seen and owned(cfg, conn, s):
-            rows.append(s)
-            seen.add(s["identifier"])
     rows.sort(key=lambda s: json.loads(s["raw_json"])["priority"] or 5)  # stable: priority, then newest
     for s in rows:
         ctx, why = map_context(cfg, s)
@@ -152,30 +202,30 @@ def gate(cfg: Config, conn) -> dict:
             raw = json.loads(s["raw_json"])
             v = conn.execute("SELECT evidence_paths_json FROM verdict WHERE issue_id=? AND superseded_at IS NULL",
                              (s["issue_id"],)).fetchone()
-            brief = briefs.get(s["identifier"])
-            intent = brief["narrative"] if brief else (raw.get("description") or "")
             todo.append({"identifier": s["identifier"], "title": raw["title"],
                          "why": reason, "context": ctx.name, "repo": ctx.repo,
                          "mirror": str(cfg.mirror_path(ctx.repo)), "trunk_sha": trunk["sha"] if trunk else None,
                          "witnesses": ctx.witnesses, **_recheck(cfg, conn, s, ctx, reason, trunk),
-                         **({"brief_id": brief["brief_id"], "brief": brief["narrative"]} if brief else {}),
                          "learnings": learn.relevant(conn, {ctx.repo}, json.loads(v[0]) if v else (),
-                                                     f"{raw['title']}\n{intent}")})
+                                                     f"{raw['title']}\n{raw.get('description') or ''}")})
+    for t in _brief_verify_targets(cfg, conn):  # exact-version brief verification (brief_id + compiled intent)
+        if len(todo) >= batch:
+            break
+        s = conn.execute("SELECT * FROM linear_latest WHERE issue_id=?", (t["issue_id"],)).fetchone()
+        if s is None:
+            continue
+        raw = json.loads(s["raw_json"])
+        ctx, _ = map_context(cfg, s)
+        if ctx is None:
+            continue  # unmapped: handled by the generic path / needs-clarification
+        trunk = conn.execute("SELECT sha FROM repo_trunk WHERE repo=?", (ctx.repo,)).fetchone()
+        todo.append({"identifier": t["identifier"], "title": raw["title"],
+                     "why": f"needs verification for brief #{t['brief_id']}", "context": ctx.name, "repo": ctx.repo,
+                     "mirror": str(cfg.mirror_path(ctx.repo)), "trunk_sha": trunk["sha"] if trunk else None,
+                     "witnesses": ctx.witnesses, "brief_id": t["brief_id"], "brief": t["narrative"],
+                     "learnings": learn.relevant(conn, {ctx.repo}, (),
+                                                 f"{raw['title']}\n{t['narrative']}")})
     return {"wakeAgent": bool(todo), "context": {"tickets": todo, "auto_needs_clarification": auto}}
-
-
-def _brief_sources(cfg: Config, conn) -> dict:
-    """identifier -> {"brief_id", "narrative"} for approved, unconsumed brief sources. The prune agent verifies from
-    the brief's compiled intent (self-contained Markdown), never by re-reading the source ticket's Linear prose."""
-    from . import strategy
-    out = {}
-    for b in conn.execute("SELECT id, sources_json FROM work_brief WHERE state='approved' AND "
-                          "NOT EXISTS (SELECT 1 FROM dispatch d WHERE d.brief_id = work_brief.id)"):
-        narrative = strategy.render(conn, b["id"])
-        for src in json.loads(b["sources_json"]):
-            if src.get("identifier"):
-                out[src["identifier"]] = {"brief_id": b["id"], "narrative": narrative}
-    return out
 
 
 RECHECK_DIFF_CHARS = 8000
@@ -196,7 +246,6 @@ def _recheck(cfg: Config, conn, s, ctx: Context, reason: str, trunk) -> dict:
                       "evidence": json.loads(v["evidence_json"]), "trunk_sha": v["trunk_sha"]},
             "cited_diff": (diff[:RECHECK_DIFF_CHARS] + "\n… (truncated)" if len(diff) > RECHECK_DIFF_CHARS else diff)
             or "(no change to the cited files)"}
-    return {"wakeAgent": bool(todo), "context": {"tickets": todo, "auto_needs_clarification": auto}}
 
 
 def _check_evidence(cfg: Config, conn, ctx: Context | None, trunk_sha: str | None, ev: list) -> list[str]:
@@ -238,13 +287,20 @@ def _check_evidence(cfg: Config, conn, ctx: Context | None, trunk_sha: str | Non
 
 
 def put(cfg: Config, conn, identifier: str, kind: str, reason: str, evidence: list,
-        target: str | None = None, actor: str = "agent") -> int:
+        target: str | None = None, actor: str = "agent", brief_id: int | None = None) -> int:
     if kind not in KINDS:
         raise VerdictError(f"kind must be one of {', '.join(KINDS)}")
     if not reason.strip():
         raise VerdictError("reason is required")
     with db.tx(conn):
         s = latest(conn, identifier)
+        if brief_id is not None:  # exact-version verification: the verdict is written for this brief version
+            b = _approved_head_brief(conn, brief_id)
+            src = next((x for x in b["sources"] if x.get("identifier") == identifier), None)
+            if src is None:
+                raise VerdictError(f"{identifier} is not a source of brief #{brief_id}")
+            if s["updated_at"] != src["snapshot_updated_at"]:
+                raise VerdictError(f"{identifier} changed since brief #{brief_id} captured it; amend the brief")
         if not owned(cfg, conn, s):
             raise VerdictError(f"{identifier}: not the factory's concern (on linear.ignore, or its Domain project "
                                f"is not led by {cfg.linear['lead']})")
@@ -282,5 +338,8 @@ def put(cfg: Config, conn, identifier: str, kind: str, reason: str, evidence: li
             "evidence_json, evidence_paths_json, created_at, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (s["issue_id"], s["updated_at"], ctx.name if ctx else None, ctx.repo if ctx else None, trunk,
              kind, target, reason.strip(), json.dumps(evidence), json.dumps(sorted(set(paths))), now, actor))
+        if brief_id is not None:  # the exact version -> verdict association (never a generic borrowed verdict)
+            conn.execute("INSERT INTO brief_verdict(brief_id, issue_id, verdict_id) VALUES (?,?,?)",
+                         (brief_id, s["issue_id"], cur.lastrowid))
         learn.cite(conn, reason)
         return cur.lastrowid
