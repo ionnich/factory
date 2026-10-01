@@ -57,7 +57,12 @@ conservative reservations; each dispatch is one `run_id` with its own state.
 - Each `run_id` has its own launch reservation (`reserved`/`sent`/`uncertain`),
   resource claims and pane. Never `/new` a pane twice after an uncertain send;
   an uncertain launch is shown to the operator, not replayed or auto-expired.
-  Release a reservation only when definitely unsent, or terminal and executor-safe.
+  Reaching `done` or archiving never clears the pane reservation (capacity frees
+  via the `launch_active` view): a terminal `sent`/`reserved` reservation is
+  cleared only by `release_safe_terminal` after positive proof the pane is idle
+  and its real supervising home is idle, and an `uncertain` one only by explicit
+  human recovery (`factory recover-launch … --confirm-unsent --reason …`). Never
+  release or re-send a reservation yourself.
 
 ## Routes
 

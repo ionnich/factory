@@ -212,7 +212,7 @@ One-time, by hand:
   awaiting you, each with its source), relations and uses, next to the cost per verdict and per plan.
 - Backups: `factory-backup` (03:00) writes `~/.hermes/factory/backups/factory-YYYY-MM-DD.db` (newest 14), and every
   schema migration first writes `factory-pre-vN.db`. Same disk: protects against bad writes, not disk loss.
-- CLI: `factory status|overview|tickets|ticket-timeline|candidates|stage|strategy|draft|decide|ask|handoff|propose|execute|card|reconcile|archive|metrics|backup|jev`.
+- CLI: `factory status|overview|tickets|ticket-timeline|candidates|stage|strategy|draft|decide|ask|handoff|propose|execute|card|reconcile|archive|recover-launch|metrics|backup|jev`.
   `stage` and approving refresh only the repos involved (parallel fetch); the cron keeps the rest fresh.
 
 ## Strategy vs Factory
@@ -234,21 +234,42 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
 - **Immutable versions & amendments:** published briefs are immutable. An amendment creates a new draft revision
   with a parent link and reason. A dispatch already staged on a version is never silently changed; if a captured
   source changed since capture, the brief is flagged **needs-amendment** before any new dispatch — an executing
-  dispatch stays pinned to its version and shows the discrepancy rather than being overwritten. Hold/unhold is an
-  explicit readiness change, never an intent or version change. Duplicate publish/stage is refused by SQLite
-  transaction/unique constraints; empty or contradictory required fields and dependency cycles are rejected.
+  dispatch stays pinned to its version and shows the discrepancy rather than being overwritten. Publishing
+  (approve) refuses a draft whose source has drifted since capture — amend it first rather than approving stale
+  intent. Hold/unhold is an explicit readiness change, never an intent or version change. Duplicate publish/stage
+  is refused by SQLite transaction/unique constraints; empty or contradictory required fields and dependency cycles
+  are rejected.
 - **Bounds:** the proposer prepares up to **3** nonexecuting drafts/staged briefs per pass, in stable approved
-  order; execution runs at **max_parallel = 2** by default. Reservations are conservative: one dispatch per repo
-  (serial per repo initially), route exclusivity, pane exclusivity (at most one dispatch per lead/pane),
-  hierarchical resource keys, and unknown `global:*` keys serialize everything. A blocked first candidate never
-  starves an independent later one.
+  order; execution runs at **max_parallel = 2** by default. Reservations are conservative: per-repo claims
+  (`repo:OWNER/NAME`, serial per repo), route exclusivity (`route:home`), pane exclusivity (at most one dispatch
+  per lead/pane), hierarchical resource keys, and the `global:*` wildcard, which serializes against everything.
+  A blocked first candidate never starves an independent later one.
+- **Terminal safety:** completing a card or archiving a dispatch never deletes its pane reservation. Terminal
+  dispatches free **capacity** automatically (`launch_active` excludes `done`/`reconciled`/`archived`); the pane
+  reservation is released only by `release_safe_terminal`, and only after **positive** proof that the pane is idle
+  (`agent_status` idle/done) AND its real supervising home reports no active children and no open decisions. The
+  supervising home is the route lead only when its registered metadata pane matches the reserved pane, otherwise
+  the captain. A missing, malformed or busy home summary is not proof of idle — release **fails closed**.
 - **Unknown / uncertain:** an uncertain launch (a send that may or may not have landed) is never replayed or
-  auto-expired; it is shown to the operator with an explicit recovery operation. Reservations are never TTL-stolen
-  from a live or unknown executor. A fallback captain cannot reset busy work.
-- **Legacy & migration:** existing NULL-brief (legacy) dispatches finish unchanged; it is not an indefinite
-  new-dispatch bypass. Active legacy dispatches are backfilled conservatively with `global:*` claims at migration;
-  the old `one_executing` guard is dropped only in the same migration that adds the replacement guards. Execution
-  does not trigger a fresh Linear fetch solely to reconstruct a narrative.
+  auto-released. It is surfaced to the operator and cleared only through explicit manual recovery
+  (`factory recover-launch <run_id> --confirm-unsent --reason …`, whose `--actor` defaults to `user:cli`), which
+  re-verifies the pane idle and the supervising home idle before deleting. Never an automatic re-send or
+  re-release; a fallback captain cannot reset busy work, and reservations are never TTL-stolen from a live or
+  unknown executor.
+- **Legacy & migration:** the v20 → v21 migration keeps every operator answer and the historical record (it runs
+  against the automatic `factory-pre-v21.db` backup and integrity-checks). Historical legacy dispatches — draft,
+  staged, executing, done, reconciled — stay NULL-brief and receive a conservative `global:*` claim held until
+  archive, so a legacy executing dispatch still bootstraps its reservation even at `max_parallel = 1` (its own
+  backfilled `global:*` claim does not conflict with itself) while a NEW staged dispatch is refused by the same
+  admission guards (its claims conflict with the legacy `global:*` holder). This is not an indefinite new-dispatch
+  bypass: new dispatches require an approved brief. Execution does not trigger a fresh Linear fetch solely to
+  reconstruct a narrative.
+
+Exercised (behavioral smoke, not a full-suite claim): real DeepSeek grooming from cached Backlog intake; immutable
+published versions with a stable version URL and full amendment history; intent-only publish; refusal to publish a
+source-drifted draft and to stage a brief with an unmapped source; hold/unhold as explicit readiness changes; the
+chat `list` folding a full overview (briefs plus the whole source list) into a compact, valid briefs+scheduler
+summary; and a refused `hold` paste command carrying its shell-quoted reason.
 
 ## Runtime coder model selector
 
@@ -274,6 +295,11 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
   plan steps and notes are writable only while draft (triggers). Once staged it is immutable (`chflags uchg` +
   sha256). Execution is bounded, not single: `max_parallel` (default 2) caps concurrent dispatches, and repo,
   route, pane and hierarchical resource reservations may serialize further.
+- A dispatch's pane reservation is retained through `done`, `reconciled` and `archived`; capacity frees via the
+  `launch_active` view. Terminal `sent`/`reserved` reservations are cleared only by `release_safe_terminal` after
+  positive pane-idle and supervisor-home-idle proof (a missing/malformed home summary fails closed); an `uncertain`
+  launch is cleared only by explicit `recover-launch --confirm-unsent` (human `user:cli` actor + reason). Card and
+  archive never delete a reservation.
 - `execute` only from the dispatch's lead pane or a pane in herdr workspace `factory`; `handoff` resets that
   session (`/new`) first, and refuses while the lead still has crews or decisions open.
 - Card `done` needs a merged PR in the ticket's repo with green checks.
