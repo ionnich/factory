@@ -18,6 +18,22 @@ def omp_log(path: Path, started: str, usd: float, text: str = "") -> None:
         json.dumps({"message": {"usage": {"input": 10, "output": 5, "cacheRead": 100, "cost": {"total": usd}}}})]))
 
 
+def seed_executing(c, run_id: str, route: str, pane: str, claims: list[str], start: str) -> None:
+    """Stage then execute a legacy (brief_id NULL) dispatch at its own pane with real independent resource claims.
+
+    Claims are pinned while the dispatch is draft (`dispatch_resource` is immutable afterwards), and the
+    staged->executing guard re-checks capacity, pane, route and resources — so each dispatch must hold at least one
+    claim and its route, pane and resource keys must not conflict with any other live dispatch."""
+    c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) "
+              "VALUES (?,'draft','[]','x',?)", (run_id, start))
+    for res in sorted(set(claims)):
+        c.execute("INSERT INTO dispatch_resource(run_id, resource) VALUES (?,?)", (run_id, res))
+    c.execute("UPDATE dispatch SET state='staged', route=?, body_sha256=?, approved_by='u', last_actor='p' "
+              "WHERE run_id=?", (route, run_id, run_id))
+    c.execute("UPDATE dispatch SET state='executing', executor_pane=?, executing_at=?, last_actor='e' "
+              "WHERE run_id=?", (pane, start, run_id))
+
+
 class Ledger(unittest.TestCase):
     def test_counts_factory_work_only_and_attributes_it_to_its_dispatch(self):
         tmp = Path(tempfile.mkdtemp())
@@ -38,11 +54,8 @@ class Ledger(unittest.TestCase):
         omp_log(tree / "factory.jsonl", "2026-09-29T10:05:00.000Z", 1.0, "brief from factory-fleet fx-news-pipeline")
         omp_log(tree / "nix.jsonl", "2026-09-29T10:06:00.000Z", 7.0, "nix-fleet crew on FIN-9")
         c = db.connect(tmp / "f.db")
-        c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) VALUES (?,'draft','[]','x',?)",
-                  (RUN, "2026-09-29T09:00:00Z"))
-        c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' WHERE run_id=?", (RUN,))
-        c.execute("UPDATE dispatch SET state='executing', executing_at='2026-09-29T09:54:00Z', last_actor='e' "
-                  "WHERE run_id=?", (RUN,))
+        seed_executing(c, RUN, "fx-news-pipeline", "pane-captain",
+                       ["repo:Finks-ai/finks-dagster", "route:fx-news-pipeline"], "2026-09-29T09:54:00Z")
         costs.sync(c, home, sessions)
         s = costs.summary(c, 36500)
         self.assertEqual(s["by_stage"], {"prune": 0.5, "captain": 2.0, "crew": 1.0})  # no nix crew, no other cron
@@ -62,21 +75,15 @@ class Ledger(unittest.TestCase):
         h.commit()
         crew = sessions / "-.treehouse-finks-dagster-1-finks-dagster"
         crew.mkdir(parents=True)
-        # A factory crew session that names no dispatch, while two dispatches' [executing_at, done_at) windows
-        # overlap it. The one_executing guard is sequenced around (first done, then the second executing) so the
-        # rows still describe genuinely parallel work: B starts before A finishes.
+        # A factory crew session that names no dispatch, while two dispatches genuinely execute in parallel
+        # (distinct route/pane/claims, both windows open at the crew's start) — attribution is ambiguous, not
+        # fabricated onto one of them.
         omp_log(crew / "factory.jsonl", "2026-09-29T10:05:00.000Z", 1.0, "factory-fleet crew work")
         c = db.connect(tmp / "f.db")
-        for run, start, end in (("20260929-090000-fin-100", "2026-09-29T10:00:00Z", "2026-09-29T10:06:00Z"),
-                                ("20260929-091500-fin-200", "2026-09-29T10:04:00Z", None)):
-            c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) "
-                      "VALUES (?,'draft','[]','x',?)", (run, start))
-            c.execute("UPDATE dispatch SET state='staged', body_sha256=?, approved_by='u', last_actor='p' "
-                      "WHERE run_id=?", (run, run))
-            c.execute("UPDATE dispatch SET state='executing', executing_at=?, last_actor='e' WHERE run_id=?",
-                      (start, run))
-            if end:
-                c.execute("UPDATE dispatch SET state='done', done_at=?, last_actor='e' WHERE run_id=?", (end, run))
+        seed_executing(c, "20260929-090000-fin-100", "fx-news-pipeline", "pane-a",
+                       ["repo:Finks-ai/finks-dagster", "route:fx-news-pipeline"], "2026-09-29T10:00:00Z")
+        seed_executing(c, "20260929-091500-fin-200", "fx-financial-data", "pane-b",
+                       ["repo:Finks-ai/finks-portfolio-service", "route:fx-financial-data"], "2026-09-29T10:04:00Z")
         costs.sync(c, home, sessions)
         s = costs.summary(c, 36500)
         self.assertEqual(s["by_stage"], {"crew": 1.0})  # ambiguous spend stays visible as crew
