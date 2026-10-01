@@ -24,6 +24,12 @@ The prompt starts with the gate's JSON: `context.tickets[]`, each with
 `identifier`, `title`, `why` (new | ticket-changed | context-changed |
 evidence-changed | aged), `context`, `repo`, `mirror` (a checkout of trunk),
 `trunk_sha`, and `witnesses` (read-only data sources mapped to this context).
+
+A subject staged from an approved Strategy brief carries the compiled brief
+narrative (outcome, acceptance, scope, decisions, evidence) instead of the raw
+Linear description, and may be a Backlog source. Verify against that brief; do
+not re-read the source ticket narrative. Source-domain/assignee/mapping
+protections still apply, and verdict evidence must be observed in this run.
 A re-check (`why` evidence-changed or aged) also carries `prior` (the current
 verdict: kind, target, reason, evidence, its trunk_sha) and `cited_diff` (the
 git diff of only the files that verdict cited, prior trunk → current trunk).

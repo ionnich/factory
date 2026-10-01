@@ -8,7 +8,9 @@ this file only adds the factory contract.
 
 ## Mission
 
-Execute factory dispatches, one at a time, and nothing else.
+Execute factory dispatches and nothing else. Several dispatches may be in
+flight at once, bounded by the factory's `max_parallel` (default 2) and by
+conservative reservations; each dispatch is one `run_id` with its own state.
 
 - The only work source is a dispatch: `~/factory/dispatches/<run_id>/dispatch.md`,
   staged by the `factory` CLI. `factory.db` is the only authoritative tracker;
@@ -23,8 +25,11 @@ Execute factory dispatches, one at a time, and nothing else.
 
 ## Hard rules (enforced by the `factory` CLI; do not work around them)
 
-- A dispatch file is immutable. At most one dispatch executes. `factory execute`
-  only works from a pane in herdr workspace `factory`.
+- A dispatch file is immutable. Dispatch is bounded, not single: `max_parallel`
+  (default 2) plus repo, route, pane and hierarchical-resource reservations. The
+  CLI reserves a run's launch slot and resource claims atomically before it
+  sends; `factory execute` enforces the same guards and only works from a pane
+  in herdr workspace `factory`.
 - Report every card only through `factory card claim|comment|done|block`.
   `done` needs the merged PR URL in the ticket's repo with green checks.
 - **Never write to Linear**, including the finks-ddd primary write-back and
@@ -34,6 +39,25 @@ Execute factory dispatches, one at a time, and nothing else.
   the dispatch's verdict no longer holds, block the card with evidence.
 - Each dispatch starts in a fresh session. Durable facts go to `data/`, never
   only to conversation memory.
+
+## Pinned briefs and per-run state
+
+- A dispatch may be backed by an approved Strategy brief. For brief-backed runs
+  `dispatch.md` carries the compiled brief intent (title, outcome, acceptance,
+  scope, exclusions, decisions, dependencies, resources, risks, evidence) plus
+  the captured source provenance — never the raw Linear narrative. Plan and
+  verdict against the brief; do not re-read the source ticket to reconstruct
+  intent.
+- Intent, version and amendment conflicts are raised against the brief, not
+  guessed. If the brief no longer matches trunk or its sources changed since
+  capture (needs-amendment), block the card with evidence and ask the captain;
+  never silently rebase or adopt a changed version.
+- Fresh code/data evidence is still required for every card. Stale evidence
+  refuses execution and asks for a recheck/replan, never a blanket bypass.
+- Each `run_id` has its own launch reservation (`reserved`/`sent`/`uncertain`),
+  resource claims and pane. Never `/new` a pane twice after an uncertain send;
+  an uncertain launch is shown to the operator, not replayed or auto-expired.
+  Release a reservation only when definitely unsent, or terminal and executor-safe.
 
 ## Routes
 

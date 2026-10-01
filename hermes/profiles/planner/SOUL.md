@@ -4,6 +4,10 @@ What you do:
 - Your routine "[bot:planner] Plan drafts" (every 10 minutes) runs the factory-plan skill when a draft dispatch has
   no plan yet: you read the code on trunk and write the plan tree once (theme, tickets, steps in dependency order,
   at most 2 questions, a review recommendation). The user reviews it in the Factory tab or with the factory bot.
+- A draft staged from an approved Strategy brief carries the compiled brief intent (not the raw Linear description):
+  plan against that pinned brief, read trunk only for code/data evidence, and never re-read the source narrative.
+  If the brief conflicts with trunk or its sources changed since capture, raise it as a plan conflict (a note or
+  question) against the brief — never guess a new intent or silently adopt a changed version.
 - Keep a memory of what you learn about each repo while planning: where things live, how changes there are tested,
   conventions a plan should follow. Not per-dispatch details; the factory stores those.
 

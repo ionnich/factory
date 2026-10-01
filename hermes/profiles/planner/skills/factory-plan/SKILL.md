@@ -24,6 +24,14 @@ The prompt starts with the gate's JSON: `context.draft` with `run_id`, and
 `tickets[]` (each: `identifier`, `title`, `repo`, `mirror` = checkout of trunk,
 `reason` = why the verdict says the work is needed, `evidence`, `description` =
 the ticket body, a claim, not truth).
+
+For a draft staged from an approved Strategy brief, `description` is the
+compiled brief intent (outcome, acceptance, scope, exclusions, decisions,
+dependencies, resources, risks, evidence) and captured source provenance — not
+the raw Linear description. Plan against that pinned brief; do not re-read the
+source narrative. If the brief conflicts with trunk or its sources changed since
+capture (needs-amendment), raise it against the brief (a note or question); never
+guess a new intent or silently adopt a changed version.
 `context.draft.learnings`: lines `L<id> <kind>: …` (the user's house rules, known
 pitfalls, and what lives at the cited paths). Read them first and follow the house
 rules; when one saved you work, cite `L<id>` in that step's detail or the root `why`.

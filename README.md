@@ -4,8 +4,8 @@ Linear tickets in niko's domains are checked against code and data, grouped into
 factory-fleet, and written back to Linear. `~/.hermes/factory.db` is the only authoritative tracker.
 
 ```
-ingest (cron) -> prune verdicts (cron) -> draft -> plan (cron agent) -> review: your notes -> approve -> handoff
-  -> execute (factory-fleet) -> reconcile (cron) -> archive
+ingest (cron) -> Strategy (groom briefs) -> publish brief -> prune verdicts (cron) -> draft -> plan (cron agent)
+  -> review: your notes -> approve -> handoff -> execute (factory-fleet) -> reconcile (cron) -> archive
 propose (cron) drafts for `auto` repos, takes ★ on decisions whose time came, and tells you (push / digest)
 ```
 
@@ -212,14 +212,61 @@ One-time, by hand:
   awaiting you, each with its source), relations and uses, next to the cost per verdict and per plan.
 - Backups: `factory-backup` (03:00) writes `~/.hermes/factory/backups/factory-YYYY-MM-DD.db` (newest 14), and every
   schema migration first writes `factory-pre-vN.db`. Same disk: protects against bad writes, not disk loss.
-- CLI: `factory status|overview|tickets|ticket-timeline|candidates|stage|draft|decide|ask|handoff|propose|execute|card|reconcile|archive|metrics|backup|jev`.
+- CLI: `factory status|overview|tickets|ticket-timeline|candidates|stage|strategy|draft|decide|ask|handoff|propose|execute|card|reconcile|archive|metrics|backup|jev`.
   `stage` and approving refresh only the repos involved (parallel fetch); the cron keeps the rest fresh.
+
+## Strategy vs Factory
+
+**Strategy** is a separate supporting workspace (`/factory?stage=strategy`) that owns source grooming and intent;
+**Factory** owns verification, implementation planning and execution proof. The eight lifecycle workspaces
+(Tickets, Verify, Draft, Plan, Review, Run, Reconcile, Archive) are unchanged. Linear snapshots are source and
+provenance plus reconciliation ids, not the runtime instruction source for a brief-backed dispatch.
+
+- A **brief** is an approved, self-contained, versioned work brief: title, outcome, acceptance, scope, exclusions,
+  decisions, dependencies, resources, risks, evidence — plus server-captured source snapshots (issue id, repo,
+  context, route, verdict id/evidence, trunk anchors). Briefs are groomed from cached snapshots by DeepSeek, edited
+  by a human, and published as an exact version. Publishing intent does **not** approve execution, override missing
+  evidence, answer questions or mutate Linear.
+- **Approval boundary:** a human approves a brief (`factory strategy approve` or the API, actor
+  `user:dashboard` / an explicit CLI user); agents can never approve or silence-publish a brief. Approving a brief
+  authorizes verification and planning from it, not execution. Dispatching still passes the existing review
+  decision; a brief is consumed (frozen to a dispatch) at stage.
+- **Immutable versions & amendments:** published briefs are immutable. An amendment creates a new draft revision
+  with a parent link and reason. A dispatch already staged on a version is never silently changed; if a captured
+  source changed since capture, the brief is flagged **needs-amendment** before any new dispatch — an executing
+  dispatch stays pinned to its version and shows the discrepancy rather than being overwritten. Hold/unhold is an
+  explicit readiness change, never an intent or version change. Duplicate publish/stage is refused by SQLite
+  transaction/unique constraints; empty or contradictory required fields and dependency cycles are rejected.
+- **Bounds:** the proposer prepares up to **3** nonexecuting drafts/staged briefs per pass, in stable approved
+  order; execution runs at **max_parallel = 2** by default. Reservations are conservative: one dispatch per repo
+  (serial per repo initially), route exclusivity, pane exclusivity (at most one dispatch per lead/pane),
+  hierarchical resource keys, and unknown `global:*` keys serialize everything. A blocked first candidate never
+  starves an independent later one.
+- **Unknown / uncertain:** an uncertain launch (a send that may or may not have landed) is never replayed or
+  auto-expired; it is shown to the operator with an explicit recovery operation. Reservations are never TTL-stolen
+  from a live or unknown executor. A fallback captain cannot reset busy work.
+- **Legacy & migration:** existing NULL-brief (legacy) dispatches finish unchanged; it is not an indefinite
+  new-dispatch bypass. Active legacy dispatches are backfilled conservatively with `global:*` claims at migration;
+  the old `one_executing` guard is dropped only in the same migration that adds the replacement guards. Execution
+  does not trigger a fresh Linear fetch solely to reconstruct a narrative.
+
+## Runtime coder model selector
+
+- The supported selector is the `omp` harness flag `--model <provider>/<model>` (fuzzy match; `--provider` is
+  legacy). DeepSeek V4 Pro is selected as `--model deepseek/deepseek-v4-pro`.
+- The factory-fleet primary (captain) is launched by `fleet/launch-factory-primary.sh`, which passes
+  `--model "${FACTORY_PRIMARY_MODEL:-anthropic/claude-opus-5-5}"` (thinking via
+  `FACTORY_PRIMARY_THINKING`); set `FACTORY_PRIMARY_MODEL` to override the default.
+- The cron agent jobs (planner/prune/reconcile) are created by `install.sh` with
+  `--provider "${FACTORY_PROVIDER:-deepseek}" --model "${FACTORY_MODEL:-deepseek-v4-pro}"`.
+- Prose never selects a model. This implementation's code is DeepSeek; no credentials or providers are changed here.
 
 ## Invariants (in code: `factory/schema.sql` triggers + CLI checks)
 
 - A dispatch is born a draft and leaves review only approved (`approved_by` set) or rejected with a reason;
   plan steps and notes are writable only while draft (triggers). Once staged it is immutable (`chflags uchg` +
-  sha256); at most one executes.
+  sha256). Execution is bounded, not single: `max_parallel` (default 2) caps concurrent dispatches, and repo,
+  route, pane and hierarchical resource reservations may serialize further.
 - `execute` only from the dispatch's lead pane or a pane in herdr workspace `factory`; `handoff` resets that
   session (`/new`) first, and refuses while the lead still has crews or decisions open.
 - Card `done` needs a merged PR in the ticket's repo with green checks.

@@ -17,7 +17,9 @@ home's secondmate id (`.fm-secondmate-home`), used as `--actor` below.
 ~/.local/bin/factory execute <run_id> --actor <your id>
 ```
 
-`execute` refuses unless it runs in this pane, on an intact file, with nothing else executing.
+`execute` refuses unless it runs in this pane and the file is intact, and it
+refuses while a reservation it needs (repo, route, pane, or a
+hierarchical/`global:*` resource) is held by another live run.
 A refusal ends this skill: say why in one line, change nothing.
 
 **Restart.** If the state is already `executing`, you were restarted on it: `execute` re-attaches
@@ -31,6 +33,16 @@ repo, trunk SHA, the verdict and its evidence, operator notes, the reviewed **Pl
 and answered questions are binding**: they override the plan and the ticket body. Carry the plan,
 every note and every answer into each crew brief verbatim; one that cannot be followed is a block,
 not a judgement call.
+
+**Brief-backed runs.** A dispatch staged from an approved Strategy brief carries the compiled brief
+intent (outcome, acceptance, scope, exclusions, decisions, dependencies, resources, risks, evidence)
+and captured source provenance, not the raw Linear narrative. Work from the brief and the plan; do
+not re-read the source ticket to reconstruct intent. If the brief conflicts with trunk or its sources
+changed since capture (needs-amendment), block the card and tell the captain — never guess a new
+intent or silently adopt a changed version. Several dispatches may run at once (bounded by
+`max_parallel`, default 2, and by reservations); each `run_id` has its own state, launch reservation
+and resource claims, and you never touch another run's pane or reservations.
+
 **Known pitfalls** (`L<id>`, when present) come from earlier blocks in these repos: put them in
 each crew brief, and cite `L<id>` in a card comment when one saved work.
 

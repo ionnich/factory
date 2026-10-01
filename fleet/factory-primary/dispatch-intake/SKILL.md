@@ -9,6 +9,10 @@ One dispatch = a few tickets frozen in `~/factory/dispatches/<run_id>/dispatch.m
 `factory.db` is authoritative; the CLI enforces every invariant. Call it by
 absolute path: `~/.local/bin/factory`.
 
+Several dispatches may run at once (bounded by `max_parallel`, default 2, and by
+reservations). Each `run_id` has its own state, launch reservation and resource
+claims; never touch another run's pane or reservations.
+
 ## 1. Take the dispatch
 
 ```sh
@@ -16,8 +20,10 @@ absolute path: `~/.local/bin/factory`.
 ~/.local/bin/factory execute <run_id> --actor factory-primary
 ```
 
-`execute` refuses outside herdr workspace `factory`, on a changed file, or while
-another dispatch executes. A refusal ends this skill: report it, change nothing.
+`execute` refuses outside herdr workspace `factory`, on a changed file, or when a
+reservation it needs (repo, route, pane, or a hierarchical/`global:*` resource)
+is already held by another live run. A refusal ends this skill: report it,
+change nothing.
 
 **Restart.** If the state is already `executing`, the captain chose "restart the
 executor" and this is a fresh session: `execute` re-attaches this pane. Skip
@@ -31,6 +37,14 @@ SHA, the verdict and its evidence, operator notes, the reviewed **Plan** (steps
 **Known pitfalls** (`L<id>`, when present) come from earlier blocks in these
 repos: pass them on with the card, and cite `L<id>` in a card comment when one
 saved work.
+
+**Brief-backed runs.** A dispatch staged from an approved Strategy brief carries
+the compiled brief intent (outcome, acceptance, scope, exclusions, decisions,
+dependencies, resources, risks, evidence) and captured source provenance, not
+the raw Linear narrative. Work from the brief and the plan; do not re-read the
+source ticket to reconstruct intent. If the brief conflicts with trunk or its
+sources changed since capture (needs-amendment), block the card and ask the
+captain — never guess a new intent or silently adopt a changed version.
 
 The dispatch was reviewed by the captain before approval. **Operator notes and
 answered questions are binding**: the dispatch-level notes, each ticket's and
