@@ -160,5 +160,38 @@ class StageBrief(unittest.TestCase):
         self.assertEqual(out, {"run_id": "r"})
 
 
+class RecoverLaunch(unittest.TestCase):
+    def test_confirm_unsent_calls_release_unsent(self):
+        with mock.patch.object(dispatch, "release_unsent", create=True, return_value={"run_id": "r"}) as rel:
+            out = run_cli(cli.cmd_recover_launch, "cfg", "conn",
+                          a(run_id="r", confirm_unsent=True, reason="never left the queue", actor="u"))
+        rel.assert_called_once_with("cfg", "conn", "r", "u", "never left the queue")
+        self.assertEqual(out, {"run_id": "r"})
+
+    def test_missing_confirm_unsent_is_refused(self):
+        with self.assertRaises(dispatch.StageError):
+            cli.cmd_recover_launch("cfg", "conn", a(run_id="r", confirm_unsent=False, reason="x", actor="u"))
+
+
+class VerdictPutBrief(unittest.TestCase):
+    EVID = '[{"type": "linear", "ref": "FIN-1"}]'
+
+    def test_brief_id_is_passed_as_a_keyword(self):
+        with mock.patch.object(cli.prune, "put", return_value=9) as put:
+            out = run_cli(cli.cmd_verdict_put, "cfg", "conn",
+                          a(identifier="FIN-1", kind="valid", reason="r", evidence=self.EVID, target=None,
+                            actor="agent", brief_id=5))
+        put.assert_called_once_with("cfg", "conn", "FIN-1", "valid", "r", [{"type": "linear", "ref": "FIN-1"}],
+                                    target=None, actor="agent", brief_id=5)
+        self.assertEqual(out, {"verdict_id": 9})
+
+    def test_no_brief_id_omits_the_keyword(self):
+        with mock.patch.object(cli.prune, "put", return_value=9) as put:
+            cli.cmd_verdict_put("cfg", "conn", a(identifier="FIN-1", kind="valid", reason="r", evidence=self.EVID,
+                                                 target=None, actor="agent", brief_id=None))
+        put.assert_called_once_with("cfg", "conn", "FIN-1", "valid", "r", [{"type": "linear", "ref": "FIN-1"}],
+                                    target=None, actor="agent")
+
+
 if __name__ == "__main__":
     unittest.main()

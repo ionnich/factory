@@ -494,15 +494,60 @@ function Runtime({ r }) {
 }
 
 // Run, beside the selected dispatch: the pinned Strategy brief (when the run came from an approved brief), linking
-// back to Strategy, and any capacity/resource blockers the server records — not just a single-run assumption.
+// back to Strategy, and its resource claims. Nothing here is inferred: the server records both.
 function BriefLink({ d, onGo }) {
-  const b = d.brief_id, blockers = d.blockers || d.resource_blockers || [];
-  if (!b && !blockers.length) return null;
+  const b = d.brief_id, resources = d.resources || [];
+  if (!b && !resources.length) return null;
   return (
     <div className="fx-stack-v fx-line">
       {b ? <div className="fx-row"><span className="fx-hint">Pinned brief</span>
         <button className="fx-link-btn" onClick={() => onGo({ stage: "strategy", brief: b }, { jump: true })}>#{b} ›</button></div> : null}
-      {blockers.length ? <div className="fx-err">Blocked: {blockers.join("; ")}</div> : null}
+      {resources.length ? <div className="fx-hint">Claims: {resources.join(", ")}</div> : null}
+    </div>
+  );
+}
+
+// Run: the launch reservation (reserved|sent|uncertain), visible so an uncertain send is never silently replayed. An
+// uncertain or reserved launch offers an explicit recovery — a human attests the send never landed and names why —
+// which releases it for a normal handoff.
+function LaunchRecovery({ d, onDone }) {
+  const l = d.launch;
+  const [reason, setReason] = useState("");
+  const [armed, setArmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  if (!l) return null;
+  const uncertain = l.state === "uncertain";
+  const releasable = l.state === "reserved" || l.state === "uncertain";
+  const go = async () => {
+    if (!armed) { setArmed(true); return; }
+    if (!reason.trim()) return;
+    setBusy(true); setErr(null);
+    try {
+      const r = await post(`/dispatch/${encodeURIComponent(d.run_id)}/release-unsent`,
+                           { confirm_unsent: true, reason: reason.trim() });
+      setBusy(false); setArmed(false); setReason("");
+      onDone(r, null, `Released ${d.run_id}'s ${l.state} launch`);
+    } catch (e) {
+      setBusy(false); setErr(errText(e));
+    }
+  };
+  return (
+    <div className={`fx-stack-v fx-line${uncertain ? " fx-sw" : ""}`}>
+      <div className="fx-row"><Tone tone={uncertain ? "red" : l.state === "sent" ? "blue" : "amber"}>launch {l.state}</Tone>
+        <span className="fx-hint">pane {l.pane_id || "—"}</span></div>
+      {uncertain ? <div className="fx-err">The send to pane {l.pane_id} is uncertain and is not auto-replayed.</div> : null}
+      {l.error ? <Fold className="fx-hint" head="Send error: " text={l.error} /> : null}
+      {releasable ? (armed ? (
+        <div className="fx-row">
+          <Input autoFocus value={reason} maxLength={2000} disabled={busy} placeholder="Reason: why is the send known unsent?"
+                 onChange={(e) => setReason(e.target.value)} />
+          <Button size="sm" disabled={busy || !reason.trim()} onClick={go}>{busy ? "Releasing…" : "Confirm release"}</Button>
+        </div>
+      ) : (
+        <div><Button size="sm" ghost onClick={go}>Release unsent launch</Button></div>
+      )) : null}
+      {err ? <ActErr err={err} /> : null}
     </div>
   );
 }
@@ -913,7 +958,7 @@ function FactoryPage() {
     plan: () => <><JobLine jobs={data.jobs} name="[bot:planner] Plan drafts" of="draft" />{table("plan", planning)}</>,
     review: () => table("review", plan),
     run: () => <>{deckOf("run")}<ExecutorDeliveries items={deliveries} onDone={done} />
-      {table("run", (d) => <><Runtime r={d.runtime} /><BriefLink d={d} onGo={go} />{plan(d)}</>)}</>,
+      {table("run", (d) => <><Runtime r={d.runtime} /><LaunchRecovery d={d} onDone={done} /><BriefLink d={d} onGo={go} />{plan(d)}</>)}</>,
     strategy: () => <StrategyTab data={data} view={strat} onViewChange={setStrategy} onDone={done} onNavigate={go} />,
     reconcile: () => <><JobLine jobs={data.jobs} name="factory-reconcile" of="dispatch" />{deckOf("reconcile")}
       <Writebacks rows={data.writebacks || []} onGo={go} />{table("reconcile", plan)}</>,

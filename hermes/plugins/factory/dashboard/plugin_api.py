@@ -297,3 +297,18 @@ async def strategy_unhold(brief_id: int):
 @router.post("/strategy/{brief_id}/stage")
 async def strategy_stage(brief_id: int):
     return await factory("stage", "--brief", str(brief_id), "--actor", "user:dashboard", timeout=120)
+
+
+class ReleaseUnsent(BaseModel):
+    confirm_unsent: bool
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/dispatch/{run_id}/release-unsent")
+async def release_unsent(run_id: str, body: ReleaseUnsent):
+    # A human explicitly attests the send never landed; there is no automatic replay. `release_unsent` still verifies
+    # the stored pane is idle before releasing, and refuses executing/sent/busy/unknown launches.
+    if not body.confirm_unsent:
+        raise HTTPException(422, "confirm_unsent must be true (a human attests the send never landed)")
+    return await factory("recover-launch", run_id_ok(run_id), "--confirm-unsent",
+                         f"--reason={text_ok(body.reason, 'reason')}", "--actor", "user:dashboard")

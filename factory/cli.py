@@ -366,6 +366,8 @@ def dispatch_status(cfg, conn, run_id):
     body = base.read_bytes() if base.exists() else None
     rd = decide.open_review(conn, run_id)
     due = rd["due_at"] if rd else None
+    launch = conn.execute("SELECT pane_id, state, error, claimed_at, sent_at FROM dispatch_launch WHERE run_id=?",
+                          (run_id,)).fetchone()
     return {
         **dict(d),
         "auto": d["drafted_by"] == dispatch.PROPOSE,
@@ -383,6 +385,10 @@ def dispatch_status(cfg, conn, run_id):
         "executor_deliveries": decide.executor_deliveries(conn, run_id),
         # Run tab: last real activity, blocker and next step, from the database alone (no pane check)
         "runtime": dispatch.runtime(conn, d) if d["state"] in ("staged", "executing") else None,
+        # the launch reservation (reserved|sent|uncertain) and the resource claims this dispatch holds, from the DB
+        "launch": dict(launch) if launch else None,
+        "resources": [r[0] for r in conn.execute(
+            "SELECT resource FROM dispatch_resource WHERE run_id=? ORDER BY resource", (run_id,))],
         "writes": reconcile.show(conn, run_id)["writes"],  # what reconcile wrote (or holds) in Linear
         # what the executor reported per card: step progress ("FIN-1/2 done") and the done summary, for the outline
         "events": [dict(r) for r in conn.execute(
@@ -612,7 +618,10 @@ def cmd_verdict_put(cfg, conn, a):
         evidence = json.loads(src if src.startswith("[") else sys.stdin.read() if src == "-" else open(src).read())
     except (json.JSONDecodeError, OSError) as e:
         raise prune.VerdictError(f"evidence: {e}") from None
-    vid = prune.put(cfg, conn, a.identifier, a.kind, a.reason, evidence, target=a.target, actor=a.actor)
+    kwargs = {"target": a.target, "actor": a.actor}
+    if a.brief_id is not None:  # binds the verdict to an exact approved brief version (brief_verdict)
+        kwargs["brief_id"] = a.brief_id
+    vid = prune.put(cfg, conn, a.identifier, a.kind, a.reason, evidence, **kwargs)
     out({"verdict_id": vid})
 
 
@@ -646,6 +655,15 @@ def cmd_strategy(cfg, conn, a):
     if a.scmd == "unhold":
         return out(strategy.unhold(cfg, conn, a.brief_id, a.actor))
     raise SystemExit(f"unknown strategy command {a.scmd}")
+
+
+def cmd_recover_launch(cfg, conn, a):
+    """Explicit, human-confirmed recovery for a launch that may not have been sent. The `--confirm-unsent` flag is a
+    person attesting the send never landed (no automatic replay); `dispatch.release_unsent` still verifies the pane
+    is idle before releasing. An executing, sent, busy or unknown launch is refused."""
+    if not a.confirm_unsent:
+        raise dispatch.StageError("recover-launch needs --confirm-unsent (a human attesting the send never landed)")
+    out(dispatch.release_unsent(cfg, conn, a.run_id, a.actor, a.reason))
 
 
 def main(argv=None):
@@ -684,6 +702,12 @@ def main(argv=None):
     s = sub.add_parser("handoff", help="reset the executor's omp session (/new) and tell it to run the dispatch")
     s.add_argument("run_id")
     s.set_defaults(fn=cmd_handoff)
+    s = sub.add_parser("recover-launch", help="explicit recovery: release a staged launch known to be unsent/uncertain")
+    s.add_argument("run_id")
+    s.add_argument("--confirm-unsent", action="store_true", help="a human attests the send never landed (no auto replay)")
+    s.add_argument("--reason", required=True, help="why the send is known unsent")
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_recover_launch)
     s = sub.add_parser("propose", help="cron: draft the top `auto` candidate, hand off approved dispatches, take ★ on "
                                         "decisions whose time came, and tell the user (push / digest)")
     s.add_argument("--announce", action="store_true", help="print only the messages for the user (cron delivery)")
@@ -793,6 +817,7 @@ def main(argv=None):
     s.add_argument("--target")
     s.add_argument("--reason", required=True)
     s.add_argument("--evidence", required=True, help="inline JSON list, a path to one, or - for stdin")
+    s.add_argument("--brief", type=int, dest="brief_id", help="bind the verdict to this exact approved brief version")
     s.add_argument("--actor", default="agent:factory-prune")
     s.set_defaults(fn=cmd_verdict_put)
     s = sub.add_parser("witness", help="read-only query against a configured witness (logged)")
@@ -806,7 +831,8 @@ def main(argv=None):
     s2.set_defaults(fn=cmd_jev)
     st = sub.add_parser("strategy", help="source grooming and approved, versioned work briefs (a supporting "
                         "workspace, separate from the lifecycle stages)").add_subparsers(dest="scmd", required=True)
-    s = st.add_parser("list", help="briefs, source list, queue and capacity (JSON; no model or network)")
+    s = st.add_parser("list", help="brief summaries, the source list, policy and active dispatches (JSON; no model "
+                       "or network)")
     s.set_defaults(fn=cmd_strategy)
     s = st.add_parser("show", help="one brief: full body and captured sources")
     s.add_argument("brief_id", type=int)
