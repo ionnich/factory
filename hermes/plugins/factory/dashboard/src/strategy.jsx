@@ -133,6 +133,10 @@ function SourceRow({ s, checked, onToggle }) {
   const [pLabel, pTone] = priorityOf(s.priority);
   return (
     <div className="fx-trow">
+      <label className="fx-check-target">
+        <input type="checkbox" className="fx-pick" checked={checked} onChange={onToggle}
+               aria-label={`Select ${s.identifier}`} />
+      </label>
       <div className="fx-grow">
         <div className="fx-row fx-row-title">
           <div className="fx-ttitle clamp">{s.title}</div>
@@ -141,13 +145,7 @@ function SourceRow({ s, checked, onToggle }) {
             {s.state ? <Tone tone="gray">{s.state}</Tone> : null}
           </span>
         </div>
-        <div className="fx-row">
-          <label className="fx-check-target">
-            <input type="checkbox" className="fx-pick" checked={checked} onChange={onToggle}
-                   aria-label={`Select ${s.identifier}`} />
-          </label>
-          {s.reason ? <span className="fx-hint">{s.reason}</span> : null}
-        </div>
+        {s.reason ? <div className="fx-hint">{s.reason}</div> : null}
         {!s.verdict ? <div className="fx-hint">Not checked</div>
           : s.stale ? <div className="fx-hint">Check outdated · {s.stale} · prior verdict {s.verdict}</div>
           : <div className="fx-hint">verdict {s.verdict}{s.verdict_at ? ` · checked ${ago(s.verdict_at)}` : ""}</div>}
