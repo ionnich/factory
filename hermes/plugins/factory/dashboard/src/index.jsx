@@ -1,6 +1,6 @@
 // Factory tab, mobile first. The header: Needs you (every decision or undelivered executor answer waiting on a person,
-// each line a link to its stage and the thing itself), job health, the live refresh. Under it one tab per lifecycle
-// stage and, apart, Learn and Costs; only the open one is on the page, with all of its own content:
+// each line a link to its stage and the thing itself), job health, and live refresh. The primary workspaces are
+// Assembly, Strategy, Learn, and Costs. Assembly alone carries the connected lifecycle:
 //   Tickets: the whole ticket ledger and each ticket's audit trail (tickets.jsx), when Linear was last ingested.
 //   Verify: tickets waiting on verification or an answer; the verification job's last run.
 //   Draft: ready tickets to draft, drafts not offered to a planner yet, blocked tickets' retry questions.
@@ -9,7 +9,7 @@
 //   Run: executor questions, undelivered answers, the server's runtime read, the plan read-only.
 //   Reconcile: done dispatches, every unsettled Linear write, held writes' questions.
 //   Archive: every archived dispatch, rejected ones too (GET /archive), its transitions and plan.
-//   Learn: learnings, and proposed ones to keep or drop. Costs: throughput and agent spend.
+// Pull-request reviews are a Needs you inbox, not a workspace or lifecycle stage.
 // The server's `phase` puts each dispatch, ticket and decision in its stage; nothing here guesses one. Where you are is
 // the URL (?stage=, run=, decision=, ticket=): each deliberate move is a history entry and Back returns to it; a stage
 // keeps its selection, ticket filters and scroll while you are elsewhere. A refresh never moves, reselects or unfolds.
@@ -21,6 +21,7 @@ import { Plan, Quick } from "./plan.jsx";
 import { Jev } from "./jev.jsx";
 import { TicketsTab } from "./tickets.jsx";
 import { StrategyTab, bumpNavToken } from "./strategy.jsx";
+import { PRReviews, usePRReviews } from "./prs.jsx";
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect, useCallback, useRef, useMemo } = SDK.hooks;
@@ -394,13 +395,13 @@ const Writes = ({ writes }) => (writes.length ? <ul className="fx-writes">{write
 // ---- lifecycle: one workspace per stage, dispatches as rows in an engineering table -------------------------------
 const STAGES = [["tickets", "Tickets"], ["verify", "Verify"], ["draft", "Draft"], ["plan", "Plan"], ["review", "Review"],
                 ["run", "Run"], ["reconcile", "Reconcile"], ["archive", "Archive"]];
-const SIDE = [["strategy", "Strategy"], ["learn", "Learn"], ["costs", "Costs"]];  // supporting views beside the stages, not stages
-const LABEL = Object.fromEntries([...STAGES, ...SIDE]);
-const IDS = new Set(Object.keys(LABEL));
+const SIDE = [["strategy", "Strategy"], ["learn", "Learn"], ["costs", "Costs"]];
+const WORKSPACES = [["assembly", "Assembly"], ...SIDE];
+const LABEL = Object.fromEntries([...STAGES, ...SIDE, ["prs", "PR reviews"]]);
+const ASSEMBLY_IDS = new Set(STAGES.map(([id]) => id));
+const IDS = new Set([...ASSEMBLY_IDS, ...SIDE.map(([id]) => id), "prs"]);
 const TICKET_MODES = ["tickets", "verify", "draft"];  // tickets.jsx workspaces, each with its view kept by the page
 const BLANK = { q: "", filter: "all", picked: [], open: null, busy: false, err: null };
-// What a stage's tab counts (the server's lifecycle.counts): tickets before they are grouped, dispatches after.
-const unit = (id, n) => (id === "tickets" || id === "verify" ? plural(n, "ticket") : plural(n, "dispatch", "dispatches"));
 // A stage's dispatches by the server's phase; Archive's are every archived one, from GET /archive (the overview carries
 // only the last five). Null: not loaded, or not a dispatch stage.
 const stageRows = (data, arch, stage) => (stage === "archive" ? arch?.rows || null
@@ -658,7 +659,7 @@ function Dispatches({ stage, rows, byRun, titles, needsOf, sel, onGo, detail }) 
   const cur = sel && rows.find((d) => d.run_id === sel);
   const now = sel && !cur && byRun[sel]?.phase !== stage ? byRun[sel] : null;
   return (<>
-    <div className="fx-k fx-line">{plural(rows.length, "dispatch", "dispatches")} {HEAD[stage]}</div>
+    <div className="fx-k fx-line">{HEAD[stage]}</div>
     {rows.length ? <StageTable dispatches={rows} titles={titles} needsOf={needsOf} selected={cur}
                                onSelect={(run) => run !== sel && onGo({ stage, run })} /> : null}
     {cur ? detail(cur) : sel ? (
@@ -743,10 +744,9 @@ function Throughput() {
 const STAGE_COST = { captain: "Fleet captain (routing)", secondmate: "Domain leads", crew: "Crews (code)", prune: "Verification",
                      plan: "Planning", reconcile: "Write-back", chat: "Chat" };
 
-// ---- page ------------------------------------------------------------------------------------------------------
 // A tab strip: arrows, Home and End move the focus, Enter or Space opens the tab (so moving along never piles up
 // history entries), and one Tab key press reaches it: the open tab, else the first.
-function Tabs({ label, items, current, counts, onPick }) {
+function Tabs({ label, items, current, onPick }) {
   const keys = (e) => {
     const tabs = [...e.currentTarget.querySelectorAll('[role="tab"]')], i = tabs.indexOf(document.activeElement);
     const j = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
@@ -758,13 +758,12 @@ function Tabs({ label, items, current, counts, onPick }) {
   return (
     <div role="tablist" aria-label={label} className="fx-tabs" onKeyDown={keys}>
       {items.map(([id, name], k) => {
-        const on = id === current, n = counts?.[id];
+        const on = id === current;
         return (
           <button key={id} id={`fx-tab-${id}`} role="tab" aria-selected={on} aria-controls={on ? "fx-pane" : undefined}
                   tabIndex={on || (!here && k === 0) ? 0 : -1} className={`fx-stage-tab${on ? " on" : ""}`}
-                  aria-label={n == null ? undefined : `${name}, ${unit(id, n)}`} title={n == null ? undefined : unit(id, n)}
                   onClick={() => on || onPick(id)}>
-            {name}{n == null ? null : <span className="fx-count">{n}</span>}
+            {name}
           </button>
         );
       })}
@@ -772,42 +771,53 @@ function Tabs({ label, items, current, counts, onPick }) {
   );
 }
 
-// Needs you: everything waiting on a person, folded to one line; open, each line goes to its stage and the thing itself.
-function NeedsYou({ items, answers, onGo }) {
-  const ref = useRef(null);
-  const n = items.length;
-  const pick = (t) => { ref.current.open = false; onGo(t); };
+// Needs you is controlled by the page so data refreshes and workspace changes cannot reopen or close it. Pull requests
+// stay a separate inbox: an unavailable fetch is unknown, never displayed as zero.
+function NeedsYou({ items, decisions, answers, prs, prLoading, prError, open, onToggle, onGo }) {
+  const prKnown = prs != null;
+  const hasPRInbox = (prKnown && prs > 0) || prError;
+  const hasAnything = items.length || answers || (prKnown && prs) || prError;
+  const prSummary = prError ? "PRs unknown" : prKnown ? plural(prs, "PR") : prLoading ? "PRs loading" : "PRs unknown";
   return (
-    <details className="fx-needs-menu" ref={ref}>
-      <summary className={`fx-hello${n ? " you" : ""}`}>
-        {n ? `${plural(n, "thing")} need${n === 1 ? "s" : ""} you`
-          : answers ? `${plural(answers, "ticket")} need${answers === 1 ? "s" : ""} an answer in Linear` : "All clear"}
+    <details className="fx-needs fx-needs-menu" open={open} onToggle={(e) => onToggle(e.currentTarget.open)}>
+      <summary className={`fx-hello fx-needs-summary${hasAnything ? " you" : ""}`}>
+        <span>Needs you</span>
+        <span className="fx-hint">{plural(decisions, "decision")} · {plural(answers, "Linear-ticket answer")} · {prSummary}</span>
       </summary>
       <ul className="fx-needs-list">
         {items.map((t) => (
-          <li key={t.key}><button type="button" className="fx-need" onClick={() => pick(t)}>
+          <li key={t.key}><button type="button" className="fx-need" onClick={() => onGo(t)}>
             <span className="fx-row"><Tone tone={t.tone}>{t.kind}</Tone><span className="fx-hint">{LABEL[t.stage]} ›</span></span>
             <span>{clip(t.text, 140)}</span>
           </button></li>
         ))}
         {answers ? (
-          <li><button type="button" className="fx-need" onClick={() => pick({ stage: "verify", filter: "answer" })}>
+          <li><button type="button" className="fx-need" onClick={() => onGo({ stage: "verify", filter: "answer" })}>
             <span className="fx-row"><Tone tone="amber">Answer in Linear</Tone><span className="fx-hint">Verify ›</span></span>
             <span>{plural(answers, "ticket")} waiting on an answer in Linear</span>
           </button></li>
         ) : null}
-        {n || answers ? null : <li className="fx-hint">Nothing waits on you. A new question shows up here and in its stage.</li>}
+        {hasPRInbox ? (
+          <li><button type="button" className="fx-need" onClick={() => onGo({ stage: "prs" })}>
+            <span className="fx-row"><Tone tone={prError ? "red" : "amber"}>PR reviews</Tone><span className="fx-hint">Inbox ›</span></span>
+            <span>{prError ? "Pull-request reviews could not be loaded" : `${plural(prs, "pull request")} waiting for your review`}</span>
+          </button></li>
+        ) : null}
+        {!hasAnything ? <li className="fx-hint">Nothing waits on you. A new question shows up here and in its stage.</li>
+          : prLoading && !items.length && !answers ? <li className="fx-hint">Checking pull-request reviews…</li> : null}
       </ul>
     </details>
   );
 }
 
 function FactoryPage() {
+  const prState = usePRReviews();
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loadedAt, setLoadedAt] = useState(null);
   const [live, setLive] = useState(false);
   const [toast, setToast] = useState(null);
+  const [needsOpen, setNeedsOpen] = useState(false);  // full page loads closed; only the disclosure toggle changes this
   const [loc, setLoc] = useState(readLoc);  // where the page is: stage, its selected dispatch, a target decision, open ticket
   const [nav, setNav] = useState(0);        // counts deliberate moves and Back/Forward; a refresh never changes it
   // tickets.jsx's views, one per ticket workspace, kept here so each outlives leaving it (a pending draft included)
@@ -826,7 +836,11 @@ function FactoryPage() {
   const setStrategy = (next) => setStrat((s) => ({ ...s, ...(typeof next === "function" ? next(s) : next) }));
   const [arch, setArch] = useState({ rows: null, err: null });  // GET /archive, kept while elsewhere
   const root = useRef(null);
-  const strip = useRef(null);
+  const workspaceStrip = useRef(null);
+  const lifecycleStrip = useRef(null);
+  const assemblyStage = useRef(ASSEMBLY_IDS.has(loc.stage) ? loc.stage : "tickets");
+  const prReturn = useRef(null);
+  if (ASSEMBLY_IDS.has(loc.stage)) assemblyStage.current = loc.stage;
   const mem = useRef({});                 // per stage, while elsewhere: its selected dispatch and scroll
   const after = useRef({ focus: true });  // what the next navigation's render does: focus its target, restore a scroll
   const canon = useRef(false);
@@ -903,12 +917,14 @@ function FactoryPage() {
     if (el) return void el.focus();
     if (a.scroll != null) return settle(root.current, a.scroll);
   }, [nav, !data]);
-  useEffect(() => {  // the open tab fully in view (nearest edge), scrolling the strip only, never the page
-    const s = strip.current, t = s?.querySelector(".on");
-    if (!t) return;
-    const a = s.getBoundingClientRect(), b = t.getBoundingClientRect();
-    if (b.left < a.left) s.scrollLeft -= a.left - b.left + 4;
-    else if (b.right > a.right) s.scrollLeft += b.right - a.right + 4;
+  useEffect(() => {  // each open tab fully in view (nearest edge), scrolling its strip only, never the page
+    [workspaceStrip.current, lifecycleStrip.current].forEach((s) => {
+      const t = s?.querySelector(".on");
+      if (!t) return;
+      const a = s.getBoundingClientRect(), b = t.getBoundingClientRect();
+      if (b.left < a.left) s.scrollLeft -= a.left - b.left + 4;
+      else if (b.right > a.right) s.scrollLeft += b.right - a.right + 4;
+    });
   }, [loc.stage, !data]);
 
   if (!data) return <div className="fx">{error ? <div className="fx-err">{error}</div> : <div className="fx-hint">Loading…</div>}</div>;
@@ -945,6 +961,7 @@ function FactoryPage() {
   };
   const jumpTo = (t) => {  // a Needs you line; the Linear answers line opens Verify on that filter
     if (t.filter) setView[t.stage]((v) => ({ ...v, filter: t.filter, q: "" }));
+    if (t.stage === "prs" && latest.current.loc.stage !== "prs") prReturn.current = latest.current.loc;
     go(t, { jump: true });
   };
   const done = (r, d, msg) => {  // a toast and a refresh; where the page is stays the user's
@@ -1039,6 +1056,8 @@ function FactoryPage() {
         </details>
       ) : null}</>,
     costs: () => <Throughput />,
+    prs: () => <PRReviews state={prState} onNavigate={go}
+      onBack={() => go(prReturn.current || { stage: assemblyStage.current })} />,
   };
 
   const why = { asks: data.asks || {}, reviews: reviewOf };  // why.jsx threads, in the plan and on every decision
@@ -1048,19 +1067,35 @@ function FactoryPage() {
     </button>
     {error ? <div className="fx-err" role="alert">Last refresh failed: {error}. Showing last loaded decisions; refresh before acting.</div> : null}
   </>;
+  const isAssembly = ASSEMBLY_IDS.has(loc.stage);
+  const workspace = isAssembly ? "assembly" : SIDE.some(([id]) => id === loc.stage) ? loc.stage : null;
+  const stageCount = isAssembly ? data.lifecycle?.counts?.[loc.stage] : null;
+  const paneLabel = isAssembly ? `fx-tab-${loc.stage}` : workspace ? `fx-tab-${workspace}` : undefined;
   return (
     <WhyContext.Provider value={why}>
     <div className="fx" ref={root}>
       <Toast toast={toast} />
       <header className="fx-head">
-        <NeedsYou items={targets} answers={data.ticket_counts?.answer || 0} onGo={jumpTo} />
+        <NeedsYou items={targets} decisions={waiting.length} answers={data.ticket_counts?.answer || 0}
+          prs={prState.error ? null : prState.data?.count} prLoading={prState.loading} prError={prState.error}
+          open={needsOpen} onToggle={setNeedsOpen} onGo={jumpTo} />
         <div className="fx-row fx-hint"><Health jobs={data.jobs} /><span>·</span>{connection}</div>
       </header>
-      <nav className="fx-stage-tabs" ref={strip} aria-label="Factory views">
-        <Tabs label="Lifecycle stages" items={STAGES} current={loc.stage} counts={data.lifecycle?.counts} onPick={(id) => go({ stage: id })} />
-        <Tabs label="Supporting views" items={SIDE} current={loc.stage} onPick={(id) => go({ stage: id })} />
+      <nav className="fx-workspaces" ref={workspaceStrip} aria-label="Factory workspaces">
+        <Tabs label="Factory workspaces" items={WORKSPACES} current={workspace}
+          onPick={(id) => go({ stage: id === "assembly" ? assemblyStage.current : id })} />
       </nav>
-      <section key={loc.stage} id="fx-pane" className="fx-pane" role="tabpanel" aria-labelledby={`fx-tab-${loc.stage}`} tabIndex={0}>
+      {isAssembly ? <>
+        <div className="fx-workspace-heading">
+          <span className="fx-k">Assembly</span>
+          <h1>{LABEL[loc.stage]}{stageCount == null ? null : <span className="fx-count">{stageCount}</span>}</h1>
+        </div>
+        <nav className="fx-lifecycle" ref={lifecycleStrip} aria-label="Assembly lifecycle">
+          <Tabs label="Assembly lifecycle" items={STAGES} current={loc.stage} onPick={(id) => go({ stage: id })} />
+        </nav>
+      </> : null}
+      <section key={loc.stage} id="fx-pane" className="fx-pane" role={paneLabel ? "tabpanel" : undefined}
+               aria-labelledby={paneLabel} aria-label={paneLabel ? undefined : LABEL[loc.stage]} tabIndex={0}>
         {PANES[loc.stage]()}
       </section>
     </div>
