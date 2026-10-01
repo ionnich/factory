@@ -61,17 +61,28 @@ def associate(conn, brief_id, issue_id, verdict_id):
                  (brief_id, issue_id, verdict_id))
 
 
-def seed_dispatch(c, run_id, state="draft", brief_id=None, route=None):
-    """Insert a dispatch (born draft); stage it when asked. Claims/launch are the caller's job (guards)."""
+def seed_dispatch(c, run_id, state="draft", brief_id=None, route=None, resources=("global:*",), pane="pane-1"):
+    """Insert a dispatch (born draft) and reach `state` (draft|staged|executing) through legal transitions: claims
+    pinned while draft, stage, then a reserved matching launch before executing (satisfies the real admission guards).
+    """
     c.execute("INSERT INTO dispatch(run_id,state,repos_json,last_actor,created_at) "
               "VALUES (?,'draft','[{\"repo\":\"o/api\",\"trunk_sha\":\"s\"}]','x',?)", (run_id, SNAP))
     if brief_id is not None:
         c.execute("UPDATE dispatch SET brief_id=? WHERE run_id=?", (brief_id, run_id))
     if route:
         c.execute("UPDATE dispatch SET route=? WHERE run_id=?", (route, run_id))
-    if state != "draft":
-        c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' WHERE run_id=?",
-                  (run_id,))
+    if state == "draft":
+        return run_id
+    set_claims(c, run_id, resources)  # pinned while draft
+    c.execute("UPDATE dispatch SET state='staged', body_sha256='h', approved_by='u', last_actor='p' WHERE run_id=?",
+              (run_id,))
+    if state == "staged":
+        return run_id
+    c.execute("INSERT INTO dispatch_launch(run_id, pane_id, state, claimed_at) VALUES (?,?,?,?)",
+              (run_id, pane, "reserved", SNAP))
+    c.execute("UPDATE dispatch SET state='executing', executor_pane=?, executing_at=? WHERE run_id=?",
+              (pane, SNAP, run_id))
+    return run_id
 
 
 def set_claims(c, run_id, resources):

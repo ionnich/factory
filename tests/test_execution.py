@@ -103,20 +103,29 @@ class Admission(unittest.TestCase):
         self.c.execute("UPDATE execution_policy SET max_parallel=1")
         self.staged("d1", {"repo:a", "route:fx-a"})
         self.staged("d2", {"repo:b", "route:fx-b"})
-        c2 = db.connect(self.path)
-        self.addCleanup(c2.close)
-        out = []
+        barrier = threading.Barrier(2)
+        results, errors = [], []
 
-        def worker(conn, run, pane):
-            out.append((run, scheduler.reserve_if_free(conn, run, pane, os.getpid())))
+        def worker(run, pane):
+            barrier.wait()  # both threads ready before either opens a connection
+            conn = None
+            try:
+                conn = db.connect(self.path)  # each worker owns its connection (sqlite forbids cross-thread sharing)
+                results.append((run, scheduler.reserve_if_free(conn, run, pane, os.getpid())))
+            except Exception as e:  # propagate thread failures, never swallow
+                errors.append(e)
+            finally:
+                if conn is not None:
+                    conn.close()
 
-        threads = [threading.Thread(target=worker, args=(conn, run, pane))
-                   for conn, run, pane in ((self.c, "d1", "p1"), (c2, "d2", "p2"))]
+        threads = [threading.Thread(target=worker, args=(run, pane)) for run, pane in (("d1", "p1"), ("d2", "p2"))]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-        self.assertEqual(len([r for r in out if r[1] is None]), 1)
+        self.assertEqual(errors, [])
+        self.assertEqual(len([r for r in results if r[1] is None]), 1)  # exactly one winner
+        self.assertEqual(len([r for r in results if r[1] is not None]), 1)  # the other rejected by capacity
         self.assertEqual(self.c.execute("SELECT count(*) FROM dispatch_launch").fetchone()[0], 1)
 
 
@@ -322,21 +331,31 @@ class ExecuteGuard(unittest.TestCase):
         self.assertEqual(self.c.execute("SELECT state FROM dispatch").fetchone()[0], "executing")
 
     def test_resume_refuses_another_dispatchs_pane(self):
-        _helpers.seed_dispatch(self.c, "d1", "executing")
-        _helpers.seed_dispatch(self.c, "d2", "staged")
+        _helpers.seed_dispatch(self.c, "d1", "executing", resources={"repo:a", "route:fx-a"}, pane="pane-1")
+        _helpers.seed_dispatch(self.c, "d2", "staged", resources={"repo:b", "route:fx-b"})
         self.c.execute("INSERT INTO dispatch_launch(run_id,pane_id,state,claimed_at) VALUES ('d2','w1:p1','sent',?)",
                        (SNAP,))
         pane = {"pane_id": "w1:p1", "agent": "omp", "agent_status": "idle"}
         with mock.patch.object(dispatch, "_target", return_value=(pane, "factory-primary")), \
-                self.assertRaisesRegex(dispatch.StageError, "reserved for dispatch d2"):
+                mock.patch.object(dispatch, "_send") as send, \
+                mock.patch.object(dispatch, "_herdr") as herdr, \
+                self.assertRaises(dispatch.StageError):
             dispatch.resume(SimpleNamespace(raw={}), self.c, "d1")
+        send.assert_not_called()  # no reset, no steal of the other run's pane
+        herdr.assert_not_called()
+        self.assertEqual(self.c.execute("SELECT executor_pane FROM dispatch WHERE run_id='d1'").fetchone()[0],
+                         "pane-1")
 
     def test_resume_refuses_busy_fallback_pane(self):
-        _helpers.seed_dispatch(self.c, "d1", "executing")  # executor_pane is 'pane1', not the fallback
+        _helpers.seed_dispatch(self.c, "d1", "executing", resources={"repo:a", "route:fx-a"}, pane="pane-1")
         pane = {"pane_id": "w1:p1", "agent": "omp", "agent_status": "running"}
         with mock.patch.object(dispatch, "_target", return_value=(pane, "factory-primary")), \
-                self.assertRaisesRegex(dispatch.StageError, "unrelated work"):
+                mock.patch.object(dispatch, "_send") as send, \
+                mock.patch.object(dispatch, "_herdr") as herdr, \
+                self.assertRaises(dispatch.StageError):
             dispatch.resume(SimpleNamespace(raw={}), self.c, "d1")
+        send.assert_not_called()  # a busy fallback pane is never reset or sent to
+        herdr.assert_not_called()
 
 
 class PruneBacklogBrief(unittest.TestCase):

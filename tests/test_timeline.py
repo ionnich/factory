@@ -27,6 +27,7 @@ class Timeline(unittest.TestCase):
                       (vid, T0, kind, ev, at, sup))
         c.execute("INSERT INTO dispatch(run_id, state, repos_json, last_actor, created_at) "
                   "VALUES ('d1','draft','[]','user',?)", (T2,))
+        c.execute("INSERT INTO dispatch_resource(run_id, resource) VALUES ('d1','global:*')")  # pinned while draft
         c.execute("INSERT INTO dispatch_ticket(run_id, issue_id, identifier, snapshot_updated_at, verdict_id) "
                   "VALUES ('d1','i1','FIN-1',?,2)", (T0,))
         c.execute("UPDATE dispatch SET state='staged', body_sha256='x', approved_by='user' WHERE run_id='d1'")
