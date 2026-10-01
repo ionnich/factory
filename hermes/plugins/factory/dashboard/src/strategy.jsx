@@ -173,6 +173,11 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const busy = view?.busy || null, err = view?.err || null;
   const update = (patch) => onViewChange((v) => ({ ...v, ...patch }));
 
+  // The selected brief at any moment, for async handlers: a late groom applies only if the operator is still where
+  // they submitted it — it must not change the selection or steal navigation.
+  const openRef = useRef(open);
+  useEffect(() => { openRef.current = open; }, [open]);
+
   // The overview: brief summaries, the source list, and the execution scheduler's read. Refetched on every overview
   // refresh (`data` is a new object each time) and on mount.
   const [all, setAll] = useState(null);
@@ -252,12 +257,15 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const editField = (key, v) => { setEdit((e) => ({ ...e, [key]: v })); setArm(null); };
 
   const groom = async () => {
-    const n = picked.length;
-    const r = await call("/strategy/groom", { identifiers: picked }, "groom");
+    const submitted = [...picked];
+    const atOpen = open;
+    const r = await call("/strategy/groom", { identifiers: submitted }, "groom");
     if (!r) return;
-    update({ picked: [] });
-    applyResult(r);
-    onDone(r, null, `Groomed a draft brief #${r.id} from ${n} source${n === 1 ? "" : "s"}`);
+    // Remove only the identifiers this request submitted; picks made since are left alone.
+    onViewChange((s) => ({ picked: (s.picked || []).filter((i) => !submitted.includes(i)) }));
+    // Apply the new brief only if the operator is still where they submitted; a late result never steals the selection.
+    if (openRef.current === atOpen) applyResult(r);
+    onDone(r, null, `Groomed a draft brief #${r.id} from ${submitted.length} source${submitted.length === 1 ? "" : "s"}`);
   };
 
   const save = async () => {

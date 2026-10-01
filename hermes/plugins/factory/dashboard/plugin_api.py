@@ -256,7 +256,8 @@ async def strategy_refresh():
 
 @router.post("/strategy/groom")
 async def strategy_groom(body: Identifiers):
-    return await factory("strategy", "groom", *idents_ok(body.identifiers), "--actor", "user:dashboard", timeout=600)
+    # 660s outer bound leaves room for the CLI's own GROOM_TIMEOUT (600s) to clean up omp before this kills it.
+    return await factory("strategy", "groom", *idents_ok(body.identifiers), "--actor", "user:dashboard", timeout=660)
 
 
 @router.post("/strategy/create")
