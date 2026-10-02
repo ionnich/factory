@@ -376,8 +376,9 @@ invention. It proposes the minimum useful system, the current consumers, correct
 **cuts**, and a keep/rewrite/merge/close/investigate disposition for every open ticket, with exact before/after
 title/description for a rewrite and a retained `target` for a merge. Completed sources and existing briefs are
 context only, never candidates to reopen/close. The review is a worker job (`pending/running/completed/failed`)
-reusing the `brief_investigate` durable pattern: a detached read-only agent (DeepSeek, `read,grep,glob` tools) reads
-the configured trunk mirrors and a written context file, and only the server validates and appends the result.
+reusing the `brief_investigate` durable pattern: a detached read-only agent (DeepSeek, `read,grep,glob` plus the
+configured read-only domain witness runners) reads the trunk mirrors and a written context file, and only the server
+validates and appends the result.
 Vanished/timed-out workers are visible and retryable; concurrent starts do not spawn duplicates. Recorded facts are
 distinguished from fresh production checks — the context carries snapshot/relationship timestamps and mirror trunk
 SHA + `fetched_at`, and limitations name what the recorded evidence cannot prove.
@@ -385,10 +386,19 @@ SHA + `fetched_at`, and limitations name what the recorded evidence cannot prove
 API (all under `/api/plugins/factory`; the actor is always `user:dashboard` from the server, never the body):
 
 - `GET /strategy/domain-reviews` → `{domains:[{id,name,ticket_count,open_count}], reviews:[summary…]}`
-- `POST /strategy/domain-reviews` `{domain_id, goal?}` → pending/existing summary (goal bounded to 2000 chars)
-- `GET /strategy/domain-reviews/{id}` → summary plus `{context, result, writebacks}`; `result` is null until completed
+- `POST /strategy/domain-reviews` `{domain_id, goal?, mode?, parent_review_id?, feedback?}` → pending/existing
+  summary. `mode` is `manual` (default) or `agentic`; `feedback` (≤4000 chars) is the review comment feeding the
+  next round; `parent_review_id` links a child review to its parent (the server derives/checks the same domain and
+  preserves the original goal unless it is explicitly changed).
+- `GET /strategy/domain-reviews/{id}` → summary plus `{context, result, writebacks, history, rounds}`; `result` is
+  null until completed.
 - `POST /strategy/domain-reviews/{id}/approve` `{identifiers:[…]}` → detail; nonempty mutation actions only
 - `POST /strategy/domain-reviews/{id}/brief` `{}` → `{brief: existing strategy brief}` (idempotent unapproved draft)
+
+Review summaries add `parent_review_id`, `feedback`, `mode`, `round_count` and `outcome`
+(`ready|blocked|limit_reached|null`). Detail adds `history` (chronological lineage summaries) and `rounds`
+(ordered pass records `{number, assessment, outcome, witnesses}`), where each witness receipt is
+`{id,name,query,at,ok,result,error}` mapped truthfully from the append-only `witness_log` rows that round produced.
 
 CLI equivalent: `factory strategy domain-list|domain-show|domain-groom|domain-run|domain-approve|domain-brief`.
 The result object: `minimum_system` (string), `consumers`/`correctness`/`limitations` (string arrays), `cuts`
@@ -396,6 +406,18 @@ The result object: `minimum_system` (string), `consumers`/`correctness`/`limitat
 (`{identifier,action,reason,evidence,cut_ids,title,description,target}`), and `simplification`
 (`{identifiers,body}` or null). The server enforces strict field types, bounded lengths, unique cut ids, exact
 per-open-ticket coverage, identifier provenance, and cut/target references — no client-supplied arbitrary bodies.
+
+Recursive rounds: a review is the first round. From the review page a person can leave a comment and request another
+round — **manual** is one human-facing revision (it may gather requested witness evidence before returning) — or
+explicitly start an **agentic** round: bounded automatic critique/evidence/revision passes (default max 3) carrying
+prior findings, stopping when the review is substantiated or blocked, and recording `outcome=limit_reached` when the
+budget is consumed. Every round keeps its own assessment and the witness receipts it cites; earlier reviews and
+comments are retained in `history`. The model runs only through the configured read-only domain witnesses
+(`witness.py` runners plus the append-only `witness_log`) — it may ask for schema queries before business queries,
+and query bounds are explicit — never unrestricted shell or Linear. An unavailable witness/data result is shown as
+such, never substituted with a cached fact. Reruns are explicit user actions, never a periodic cron; a superseded
+unapproved review is never newly approved, already-approved writebacks stay pinned, and a healthy worker is never
+expired by the bounded multi-pass lifecycle.
 
 Safety:
 
@@ -424,6 +446,10 @@ Confirm ticket changes** (with the exact previewed diffs and a warning about rea
 actions for reconcile. **Create simplification brief** stays a separate unapproved action with its own Open brief
 link; existing approval/execution gates are unchanged.
 
+The top **Proposals failed** health indicator is clickable and read-only: it shows the exact recorded failure (e.g.
+the cron job's `last_error`), its execution timestamp, and a route/link to the detailed log, with no retry/run
+controls and no secret exposure. It stays behind the dashboard auth and scoped job ids.
+
 ## Runtime coder model selector
 
 - The supported selector is the `omp` harness flag `--model <provider>/<model>` (fuzzy match; `--provider` is
@@ -444,6 +470,10 @@ link; existing approval/execution gates are unchanged.
 
 ## Invariants (in code: `factory/schema.sql` triggers + CLI checks)
 
+- Project refresh upserts Linear's current projects and never deletes an identity a `domain_review` still cites
+  (the `domain_review.domain_id` FK). A removed referenced project keeps its identity but loses its stale owner, so
+  it is no longer listed, requestable, or counted as owned; a removed unreferenced project is deleted. The fetch
+  happens before any write, so a failed upstream fetch changes nothing.
 - A dispatch is born a draft and leaves review only approved (`approved_by` set) or rejected with a reason;
   plan steps and notes are writable only while draft (triggers). Once staged it is immutable (`chflags uchg` +
   sha256). Execution is bounded, not single: `max_parallel` (default 2) caps concurrent dispatches, and repo,
