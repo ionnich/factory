@@ -154,8 +154,15 @@ _OP_QUESTION = {
     "comment": lambda i, p: f"Post the comment on {i}?",
 }
 
+# Pinned domain-groom writes a person approved: the held question names the exact effect, never the generic prose.
+_GROOM_QUESTION = {
+    "description": lambda i, p: f"Rewrite {i}'s title/description in Linear?",
+    "state": lambda i, p: f"Close {i} in Linear (cancel: {p.get('state')})?",
+    "comment": lambda i, p: f"Post the grooming comment on {i}?",
+}
 
-def writeback(conn, run_id: str, issue_id: str, op: str, payload: dict, reason: str) -> int:
+
+def writeback(conn, run_id: str, issue_id: str, op: str, payload: dict, reason: str, rule: str = "") -> int:
     """A write reconcile held back. "Apply anyway" only when the reconcile agent held it; a code gate (assignee,
     ticket changed, already closed) would hold it again."""
     ident = (conn.execute("SELECT identifier FROM linear_latest WHERE issue_id=?", (issue_id,)).fetchone()
@@ -165,7 +172,8 @@ def writeback(conn, run_id: str, issue_id: str, op: str, payload: dict, reason: 
     if (reason or "").startswith("reconcile agent:"):
         opts.insert(0, option("apply", "Apply anyway", "reconcile sends it on its next run; the assignee and "
                                                        "ticket-changed checks still apply"))
-    return open_(conn, "writeback", _OP_QUESTION.get(op, _OP_QUESTION["comment"])(ident, payload), opts, "skip",
+    questions = _GROOM_QUESTION if (rule or "").startswith("domain-groom") else _OP_QUESTION
+    return open_(conn, "writeback", questions.get(op, questions["comment"])(ident, payload), opts, "skip",
                  reason or "held by reconcile", "factory:reconcile", run_id=run_id, node_id=ident, issue_id=issue_id,
                  ref=op, detail=payload)
 

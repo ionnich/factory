@@ -277,6 +277,53 @@ async def strategy_create(body: StrategyCreate):
         args.append(f"--body={brief_json(body.body)}")
     return await factory(*args, "--actor", "user:dashboard")
 
+
+# ---- domain grooming: durable read-only DeepSeek review + human-frozen ticket mutations -----------------------
+# Fixed routes first (before /strategy/{brief_id}). Starting a review returns a pending row at once; the detached
+# worker appends the validated result. Approval and the simplification brief are human actions (user:dashboard).
+class DomainReviewRequest(BaseModel):
+    domain_id: str = Field(min_length=1, max_length=200)
+    goal: str = Field(default="", max_length=2000)
+
+
+class DomainReviewApprove(BaseModel):
+    identifiers: list[str] = Field(min_length=1, max_length=100)
+
+
+class DomainReviewBrief(BaseModel):
+    pass
+
+
+@router.get("/strategy/domain-reviews")
+async def domain_reviews_list():
+    return await factory("strategy", "domain-list")
+
+
+@router.post("/strategy/domain-reviews")
+async def domain_review_start(body: DomainReviewRequest):
+    args = ["strategy", "domain-groom", body.domain_id.strip()]
+    if body.goal.strip():
+        args.append(f"--goal={body.goal.strip()}")
+    return await factory(*args)
+
+
+@router.get("/strategy/domain-reviews/{review_id}")
+async def domain_review_show(review_id: int):
+    return await factory("strategy", "domain-show", str(review_id))
+
+
+@router.post("/strategy/domain-reviews/{review_id}/approve")
+async def domain_review_approve(review_id: int, body: DomainReviewApprove):
+    # freezes the EXACT reviewed rewrite/merge/close actions into the reconcile writeback run; no first-tap writes
+    return await factory("strategy", "domain-approve", str(review_id), *idents_ok(body.identifiers),
+                         "--actor", "user:dashboard")
+
+
+@router.post("/strategy/domain-reviews/{review_id}/brief")
+async def domain_review_brief(review_id: int, body: DomainReviewBrief):
+    return await factory("strategy", "domain-brief", str(review_id), "--actor", "user:dashboard")
+
+
 @router.post("/strategy/{brief_id}/investigate")
 async def strategy_investigate(brief_id: int, body: InvestigationRequest):
     # Returns the durable pending/running row immediately; a detached read-only agent writes the eventual result.

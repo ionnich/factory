@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -672,6 +672,44 @@ BEGIN SELECT RAISE(ABORT, 'a dismissed brief cannot be changed or approved'); EN
 CREATE TRIGGER work_brief_dismissed_insert BEFORE INSERT ON work_brief
 WHEN EXISTS (SELECT 1 FROM brief_dismissal WHERE brief_id IN (NEW.id, NEW.parent_id))
 BEGIN SELECT RAISE(ABORT, 'a dismissed brief cannot be replaced or revised'); END;""",
+    # v26: domain grooming. A durable domain_review job and its append-only per-ticket approval freeze. Rewrites use
+    # the existing 'description' writeback op (payload carries the optional title and description together), so the
+    # writeback table itself is untouched.
+    26: """CREATE TABLE domain_review (
+  id                INTEGER PRIMARY KEY,
+  domain_id         TEXT NOT NULL REFERENCES linear_project(id),
+  goal              TEXT NOT NULL DEFAULT '' CHECK (length(goal) <= 2000),
+  status            TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+  requested_at      TEXT NOT NULL,
+  started_at        TEXT,
+  completed_at      TEXT,
+  error             TEXT,
+  approved_at       TEXT,
+  approved_by       TEXT,
+  proposal_brief_id INTEGER REFERENCES work_brief(id),
+  result_json       TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+  context_json      TEXT NOT NULL CHECK (json_valid(context_json)),
+  CHECK (status IN ('pending', 'running') OR completed_at IS NOT NULL),
+  CHECK (status <> 'completed' OR result_json IS NOT NULL),
+  CHECK (status <> 'failed' OR error IS NOT NULL),
+  CHECK ((approved_at IS NULL) = (approved_by IS NULL)),
+  CHECK (approved_at IS NULL OR (approved_by NOT GLOB 'agent:*' AND approved_by NOT GLOB 'factory:*'))
+);
+CREATE UNIQUE INDEX domain_review_active ON domain_review(domain_id)
+WHERE status IN ('pending', 'running');
+
+CREATE TABLE domain_review_approval (
+  review_id   INTEGER NOT NULL REFERENCES domain_review(id),
+  identifier  TEXT NOT NULL,
+  action      TEXT NOT NULL CHECK (action IN ('rewrite', 'merge', 'close')),
+  approved_at TEXT NOT NULL,
+  approved_by TEXT NOT NULL CHECK (approved_by NOT GLOB 'agent:*' AND approved_by NOT GLOB 'factory:*'),
+  PRIMARY KEY (review_id, identifier)
+);
+CREATE TRIGGER domain_review_approval_append_u BEFORE UPDATE ON domain_review_approval
+BEGIN SELECT RAISE(ABORT, 'domain review approvals are append-only'); END;
+CREATE TRIGGER domain_review_approval_append_d BEFORE DELETE ON domain_review_approval
+BEGIN SELECT RAISE(ABORT, 'domain review approvals are append-only'); END;""",
 }
 
 
