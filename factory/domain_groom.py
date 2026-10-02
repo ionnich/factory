@@ -707,6 +707,7 @@ def run(cfg, conn, review_id: int, runner=subprocess.run) -> dict:
             _record_round(conn, review_id, number, env["assessment"], "ready", [], result)
             if mode == "manual" or candidate is not None:
                 return _commit(conn, review_id, result, outcome="ready", round_count=number)
+            prior_rounds.append(summary)  # carry the candidate pass's assessment into the critique pass
             candidate = result  # agentic first candidate: retained, now subject to a critique pass
             continue
         # the bounded budget was consumed without a critique-finalized ready

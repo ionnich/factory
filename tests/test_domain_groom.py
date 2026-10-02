@@ -495,6 +495,34 @@ class RecursiveGrooming(unittest.TestCase):
         self.assertEqual([(r["number"], r["outcome"]) for r in rounds], [(1, "ready"), (2, "ready")])
         self.assertIsNotNone(rounds[0]["review"])  # candidate retained for audit
 
+    def test_agentic_critique_prompt_carries_prior_ready_assessment(self):
+        self.insert("FIN-1")
+        rid = domain_groom.request(self.cfg, self.c, "p1", mode="agentic", spawn=lambda argv, **kw: None)["id"]
+        first = self.envelope("ready", assessment="FIRST_PASS_ASSESSMENT_MARKER",
+                              review=result([disposition("FIN-1", "keep")]))
+        critique = self.envelope("ready", assessment="CRITIQUE_PASS_ASSESSMENT_MARKER",
+                                 review=result([disposition("FIN-1", "keep")]))
+        prompts = []
+        it = iter([first, critique])
+
+        def runner(argv, **kw):
+            with open(argv[-1][1:]) as handle:  # argv[-1] is @<prompt file>; read the emitted prompt
+                prompts.append(handle.read())
+            return SimpleProc(next(it))
+
+        done = domain_groom.run(self.cfg, self.c, rid, runner=runner)
+        self.assertEqual(done["outcome"], "ready")
+        self.assertEqual(done["round_count"], 2)
+        self.assertEqual(len(prompts), 2)
+        # the candidate pass emits no prior-rounds section; the critique pass does
+        self.assertNotIn("Prior passes in this review", prompts[0])
+        self.assertIn("Prior passes in this review", prompts[1])
+        # the critique prompt carries the candidate pass's recorded assessment as structured JSON,
+        # with the correct pass lineage (number 1, not the critique's own number-2 assessment)
+        idx = prompts[1].index("Prior passes in this review")
+        prior, _ = json.JSONDecoder().raw_decode(prompts[1][prompts[1].index("[", idx):])
+        self.assertEqual(prior, [{"number": 1, "assessment": "FIRST_PASS_ASSESSMENT_MARKER", "outcome": "ready"}])
+
     def test_agentic_candidate_without_critique_budget_is_limit_reached(self):
         self.insert("FIN-1")
         rid = domain_groom.request(self.cfg, self.c, "p1", mode="agentic", spawn=lambda argv, **kw: None)["id"]
