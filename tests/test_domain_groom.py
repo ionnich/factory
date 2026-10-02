@@ -729,6 +729,23 @@ class RecursiveGrooming(unittest.TestCase):
                        "CONSUMER_MARKER", "SELECT COUNT(*) FROM filings", "WITNESS_RESULT_MARKER"):
             self.assertIn(marker, prompt)
 
+    def test_revised_candidate_retains_distinct_prior_result(self):
+        # when the current candidate differs from the prior result, the generated prompt keeps BOTH: the candidate
+        # (critique section) and the distinct prior result, because the person's feedback may refer to it
+        ctx = {"domain": {"id": "p1", "name": "My Domain", "slug_id": "my-domain"}, "goal": "",
+               "tickets": [], "completed_sources": [], "briefs": [], "mirrors": []}
+        feed = {"parent_review_id": 7, "feedback": "address the original result",
+                "result": result([], minimum_system="ORIGINAL_RESULT_MARKER"), "draft": False, "passes": []}
+        tmp = tempfile.mkdtemp()
+        dw = domain_groom._domain_witnesses(self.cfg, "My Domain")
+        prompt = domain_groom._round_prompt(ctx, tmp, parent_feed=feed, prior_rounds=[], receipts=[],
+                                            witnesses=dw,
+                                            candidate=result([], minimum_system="REVISED_CANDIDATE_MARKER"),
+                                            mode="agentic", number=2,
+                                            max_rounds=domain_groom.MAX_AGENTIC_ROUNDS)
+        self.assertIn("REVISED_CANDIDATE_MARKER", prompt)  # the current (revised) candidate is shown
+        self.assertIn("ORIGINAL_RESULT_MARKER", prompt)    # the distinct prior result is retained
+
     def test_superseded_unapproved_parent_cannot_be_approved(self):
         self.insert("FIN-1")
         rewrite = self.envelope("ready", review=result(

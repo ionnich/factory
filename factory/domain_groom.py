@@ -272,10 +272,16 @@ def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rou
     detail = Path(tmpdir) / "context.json"
     detail.write_text(json.dumps(ctx, indent=2))
     if mode == "agentic":
-        intro = (f"You are grooming one canonical Factory Domain project (agentic mode, pass {number} of at most "
-                 f"{max_rounds}). Inspect the open tickets and the code consumers they name. Your first `ready` is a "
-                 "DRAFT candidate the server retains; a later critique pass re-examines it, and a later `ready` (or "
-                 "`confirmed` when the candidate is unchanged) finalizes the review.")
+        if candidate is not None:
+            intro = (f"You are grooming one canonical Factory Domain project (agentic mode, pass {number} of at most "
+                     f"{max_rounds}). A candidate review already exists (inherited or retained from a prior pass); "
+                     "THIS pass is its critique — return `ready` (a revised review) or `confirmed` (unchanged) to "
+                     "finalize, or request more evidence or block.")
+        else:
+            intro = (f"You are grooming one canonical Factory Domain project (agentic mode, pass {number} of at most "
+                     f"{max_rounds}). Inspect the open tickets and the code consumers they name. Your first `ready` is a "
+                     "DRAFT candidate the server retains; a later critique pass re-examines it, and a later `ready` "
+                     "(or `confirmed` when the candidate is unchanged) finalizes the review.")
     else:
         intro = (f"You are grooming one canonical Factory Domain project (manual mode, pass {number} of at most "
                  f"{max_rounds}). Inspect the open tickets and the code consumers they name.")
@@ -319,17 +325,17 @@ def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rou
                   "Never finalize without genuinely testing the candidate's evidence. The DRAFT candidate:",
                   json.dumps(candidate, indent=2)]
     if parent_feed is not None:
-        if candidate is None:
+        if candidate is not None and candidate == parent_feed["result"]:
+            lines += ["Person feedback (address it) and the ancestor chain's ordered passes (tagged with review_id) "
+                      "with assessments and witness receipts:",
+                      json.dumps({"parent_review_id": parent_feed["parent_review_id"],
+                                  "feedback": parent_feed["feedback"], "passes": parent_feed["passes"]}, indent=2)]
+        else:
             lines += ["Prior review (a person reviewed it and left feedback; address it). `result` is the prior "
                       "review's recorded result — `draft: true` means it is a retained candidate, not a finalized "
                       "review — and `passes` are the ancestor chain's ordered passes (tagged with review_id) with "
                       "assessments and witness receipts:",
                       json.dumps(parent_feed, indent=2)]
-        else:
-            lines += ["Person feedback (address it) and the ancestor chain's ordered passes (tagged with review_id) "
-                      "with assessments and witness receipts:",
-                      json.dumps({"parent_review_id": parent_feed["parent_review_id"],
-                                  "feedback": parent_feed["feedback"], "passes": parent_feed["passes"]}, indent=2)]
     if inherited_note:
         lines += ["The inherited prior review could NOT be reused against the current recorded context and was "
                   "discarded — produce a fresh review. Reason: " + inherited_note]
