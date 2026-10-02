@@ -680,10 +680,10 @@ const JOB_NAME = { "factory-prune": "Verification", "[bot:planner] Plan drafts":
                    "factory-propose": "Proposals", "factory-reconcile": "Write-back", "factory-backup": "Backup" };
 const JOB_OK = ["ok", "success", "succeeded"];
 const badJob = (j) => !!(j.last_status && !JOB_OK.includes(j.last_status));
-// The cron run history carries epoch seconds; the overview's last_run_at is an ISO string.
+// The cron run history carries epoch seconds; the overview's last_run_at is an ISO string. epochAgo (above) takes
+// epoch seconds directly for SDK.utils.timeAgo (whose delta is Date.now()/1000 - ts); epochLocal builds the Date.
 const epochLocal = (v) => (v == null ? "never" : new Date((typeof v === "number" ? v : Number(v)) * 1000)
   .toLocaleString([], { hour: "2-digit", minute: "2-digit", month: "short", day: "numeric" }));
-const epochAgoS = (v) => (v == null ? "never" : SDK.utils.timeAgo((typeof v === "number" ? v : Number(v)) * 1000));
 
 // Job health: a tap opens a dialog with each job's own last run — its exact recorded error and time — plus the
 // run history read from the dashboard's existing cron endpoint (never a second log backend). The overview carries
@@ -729,7 +729,7 @@ function HealthPanel({ jobs, onClose, openerRef }) {
         <DialogHeader>
           <DialogTitle>{viewingRun ? "Run detail" : "Job health"}</DialogTitle>
           <DialogDescription>{viewingRun
-            ? (when != null ? `${epochAgoS(when)} · ${epochLocal(when)}` : "time unknown")
+            ? (when != null ? `${epochAgo(when)} · ${epochLocal(when)}` : "time unknown")
             : "Each cron job's own last run, exactly as its store records it — the whole job, never one ticket or dispatch."}</DialogDescription>
         </DialogHeader>
         <div className="fx-dialog-body">
@@ -793,7 +793,7 @@ function RunHistory({ id, profile, rowRef, onOpenRun }) {
               <button type="button" className="fx-run"
                       onClick={(e) => { rowRef.current = e.currentTarget; onOpenRun(r); }}
                       aria-label={`${epochLocal(r.started_at || r.last_active)} — ${clip(r.title || r.preview || r.id, 60)}`}>
-                <span className="fx-hint">{epochAgoS(r.started_at || r.last_active)} · {epochLocal(r.started_at || r.last_active)}</span>
+                <span className="fx-hint">{epochAgo(r.started_at || r.last_active)} · {epochLocal(r.started_at || r.last_active)}</span>
                 <span className="t">{r.title || r.preview || r.id}</span>
               </button>
             </li>))}</ul> : <div className="fx-hint">No completed runs recorded.</div>)
