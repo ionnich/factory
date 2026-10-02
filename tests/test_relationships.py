@@ -533,6 +533,11 @@ CREATE TABLE linear_due (
   PRIMARY KEY (issue_id, snapshot_updated_at),
   FOREIGN KEY (issue_id, snapshot_updated_at) REFERENCES linear_snapshot(issue_id, updated_at)
 );
+CREATE TABLE work_brief (
+  id INTEGER PRIMARY KEY,
+  parent_id INTEGER REFERENCES work_brief(id),
+  state TEXT NOT NULL
+);
 """
 
 
@@ -542,14 +547,19 @@ class Migration(unittest.TestCase):
         raw = sqlite3.connect(path)
         raw.executescript(V22 + "PRAGMA user_version=22;")
         raw.execute("INSERT INTO linear_snapshot VALUES ('i1','FIN-1','t','t','unstarted',1,?)", ('{"a":1}',))
+        raw.execute("INSERT INTO work_brief VALUES (1,NULL,'draft')")
         raw.commit()
         raw.close()
         conn = db.connect(path)
         self.addCleanup(conn.close)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 24)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
         self.assertEqual(conn.execute("SELECT raw_json FROM linear_snapshot WHERE issue_id='i1'").fetchone()[0], '{"a":1}')
         self.assertEqual(conn.execute("SELECT count(*) FROM linear_relationship").fetchone()[0], 0)
         self.assertEqual(conn.execute("SELECT count(*) FROM brief_investigation").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT count(*) FROM brief_dismissal").fetchone()[0], 0)
+        conn.execute("INSERT INTO brief_dismissal VALUES (1,'not needed','user:cli','now')")
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute("UPDATE work_brief SET state='approved' WHERE id=1")
         with self.assertRaises(sqlite3.IntegrityError):
             conn.execute("UPDATE linear_snapshot SET identifier='X' WHERE issue_id='i1'")
 

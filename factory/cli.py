@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import ask, config, costs, db, decide, dispatch, jev, learn, linear, prune, reconcile, repos, witness
-from . import pr_reviews
+from . import brief_propose, pr_reviews, strategy
 
 
 def out(obj) -> None:
@@ -107,6 +107,17 @@ def cmd_propose(cfg, conn, a):
         learn.sync(cfg, conn)
     except Exception as e:
         print(f"factory: learn sync: {type(e).__name__}: {e}", file=sys.stderr)
+    try:  # handoffs and normal notifications above always run before potentially slow grooming
+        res["brief_proposal"] = brief_propose.propose(cfg, conn)
+        if res["brief_proposal"]["status"] == "created":
+            msgs.append(brief_propose.announcement(cfg, res["brief_proposal"]["brief"]))
+        elif res["brief_proposal"]["status"] == "blocked":
+            reasons = "; ".join(item["reason"] for item in res["brief_proposal"]["skipped"][:3])
+            msgs.append(f"Automatic brief grooming blocked: {reasons}")
+    except Exception as e:
+        res["brief_proposal"] = {"status": "failed", "error": f"{type(e).__name__}: {e}"}
+        msgs.append(f"Automatic brief grooming failed: {type(e).__name__}: {e}")
+        print(f"factory: brief grooming: {type(e).__name__}: {e}", file=sys.stderr)
     if not a.announce:
         return out({**res, "messages": msgs})
     if msgs:  # cron stdout -> bot-chat:factory (Hermex); nothing to say = no message
@@ -323,6 +334,7 @@ def cmd_overview(cfg, conn, a):
          "lifecycle": {"counts": {"tickets": len(rows), "verify": sum(t["phase"] == "verify" for t in rows), **stages}},
          "writebacks": reconcile.unresolved(conn),  # every unsettled Linear write, sweeps and follow-ups too
          "candidates": cands, "learnings": learn.rows(conn),
+         "brief_reviews": strategy.brief_reviews(conn),
          "dispatches": dispatches, "asks": ask.rows(conn, set(shown))})  # "why?" threads by decision id
 
 
@@ -665,6 +677,8 @@ def cmd_strategy(cfg, conn, a):
         return out(strategy.revise(cfg, conn, a.brief_id, _json_body(a.body), a.reason, a.actor))
     if a.scmd == "approve":
         return out(strategy.approve(cfg, conn, a.brief_id, a.actor))
+    if a.scmd == "dismiss":
+        return out(strategy.dismiss(cfg, conn, a.brief_id, a.reason, a.actor))
     if a.scmd == "hold":
         return out(strategy.hold(cfg, conn, a.brief_id, a.reason, a.actor))
     if a.scmd == "unhold":
@@ -879,6 +893,11 @@ def main(argv=None):
     s.set_defaults(fn=cmd_strategy)
     s = st.add_parser("approve", help="approve the draft as intent (not execution; verification may stay pending)")
     s.add_argument("brief_id", type=int)
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("dismiss", help="dismiss a latest draft with a human reason; preserve its history")
+    s.add_argument("brief_id", type=int)
+    s.add_argument("--reason", required=True)
     s.add_argument("--actor", default="user")
     s.set_defaults(fn=cmd_strategy)
     s = st.add_parser("hold", help="hold an approved brief (explicit readiness change)")
