@@ -103,6 +103,7 @@ def _capture(sources):
 
 def propose(cfg, conn) -> dict:
     """Single-host single-flight; never hold SQLite's writer lock while the model runs."""
+    # ponytail: single-host lock; use a DB lease if generation moves across hosts.
     path = cfg.db.resolve()
     with path.with_name(path.name + ".brief-propose.lock").open("a") as lock:
         try:

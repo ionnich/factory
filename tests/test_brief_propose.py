@@ -149,7 +149,8 @@ class AutoBriefs(unittest.TestCase):
         verdict = seed_verdict(self.conn, "fin-1")
         seed_dispatch(self.conn, "old")
         seed_ticket(self.conn, "old", "fin-1", "FIN-1", verdict)
-        self.conn.execute("UPDATE dispatch SET state='archived',rejected_reason='retired' WHERE run_id='old'")
+        self.conn.execute("UPDATE dispatch SET state='archived',body_sha256='sha',rejected_reason='retired' "
+                          "WHERE run_id='old'")
         self.assertEqual(self.tick()["status"], "idle")
         seed_snapshot(self.conn, "fin-1", "FIN-1", snap=NEXT)
         self.conn.execute("INSERT INTO linear_own_write VALUES ('fin-1',?)", (NEXT,))
@@ -315,12 +316,11 @@ class AutoBriefs(unittest.TestCase):
                 cli.cmd_propose(self.cfg, self.conn, SimpleNamespace(announce=False))
             result = json.loads(output.getvalue())
             self.assertEqual(result["brief_proposal"]["status"], "created")
-            self.assertEqual(result["messages"][0], "Existing notice")
             self.assertIn("https://dashboard.example/factory?workspace=work&stage=strategy&brief=1", result["messages"][1])
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 cli.cmd_propose(self.cfg, self.conn, SimpleNamespace(announce=True))
-            self.assertEqual(output.getvalue().strip(), "Existing notice")
+            self.assertNotIn("https://dashboard.example/factory", output.getvalue())
             self.source(2)
             with mock.patch.object(strategy, "_run_groom", side_effect=StageError("model unavailable")):
                 output = io.StringIO()

@@ -44,6 +44,7 @@ One-time, by hand:
   **Needs you** starts folded on every full page load and opens only by manual toggle. Refreshes, new decisions,
   PR results and workspace switches preserve its current toggle state; opening it never acknowledges anything.
   Decision and Linear-answer entries open their owning stage; executor questions belong in Run.
+  **Brief reviews** link straight to each pending Strategy draft, including automatically proposed briefs.
   `factory.db` changes refresh data over `/stream` without polling, changing tabs or opening panels.
   Wispr-inspired hierarchy uses serif workspace headings, readable sans-serif work rows, quiet metadata,
   flat theme-derived surfaces and lavender selection accents. Buttons retain 6px corners, 44px targets,
@@ -271,15 +272,30 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
   metadata never rewrites immutable snapshots. Older cached versions need metadata backfill before dates appear.
   **Not checked** and **Check outdated** describe existing verification evidence, separately from workflow state
   and execution blockers; these labels do not run a new scan. Counts distinguish displayed, matching and total sources.
-- A **brief** is an approved, self-contained, versioned work brief: title, outcome, acceptance, scope, exclusions,
+- A **brief** is a self-contained, versioned work brief: title, outcome, acceptance, scope, exclusions,
   decisions, dependencies, resources, risks, evidence — plus server-captured source snapshots (issue id, repo,
   context, route, verdict id/evidence, trunk anchors and recorded relationships).
-  Briefs are groomed from cached sources by DeepSeek, edited
+  Briefs are groomed from cached sources by DeepSeek, reviewed/edited
   by a human, and published as an exact version. Publishing intent does **not** approve execution, override missing
   evidence, answer questions or mutate Linear.
-  Selected links are reviewed before grooming; only explicit incoming blocking links from outside the selected work
+  Manual selections have their links reviewed before grooming; only explicit incoming blocking links from outside the selected work
   qualify as model-proposed dependencies. A human can edit dependencies. Compiled intent retains captured links and
   outside context, not later relationship-cache contents.
+- **Automatic brief generation:** the existing `factory-propose` tick now selects and grooms at most **one**
+  new draft after normal dispatch/notification handling, stopping at **three** pending brief reviews (manual and
+  automatic combined). Drafts appear in **Needs you** and Strategy; creation announces a direct review link.
+  Selection uses current owned/routed sources, priority then due date, known relationship snapshots, and recorded
+  parent/dependency/related groups within one repo/context/route. A shared project alone produces singleton briefs,
+  not a grab-bag. Backlog sources without verdicts are allowed; completed, canceled, QA, foreign-assigned,
+  explicitly invalid and already-covered work is excluded. Generation does not verify or approve anything.
+  Existing drafts/approved/held briefs are not rewritten. Archived or dismissed source versions, including only
+  reconcile-owned updates, are not proposed again; an intervening external source update may make them eligible.
+  A single-host file lock prevents overlapping model calls; eligibility, coverage, queue capacity and captured
+  facts are checked again in a short transaction before insertion. Failures are reported, never replaced by a fake draft.
+- **Dismiss draft:** two taps and a reason remove a latest draft from review without deleting its history
+  (`factory strategy dismiss ID --reason TEXT --actor user:cli`). Dismissal is human-only and append-only;
+  the body/sources remain readable, but approval and revision are refused. Ordinary editing and **Approve brief**
+  remain separate human actions. The three-brief review cap is separate from the dispatch queue below.
 - **Approval boundary:** a human approves a brief (`factory strategy approve` or the API, actor
   `user:dashboard` / an explicit CLI user); agents can never approve or silence-publish a brief. Approving a brief
   authorizes verification and planning from it, not execution. Dispatching still passes the existing review
