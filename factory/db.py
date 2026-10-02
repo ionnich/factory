@@ -698,6 +698,13 @@ BEGIN SELECT RAISE(ABORT, 'a dismissed brief cannot be replaced or revised'); EN
 CREATE UNIQUE INDEX domain_review_active ON domain_review(domain_id)
 WHERE status IN ('pending', 'running');
 
+CREATE TRIGGER domain_review_frozen BEFORE UPDATE OF result_json, context_json, domain_id, goal ON domain_review
+WHEN OLD.status NOT IN ('pending', 'running')
+BEGIN SELECT RAISE(ABORT, 'a completed or failed domain review is immutable'); END;
+CREATE TRIGGER domain_review_approved_once BEFORE UPDATE OF approved_at, approved_by ON domain_review
+WHEN OLD.approved_at IS NOT NULL AND (NEW.approved_at IS NOT OLD.approved_at OR NEW.approved_by IS NOT OLD.approved_by)
+BEGIN SELECT RAISE(ABORT, 'a domain review approval provenance is set once'); END;
+
 CREATE TABLE domain_review_approval (
   review_id   INTEGER NOT NULL REFERENCES domain_review(id),
   identifier  TEXT NOT NULL,
@@ -709,7 +716,13 @@ CREATE TABLE domain_review_approval (
 CREATE TRIGGER domain_review_approval_append_u BEFORE UPDATE ON domain_review_approval
 BEGIN SELECT RAISE(ABORT, 'domain review approvals are append-only'); END;
 CREATE TRIGGER domain_review_approval_append_d BEFORE DELETE ON domain_review_approval
-BEGIN SELECT RAISE(ABORT, 'domain review approvals are append-only'); END;""",
+BEGIN SELECT RAISE(ABORT, 'domain review approvals are append-only'); END;
+
+CREATE TRIGGER writeback_domain_groom_frozen BEFORE UPDATE OF payload_json, rule, op, issue_id, run_id ON writeback
+WHEN OLD.rule LIKE 'domain-groom%'
+  AND (NEW.payload_json IS NOT OLD.payload_json OR NEW.rule IS NOT OLD.rule OR NEW.op IS NOT OLD.op
+       OR NEW.issue_id IS NOT OLD.issue_id OR NEW.run_id IS NOT OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'a domain-groom write is pinned by a person; its content is immutable'); END;""",
 }
 
 
