@@ -115,10 +115,18 @@
 .fx-health-runs > summary { cursor: pointer; font-weight: 600; min-height: 44px; padding: .25rem 0; list-style: none; }
 .fx-health-runs > summary::-webkit-details-marker { display: none; }
 .fx-health-runs-list { list-style: none; margin: .2rem 0 0; padding: 0 0 0 .55rem; border-left: 2px solid var(--e);
-                       display: grid; gap: .35rem; font-size: .82rem; }
-.fx-health-runs-list li { display: grid; gap: .1rem; }
+                       display: grid; gap: .15rem; font-size: .82rem; }
+.fx-health-runs-list li { display: grid; }
+.fx-health-runs-list .fx-run { display: grid; gap: .1rem; width: 100%; text-align: left; background: none; border: 0;
+                               padding: .35rem .5rem; border-radius: var(--fx-r-sm); font: inherit; cursor: pointer; }
+.fx-health-runs-list .fx-run:hover { background: var(--fx-fill); }
+.fx-health-runs-list .fx-run:focus-visible { outline: 2px solid var(--fx-lavender); outline-offset: 2px; }
 .fx-health-runs-list .t { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fx-fg); }
-.fx-health-runs-list li.r-script .t { color: var(--fx-muted); }
+/* A run's full recorded output/error, opened from a run row (read-only). */
+.fx-run-out { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font: inherit; font-size: .82rem;
+              color: var(--fx-fg); background: var(--fx-panel); border: 1px solid var(--fx-line);
+              border-radius: var(--fx-r-sm); padding: .5rem .6rem; max-height: 40vh; overflow: auto; }
+.fx-run-out.muted { color: var(--fx-muted); }
 .fx-live { display: inline-block; width: .45rem; height: .45rem; border-radius: 999px; margin-right: .3rem;
            background: var(--n); vertical-align: middle; }
 .fx-live.on { background: var(--g); animation: fx-pulse 2.4s ease-in-out infinite; }
