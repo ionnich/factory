@@ -28,6 +28,15 @@ MODEL = "deepseek/deepseek-v4-pro"
 MAX_AGENTIC_ROUNDS = 3
 MANUAL_MAX_ROUNDS = 3
 MAX_WITNESS_QUERIES = 4
+_REVIEWER_SYSTEM_PROMPT = (
+    "You are a read-only Factory domain-grooming reviewer. Each run is exactly ONE pass: read the prompt, do only "
+    "targeted evidence checks with read/grep/glob, then return the required JSON envelope and stop — never edit, "
+    "write, execute, or run anything, and never continue into later passes.\n"
+    "Recorded inputs are authoritative facts to cite, not facts to re-verify: ticket identifiers, eligibility "
+    "(mutable/blocker), snapshot timestamps, witness receipts, and relationship edges are server-recorded. "
+    "Re-read the context file only where a specific claim needs it; do not re-inventory the domain or repeatedly "
+    "re-confirm already-established facts. Judge the recorded evidence, then finish promptly."
+)
 _ROUND_OUTCOMES = ("ready", "blocked", "evidence")
 _ENVELOPE_KEYS = {"outcome", "assessment", "witness_queries", "review"}
 _WITNESS_QUERY_KEYS = {"witness", "query"}
@@ -294,9 +303,14 @@ def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rou
         json.dumps([{"name": n, "kind": w["kind"]} for n, w in sorted(witnesses.items())], indent=2),
     ]
     if candidate is not None:
-        lines += ["Your DRAFT candidate review from a prior pass. Critique it against the recorded evidence: confirm "
-                  "it (ready with the same or a revised review), request more evidence, or block — never mark it "
-                  "final without that critique:",
+        lines += ["Your DRAFT candidate review from a prior pass. CRITIQUE it — do not re-do the review or "
+                  "re-inventory the domain. Challenge each disposition's specific claims against the recorded "
+                  "evidence and the person's feedback: confirm only what the cited evidence genuinely supports, "
+                  "flag contradictions and missing evidence, and re-read only the files a specific claim actually "
+                  "needs (the full context file remains available). Server-recorded identifiers, eligibility, and "
+                  "snapshot timestamps are input facts to cite, not facts to re-verify. Then confirm (ready with "
+                  "the same or a revised review), request more evidence, or block — never finalize without "
+                  "genuinely testing the candidate's evidence:",
                   json.dumps(candidate, indent=2)]
     if parent_feed is not None:
         lines += ["Parent review (a person reviewed it and left feedback; address it). `result` is the parent's "
@@ -652,6 +666,7 @@ def _model_turn(prompt: str, runner) -> dict:
             handle.write(prompt)
         proc = runner([strategy.OMP, "--model", MODEL, "--thinking", "high", "--tools", "read,grep,glob",
                        "--no-extensions", "--no-session", "--no-prewalk", "--no-pty", "--approval-mode", "yolo",
+                       "--no-skills", "--no-rules", "--system-prompt", _REVIEWER_SYSTEM_PROMPT,
                        "-p", f"@{path}"],
                       capture_output=True, text=True, timeout=TIMEOUT)
     finally:
