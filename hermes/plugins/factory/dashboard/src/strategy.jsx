@@ -8,7 +8,8 @@
 //   render. Grooming runs real DeepSeek through the CLI (long), so it shows busy and any error truthfully — never a
 //   fake placeholder. Editing persists a new draft revision (immutable versions; an amendment needs a reason).
 //   Approval freezes intent for planning only; creating a draft dispatch is a separate readiness-gated action.
-//   Holding/unholding is an explicit readiness change.
+//   Holding/unholding is an explicit readiness change. Human dismissal requires confirmation and a reason, preserving
+//   draft history as read-only. Automatic proposals enter human review; they never imply verification or approval.
 //
 // Layout: sources are the default landing surface, with grouped relationship-aware browsing first. The brief list is
 // opened intentionally, and a selected brief replaces browsing until the operator returns to sources. Grouped mode
@@ -219,8 +220,10 @@ const formToBody = (f) => {
 
 const canonical = (f) => JSON.stringify(formToBody(f));
 
-const STATE_TONE = { draft: "blue", approved: "green", held: "amber" };
-const stateLabel = (b) => (b.state === "approved" ? "approved" : b.state === "held" ? "held" : "draft");
+const STATE_TONE = { draft: "blue", approved: "green", held: "amber", dismissed: "gray" };
+const stateLabel = (b) => (b.dismissal || b.readiness === "dismissed" ? "dismissed"
+  : b.state === "approved" ? "approved" : b.state === "held" ? "held" : "draft");
+const needsReview = (b) => stateLabel(b) === "draft" && b.readiness !== "superseded";
 const DISPATCH_STAGE = { draft: "draft", staged: "run", executing: "run", done: "reconcile",
                          reconciled: "reconcile", archived: "archive" };
 let NAV_TOKEN = 0;  // latest navigation generation; the parent bumps it synchronously on every move (go/Back)
@@ -279,16 +282,18 @@ function BriefRow({ b, selected, onSelect, onDispatch }) {
          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { stop(e); onSelect(); } }}>
       <div className="fx-grow">
         <div className="fx-row fx-row-status">
-          <Tone tone={STATE_TONE[b.state] || "gray"}>{stateLabel(b)}</Tone>
+          <Tone tone={STATE_TONE[stateLabel(b)] || "gray"}>{stateLabel(b)}</Tone>
           {superseded ? <Tone tone="gray">superseded</Tone> : null}
-          {b.source_changed?.length ? <Tone tone="red">needs amendment</Tone> : null}
+          {!b.dismissal && b.source_changed?.length ? <Tone tone="red">needs amendment</Tone> : null}
           {blockers.length ? <Tone tone="amber">{plural(blockers.length, "blocker")}</Tone> : null}
         </div>
         <div className="fx-row-title fx-ttitle clamp">{b.title || `Brief #${b.id}`}</div>
         <div className="fx-row-meta fx-hint">#{b.id} · revision {b.revision}{b.created_by ? ` · ${b.created_by}` : ""}
           {b.created_at ? ` · ${ago(b.created_at)}` : ""}
           {b.sources?.length ? ` · ${plural(b.sources.length, "source")}` : ""}</div>
-        {blockers.length ? <div className="fx-hint">Open for grouped readiness details and recovery actions.</div> : null}
+        {b.created_by === "agent:brief-proposer" ? <div className="fx-hint">Auto-proposed by DeepSeek · {needsReview(b) ? "human review required" : stateLabel(b)}</div> : null}
+        {b.dismissal ? <div className="fx-hint">Dismissed: {b.dismissal.reason}</div> : null}
+        {!b.dismissal && blockers.length ? <div className="fx-hint">Open for grouped readiness details and recovery actions.</div> : null}
         {relWarnings.length ? <div className="fx-err">{clip(relWarnings.join("; "), 160)}</div> : null}
       </div>
       <div className="fx-tc-ne">
@@ -439,13 +444,13 @@ function InvestigationPanel({ investigation, eligible, dirty, busy, onInvestigat
   );
 }
 
-function Field({ label, value, onChange, kind, disabled }) {
+function Field({ label, value, onChange, kind, disabled, readOnly = false }) {
   return (
     <label className="fx-field fx-brief-section">
       <span className="fx-k">{label}</span>
       {kind === "one"
-        ? <Input value={value} maxLength={200} disabled={disabled} onChange={(e) => onChange(e.target.value)} />
-        : <textarea className="fx-ta" rows={3} value={value} disabled={disabled}
+        ? <Input value={value} maxLength={200} disabled={disabled} readOnly={readOnly} onChange={(e) => onChange(e.target.value)} />
+        : <textarea className="fx-ta" rows={3} value={value} disabled={disabled} readOnly={readOnly}
                     onChange={(e) => onChange(e.target.value)} />}
     </label>
   );
@@ -797,6 +802,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   }, [data]);
 
   const briefs = all?.briefs || [];
+  const pendingBriefs = briefs.filter(needsReview);
   const tickets = all?.tickets || [];
   // Real execution-scheduler read (scheduler.status): capacity in use, running dispatches, launch reservations and
   // held resource claims. Held claims are not running slots — they persist through done/reconcile until archive.
@@ -824,16 +830,19 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     SDK.fetchJSON(`${API}/strategy/${open}`).then((x) => { if (live) { setDetail(x); setDetailErr(null); } },
                                                    (e) => { if (live) setDetailErr(errText(e)); });
     return () => { live = false; };
-  }, [open, summary?.revision, summary?.state, mut]);
+  }, [open, summary?.revision, summary?.state, summary?.dismissal?.at, mut]);
   const current = detail?.brief || null;
+  const dismissal = current?.dismissal || summary?.dismissal;
+  const dismissed = !!dismissal || summary?.readiness === "dismissed";
 
   // The editable form, reset when the open brief's version changes (a new revision is its own row).
   const [edit, setEdit] = useState(null);
   const [reason, setReason] = useState("");
-  const [arm, setArm] = useState(null);  // the weighty action awaiting its second tap: approve|dispatch|amend|hold
+  const [arm, setArm] = useState(null);  // the weighty action awaiting its second tap: approve|dispatch|amend|hold|dismiss
   useEffect(() => { setEdit(current ? toForm(current.body) : null); setReason(""); setArm(null); },
-            [current?.id, current?.revision]);  // eslint-disable-line react-hooks/exhaustive-deps
+            [current?.id, current?.revision, dismissal?.at]);  // eslint-disable-line react-hooks/exhaustive-deps
   const dirty = !!current && !!edit && canonical(edit) !== canonical(toForm(current.body || {}));
+  const shownForm = dismissed && current ? toForm(current.body) : edit;
   const canCreateDispatch = current?.state === "approved" && summary?.readiness === "ready" && !dirty;
   const dispatchWhy = dirty ? "Save or discard edits first."
     : summary?.readiness === "verification-pending" ? "Exact-version verification is pending."
@@ -934,6 +943,17 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     if (!r) return;
     if (applyGuarded(r, atNav)) settleId(r, atOpen);
     onDone(r, null, `Held #${open}`);
+  };
+
+  const dismiss = async () => {
+    if (dismissed || current?.state !== "draft" || summary?.readiness === "superseded") return;
+    if (arm !== "dismiss") { setReason(""); setArm("dismiss"); return; }
+    if (!reason.trim()) return;
+    const atOpen = open, atNav = NAV_TOKEN;
+    const r = await call(`/strategy/${open}/dismiss`, { reason: reason.trim() }, "dismiss");
+    if (!r) return;
+    if (applyGuarded(r, atNav)) settleId(r, atOpen);
+    onDone(r, null, `Dismissed draft #${open}; history preserved`);
   };
 
   const unhold = async () => {
@@ -1157,7 +1177,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
         </div>
         {briefsOpen && open == null
           ? <Button size="sm" ghost onClick={showSources}>Back to sources</Button>
-          : <Button size="sm" ghost onClick={showBriefs}>View briefs <span className="fx-count">{briefs.length}</span></Button>}
+          : <Button size="sm" ghost onClick={showBriefs}>View briefs <span className="fx-count">{briefs.length}</span>{pendingBriefs.length ? ` · ${pendingBriefs.length} to review` : ""}</Button>}
       </header>
 
       {loadErr ? <div className="fx-err" role="alert">{all ? `Refreshing strategy failed: ${loadErr}. Showing the last loaded.` : `Strategy did not load: ${loadErr}`}</div> : null}
@@ -1179,27 +1199,36 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
               <div className="fx-row between">
                 <div className="fx-row">
                   <span className="fx-id">#{current.id}</span><span className="fx-hint">revision {current.revision}</span>
-                  <Tone tone={STATE_TONE[current.state] || "gray"}>{stateLabel(current)}</Tone>
+                  <Tone tone={dismissed ? "gray" : STATE_TONE[current.state] || "gray"}>{dismissed ? "dismissed" : stateLabel(current)}</Tone>
                   {summary?.readiness === "superseded" ? <Tone tone="gray">superseded</Tone> : null}
-                  {summary?.source_changed?.length ? <Tone tone="red">needs amendment</Tone> : null}
+                  {!dismissed && summary?.source_changed?.length ? <Tone tone="red">needs amendment</Tone> : null}
                 </div>
                 <div className="fx-hint">{current.created_by} · {ago(current.created_at)}
                   {current.approved_by ? ` · approved by ${current.approved_by} ${ago(current.approved_at)}` : ""}</div>
               </div>
+              {current.created_by === "agent:brief-proposer" ? (
+                <div className="fx-why">Auto-proposed by DeepSeek from captured sources. Generation is not verification or approval.
+                  {!dismissed && current.state === "draft" ? " Review, edit and approve, or dismiss with a reason." : ""}</div>
+              ) : null}
+              {dismissal ? (
+                <div className="fx-why">Dismissed: {dismissal.reason}
+                  <div className="fx-hint">{dismissal.actor} · {ago(dismissal.at)} · Read-only history</div>
+                </div>
+              ) : null}
               {current.amendment_reason ? <div className="fx-why">Amended: {current.amendment_reason}</div> : null}
               {current.hold_reason ? <div className="fx-why">Hold: {current.hold_reason}</div> : null}
               {summary?.readiness === "superseded" ? (
                 <div className="fx-err">Superseded — a newer revision exists; a draft with a child cannot be approved.</div>
               ) : null}
-              <ReadinessPanel summary={summary} />
-              {(investigation || investigationEligible) ? (
+              {!dismissed ? <ReadinessPanel summary={summary} /> : null}
+              {!dismissed && (investigation || investigationEligible) ? (
                 <InvestigationPanel investigation={investigation} eligible={investigationEligible} dirty={dirty}
                                     busy={busy} onInvestigate={investigate} onOpenProposal={openBrief} />
               ) : null}
               {current.state === "approved" ? (
                 <div className="fx-why">Approval freezes scope for planning only. It does not authorize or start execution.</div>
               ) : null}
-              {summary?.replacement?.excluded?.length ? (
+              {!dismissed && summary?.replacement?.excluded?.length ? (
                 <div className="fx-sec fx-stack-v">
                   <div className="fx-k">Recover this scope</div>
                   <div className="fx-hint">The approved brief stays intact. This explicit action replaces any current source picks,
@@ -1219,16 +1248,16 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
               <div className="fx-brief-fields">
                 {FIELDS.map(([key, label, kind]) => (
                   <Fragment key={key}>
-                    <Field label={label} kind={kind} value={edit[key]} disabled={!!busy}
-                           onChange={(v) => editField(key, v)} />
-                    {key === "resources" && (edit.resources || "").split("\n").map((x) => x.trim()).includes("global:*") ? (
+                    <Field label={label} kind={kind} value={shownForm[key]} disabled={!!busy}
+                           readOnly={dismissed} onChange={(v) => editField(key, v)} />
+                    {key === "resources" && (shownForm.resources || "").split("\n").map((x) => x.trim()).includes("global:*") ? (
                       <div className="fx-note"><code>global:*</code> reserves all execution resources, so this work runs alone.
                         Use narrower claims only after reviewing them.</div>
                     ) : null}
                   </Fragment>
                 ))}
               </div>
-              {dirty ? (current.state === "draft"
+              {!dismissed && dirty ? (current.state === "draft"
                 ? <div className="fx-hint">Unsaved edits.</div>
                 : <div className="fx-err">Unsaved edits are not the approved intent — amend (with a reason) before creating a draft dispatch.</div>
               ) : null}
@@ -1245,13 +1274,16 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
               </details>
 
               <div className="fx-stack-v">
-                {current.state === "draft" ? (
+                {!dismissed && current.state === "draft" ? (
                   <>
                     <div className="fx-row">
                       <Button size="sm" disabled={!!busy || !dirty} onClick={save}>{busy === "save" ? "Saving…" : "Save draft"}</Button>
                       {summary?.readiness !== "superseded"
                         ? <Button size="sm" disabled={!!busy} onClick={approveBrief}>{busy === "approve" ? "Approving…" : arm === "approve" ? "Confirm approval" : "Approve brief"}</Button>
                         : null}
+                      {summary?.readiness !== "superseded" && arm !== "dismiss" ? (
+                        <Button size="sm" ghost disabled={!!busy} onClick={dismiss}>Dismiss draft</Button>
+                      ) : null}
                     </div>
                     {arm === "approve" ? (
                       <div className="fx-sw">
@@ -1261,10 +1293,28 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
                           or change Linear.</div>
                       </div>
                     ) : null}
+                    {arm === "dismiss" ? (
+                      <div className="fx-sw">
+                        <div className="fx-sw-q">Dismiss this draft?</div>
+                        <div className="fx-sw-detail">Removes it from human review and keeps read-only history. It does not approve
+                          work or change Linear.{dirty ? " Unsaved edits will not be saved." : ""}</div>
+                        <label className="fx-field">
+                          <span className="fx-k">Dismissal reason (required)</span>
+                          <Input autoFocus required value={reason} maxLength={2000} disabled={!!busy}
+                                 onChange={(e) => setReason(e.target.value)} />
+                        </label>
+                        <div className="fx-row">
+                          <Button size="sm" disabled={!!busy || !reason.trim()} onClick={dismiss}>
+                            {busy === "dismiss" ? "Dismissing…" : "Confirm dismissal"}
+                          </Button>
+                          <Button size="sm" ghost disabled={!!busy} onClick={() => { setArm(null); setReason(""); }}>Cancel</Button>
+                        </div>
+                      </div>
+                    ) : null}
                   </>
                 ) : null}
 
-                {current.state !== "draft" ? (
+                {!dismissed && current.state !== "draft" ? (
                   <>
                     <div className="fx-row">
                       <Button size="sm" disabled={!!busy} onClick={amend}>{busy === "amend" ? "Amending…" : arm === "amend" ? "Confirm amendment" : "Amend"}</Button>
@@ -1303,9 +1353,9 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
         </>
       ) : briefsOpen ? (
         <section className="fx-brief-section" aria-label="Work briefs">
-          <div className="fx-k">{plural(briefs.length, "brief")}</div>
+          <div className="fx-k">{plural(briefs.length, "brief")} · {pendingBriefs.length} to review</div>
           <div className="fx-list">
-            {briefs.length ? briefs.map((b) => (
+            {briefs.length ? [...pendingBriefs, ...briefs.filter((b) => !needsReview(b))].map((b) => (
               <BriefRow key={b.id} b={b} selected={false}
                         onSelect={() => openBrief(b.id)} onDispatch={openDispatch} />
             )) : <div className="fx-empty">No briefs yet. Groom a source, or create one from the CLI.</div>}

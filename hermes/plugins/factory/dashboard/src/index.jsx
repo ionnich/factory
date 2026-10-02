@@ -1,4 +1,4 @@
-// Factory tab, mobile first. The header: Needs you (every decision or undelivered executor answer waiting on a person,
+// Factory tab, mobile first. The header: Needs you (every decision, draft brief or undelivered executor answer waiting on a person,
 // each line a link to its stage and the thing itself), job health, and live refresh. The primary workspaces are
 // Assembly, Strategy, Learn, and Costs. Assembly alone carries the connected lifecycle:
 //   Tickets: the whole ticket ledger and each ticket's audit trail (tickets.jsx), when Linear was last ingested.
@@ -773,10 +773,10 @@ function Tabs({ label, items, current, onPick }) {
 
 // Needs you is controlled by the page so data refreshes and workspace changes cannot reopen or close it. Pull requests
 // stay a separate inbox: an unavailable fetch is unknown, never displayed as zero.
-function NeedsYou({ items, decisions, answers, prs, prLoading, prError, open, onToggle, onGo }) {
+function NeedsYou({ items, decisions, briefReviews, answers, prs, prLoading, prError, open, onToggle, onGo }) {
   const prKnown = prs != null;
   const hasAnything = items.length || answers || (prKnown && prs) || prError;
-  const knownCount = decisions + answers + (prKnown ? prs : 0);
+  const knownCount = decisions + briefReviews + answers + (prKnown ? prs : 0);
   const count = prKnown ? knownCount : knownCount ? `${knownCount}+` : "?";
   const prSummary = prError ? "PRs unknown" : prKnown ? plural(prs, "PR") : prLoading ? "PRs loading" : "PRs unknown";
   return (
@@ -785,11 +785,12 @@ function NeedsYou({ items, decisions, answers, prs, prLoading, prError, open, on
         <span>Needs you · {count}</span>
       </summary>
       <ul className="fx-needs-list">
-        <li className="fx-hint">{plural(decisions, "decision")} · {plural(answers, "Linear-ticket answer")} · {prSummary}</li>
+        <li className="fx-hint">{plural(decisions, "decision")} · {plural(briefReviews, "brief review")} · {plural(answers, "Linear-ticket answer")} · {prSummary}</li>
         {items.map((t) => (
           <li key={t.key}><button type="button" className="fx-need" onClick={() => onGo(t)}>
             <span className="fx-row"><Tone tone={t.tone}>{t.kind}</Tone><span className="fx-hint">{LABEL[t.stage]} ›</span></span>
             <span>{clip(t.text, 140)}</span>
+            {t.provenance ? <span className="fx-hint">{t.provenance}</span> : null}
           </button></li>
         ))}
         {answers ? (
@@ -982,6 +983,7 @@ function FactoryPage() {
   const tix = Object.fromEntries(data.tickets.map((t) => [t.identifier, t]));
   const done4u = data.status.done_for_you || [];
   const needsOf = (runId) => waiting.filter((x) => x.run_id === runId).length;
+  const briefReviews = data.brief_reviews || [];
   // Needs you, one line per thing, each to its stage and the thing itself: an executor answer not delivered (Run), a
   // draft's planner questions with its review (its plan in Review, at the first open question), any other decision (its
   // card in its stage's deck, with its dispatch selected when that dispatch is in the same stage).
@@ -1001,6 +1003,11 @@ function FactoryPage() {
       return [{ key: `r${x.run_id}`, stage: "review", run: x.run_id, decision: (qs[0] || reviewOf[x.run_id] || x).id, tone: "amber",
                 kind: "Review", text: `${d ? dispatchTitle(d, titles) : x.run_id}${qs.length ? ` · ${plural(qs.length, "question")}` : ""}` }];
     }),
+    ...briefReviews.map((b) => ({
+      key: `b${b.id}`, stage: "strategy", brief: b.id, tone: "blue", kind: "Review draft brief",
+      text: b.title || `Brief #${b.id}`,
+      provenance: `${b.created_by === "agent:brief-proposer" ? "Auto-proposed" : b.created_by || "Draft"} · #${b.id}${b.created_at ? ` · ${ago(b.created_at)}` : ""}`,
+    })),
   ];
   const context = (x) => (byRun[x.run_id] ? clip(dispatchTitle(byRun[x.run_id], titles), 60) : x.identifier ? `${x.identifier} ${clip(x.title, 50)}` : null);
   const openCtx = (x) => (byRun[x.run_id] ? go({ stage: byRun[x.run_id].phase, run: x.run_id }, { jump: true })
@@ -1075,7 +1082,7 @@ function FactoryPage() {
     <div className="fx" ref={root}>
       <Toast toast={toast} />
       <header className="fx-head">
-        <NeedsYou items={targets} decisions={waiting.length} answers={data.ticket_counts?.answer || 0}
+        <NeedsYou items={targets} decisions={waiting.length} briefReviews={briefReviews.length} answers={data.ticket_counts?.answer || 0}
           prs={prState.error ? null : prState.data?.count} prLoading={prState.loading} prError={prState.error || prState.data?.error}
           open={needsOpen} onToggle={setNeedsOpen} onGo={jumpTo} />
         <div className="fx-row fx-hint"><Health jobs={data.jobs} /><span>·</span>{connection}</div>
