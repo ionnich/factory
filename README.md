@@ -414,8 +414,13 @@ round, or explicitly start an **agentic** round. Both modes run a bounded pass l
 reports `evidence` (asking for read-only domain-witness queries, up to 4, which the server runs and feeds back next
 pass), `blocked` (required recorded evidence is unavailable), or `ready` (a validated review). **Manual** finalizes
 on its first `ready`. **Agentic** never finalizes on its first `ready`: that pass is retained as a DRAFT candidate,
-and a later **critique** pass must re-examine it against the evidence; only a later `ready` after that critique
-finalizes the review. If the budget is consumed before a critique-finalized `ready`, the review records
+and a later **critique** pass must re-examine it against the evidence. A revised review returns `ready`; an unchanged
+candidate returns the model-only `confirmed` envelope with a substantive assessment and no copied review object.
+The server rejects confirmation before a candidate exists; a valid confirmation records the exact retained candidate
+as a `ready` critique round and final result, never as ticket approval. This avoids regenerating an identical large
+review. The critique receives the candidate's assessment as well as its exact contents and checks specific claims,
+not the server-recorded snapshot metadata again. Each pass still has a 600-second deadline.
+If the budget is consumed before a critique-finalized `ready`, the review records
 `outcome=limit_reached` — never a falsely-final result. Each pass carries its assessment, its witness queries and
 receipts, and (for `ready`) its validated review forward to the next pass; a child review's prompt receives the
 parent's exact committed result (or its latest retained draft candidate if the parent never finalized) plus the
