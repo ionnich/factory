@@ -118,7 +118,7 @@
                        display: grid; gap: .15rem; font-size: .82rem; }
 .fx-health-runs-list li { display: grid; }
 .fx-health-runs-list .fx-run { display: grid; gap: .1rem; width: 100%; text-align: left; background: none; border: 0;
-                               padding: .35rem .5rem; border-radius: var(--fx-r-sm); font: inherit; cursor: pointer; }
+                               min-height: 44px; padding: .35rem .5rem; border-radius: var(--fx-r-sm); font: inherit; cursor: pointer; }
 .fx-health-runs-list .fx-run:hover { background: var(--fx-fill); }
 .fx-health-runs-list .fx-run:focus-visible { outline: 2px solid var(--fx-lavender); outline-offset: 2px; }
 .fx-health-runs-list .t { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fx-fg); }
@@ -144,6 +144,8 @@
   --fx-r-sm: 6px; --fx-r: 8px;
 }
 .fx-dialog-body { display: grid; gap: .6rem; padding: .8rem; }
+/* The SDK dialog's built-in close (X) is 24px; give it a 44px hit target while keeping the icon in place. */
+.fx-dialog [data-slot="dialog-close"] { width: 44px; height: 44px; top: 2px; right: 2px; }
 /* A run's recorded error/status and its output preview, opened from a run row (read-only). */
 .fx-run-out { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font: inherit; font-size: .82rem;
               color: var(--fx-fg); background: var(--fx-panel); border: 1px solid var(--fx-line);
