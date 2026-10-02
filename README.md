@@ -397,7 +397,7 @@ API (all under `/api/plugins/factory`; the actor is always `user:dashboard` from
 
 Review summaries add `parent_review_id`, `feedback`, `mode`, `round_count` and `outcome`
 (`ready|blocked|limit_reached|null`). Detail adds `history` (chronological lineage summaries) and `rounds`
-(ordered pass records `{number, assessment, outcome, witnesses}`), where each witness receipt is
+(ordered pass records `{number, assessment, outcome, receipts}`), where each witness receipt is
 `{id,name,query,at,ok,result,error}` mapped truthfully from the append-only `witness_log` rows that round produced.
 
 CLI equivalent: `factory strategy domain-list|domain-show|domain-groom|domain-run|domain-approve|domain-brief`.
