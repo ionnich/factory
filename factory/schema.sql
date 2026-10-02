@@ -219,6 +219,48 @@ CREATE TABLE brief_investigation (
 CREATE UNIQUE INDEX brief_investigation_active ON brief_investigation(brief_id)
 WHERE status IN ('pending', 'running');
 
+-- Domain grooming: a durable, read-only DeepSeek review of one canonical Domain project's open tickets. Active work
+-- is unique per domain; a completed review's validated result is appended once. Approval (a person only) freezes the
+-- exact selected ticket mutations into writeback rows (run_id = domain-<id>) for the normal reconcile cron; approved
+-- payload is pinned, never editable by the reconcile agent. Simplification becomes a separate unapproved work brief.
+CREATE TABLE domain_review (
+  id                INTEGER PRIMARY KEY,
+  domain_id         TEXT NOT NULL REFERENCES linear_project(id),
+  goal              TEXT NOT NULL DEFAULT '' CHECK (length(goal) <= 2000),
+  status            TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+  requested_at      TEXT NOT NULL,
+  started_at        TEXT,
+  completed_at      TEXT,
+  error             TEXT,
+  approved_at       TEXT,
+  approved_by       TEXT,
+  proposal_brief_id INTEGER REFERENCES work_brief(id),
+  result_json       TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+  context_json      TEXT NOT NULL CHECK (json_valid(context_json)),
+  CHECK (status IN ('pending', 'running') OR completed_at IS NOT NULL),
+  CHECK (status <> 'completed' OR result_json IS NOT NULL),
+  CHECK (status <> 'failed' OR error IS NOT NULL),
+  CHECK ((approved_at IS NULL) = (approved_by IS NULL)),
+  CHECK (approved_at IS NULL OR (approved_by NOT GLOB 'agent:*' AND approved_by NOT GLOB 'factory:*'))
+);
+CREATE UNIQUE INDEX domain_review_active ON domain_review(domain_id)
+WHERE status IN ('pending', 'running');
+
+-- Which exact ticket dispositions a person froze into writes. Append-only: a repeated approval of the same ticket is
+-- a no-op (writeback PRIMARY KEY already guards the rows), never a duplicate write.
+CREATE TABLE domain_review_approval (
+  review_id   INTEGER NOT NULL REFERENCES domain_review(id),
+  identifier  TEXT NOT NULL,
+  action      TEXT NOT NULL CHECK (action IN ('rewrite', 'merge', 'close')),
+  approved_at TEXT NOT NULL,
+  approved_by TEXT NOT NULL CHECK (approved_by NOT GLOB 'agent:*' AND approved_by NOT GLOB 'factory:*'),
+  PRIMARY KEY (review_id, identifier)
+);
+CREATE TRIGGER domain_review_approval_append_u BEFORE UPDATE ON domain_review_approval
+BEGIN SELECT RAISE(ABORT, 'domain review approvals are append-only'); END;
+CREATE TRIGGER domain_review_approval_append_d BEFORE DELETE ON domain_review_approval
+BEGIN SELECT RAISE(ABORT, 'domain review approvals are append-only'); END;
+
 -- Exact version -> verdict bridge, written by the prune slice. A source is verified for a specific brief VERSION,
 -- never borrowed from a prior version: each newly approved version/amendment must be explicitly re-pruned. One
 -- verdict per (version, source); re-prune upserts the same key. No guessed ticket FK (linear_snapshot's PK is

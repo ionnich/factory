@@ -671,6 +671,24 @@ def cmd_strategy(cfg, conn, a):
     if a.scmd == "investigate-run":
         from . import brief_investigate
         return out(brief_investigate.run(cfg, conn, a.id))
+    if a.scmd == "domain-list":
+        from . import domain_groom
+        return out(domain_groom.list_(cfg, conn))
+    if a.scmd == "domain-show":
+        from . import domain_groom
+        return out(domain_groom.detail(cfg, conn, a.review_id))
+    if a.scmd == "domain-groom":
+        from . import domain_groom
+        return out(domain_groom.request(cfg, conn, a.domain_id, a.goal or ""))
+    if a.scmd == "domain-run":
+        from . import domain_groom
+        return out(domain_groom.run(cfg, conn, a.review_id))
+    if a.scmd == "domain-approve":
+        from . import domain_groom
+        return out(domain_groom.approve(cfg, conn, a.review_id, a.identifiers, a.actor))
+    if a.scmd == "domain-brief":
+        from . import domain_groom
+        return out(domain_groom.brief(cfg, conn, a.review_id, a.actor))
     if a.scmd == "create":
         return out(strategy.create(cfg, conn, a.identifiers, a.actor, body=_json_body(a.body) if a.body else None))
     if a.scmd == "revise":
@@ -879,6 +897,29 @@ def main(argv=None):
     s.set_defaults(fn=cmd_strategy)
     s = st.add_parser("investigate-run", help=argparse.SUPPRESS)
     s.add_argument("id", type=int)
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("domain-list", help="canonical owned domains with counts and the latest review summary each "
+                       "(JSON; no model or network)")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("domain-show", help="one domain review: context, validated result and its writebacks (JSON)")
+    s.add_argument("review_id", type=int)
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("domain-groom", help="start a durable read-only DeepSeek review of a domain's open tickets")
+    s.add_argument("domain_id")
+    s.add_argument("--goal", default="", help="optional focus for this review (bounded)")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("domain-run", help=argparse.SUPPRESS)
+    s.add_argument("review_id", type=int)
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("domain-approve", help="a person freezes the exact selected rewrite/merge/close dispositions "
+                       "into the reconcile writeback run")
+    s.add_argument("review_id", type=int)
+    s.add_argument("identifiers", nargs="+")
+    s.add_argument("--actor", default="user")
+    s.set_defaults(fn=cmd_strategy)
+    s = st.add_parser("domain-brief", help="a person creates the unapproved simplification brief from a review")
+    s.add_argument("review_id", type=int)
+    s.add_argument("--actor", default="user")
     s.set_defaults(fn=cmd_strategy)
     s = st.add_parser("create", help="draft a brief from the named sources (deterministic; optional body)")
     s.add_argument("identifiers", nargs="+")

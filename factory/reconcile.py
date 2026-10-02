@@ -167,6 +167,8 @@ def resolve(conn, run_id: str, identifier: str, op: str, body: str | None, flag_
                      "WHERE w.run_id=? AND l.identifier=? AND w.op=?", (run_id, identifier, op)).fetchone()
     if w is None or w["status"] != "planned":
         raise StageError(f"no planned {op} write for {identifier} in {run_id}")
+    if (w["rule"] or "").startswith("domain-groom"):
+        raise StageError("domain grooming writes are pinned by a person; the reconcile agent cannot edit or hold them")
     payload = json.loads(w["payload_json"])
     with db.tx(conn):
         if body is not None:
@@ -201,6 +203,66 @@ def _state_id(cfg: Config, issue: dict, name: str, cache: dict) -> str:
     return cache[tid][name]
 
 
+def _domain_of_live(conn, issue: dict):
+    """The canonical Domain project of a live Linear issue, resolved from its Domain: line (never issue.project)."""
+    return prune.domain_project(conn, {"raw_json": json.dumps(issue), "identifier": issue["identifier"]})
+
+
+def _domain_gate(cfg: Config, conn, issue: dict, p: dict, own_updated: set[str], own_state: set[str]) -> str | None:
+    """Why a domain-groom write is NOT allowed now, or None. Every check is re-run against a live read immediately
+    before each write; own writes this run are excluded from the freshness/state checks so a multi-write ticket's
+    title write never stales its own description write (and vice versa)."""
+    expect = p.get("expect_updated_at")
+    if expect and issue["updatedAt"] != expect and issue["updatedAt"] not in own_updated:
+        return f"ticket changed since the review ({expect} -> {issue['updatedAt']})"
+    who = (issue["assignee"] or {}).get("email")
+    if who not in (None, cfg.linear["lead"]):
+        return f"assigned to {who}"
+    if issue["state"]["type"] in ("completed", "canceled") and issue["id"] not in own_state:
+        return f"already {issue['state']['name']}"
+    if issue["state"]["name"] == team_cfg(cfg, issue).get("review_state"):
+        return f"waiting on human review ({issue['state']['name']})"
+    domain = _domain_of_live(conn, issue)
+    if domain is None or domain["id"] != p.get("domain_id"):
+        return "ticket left the reviewed domain"
+    if domain["lead_email"] != cfg.linear["lead"]:
+        return "domain no longer led by the factory lead"
+    if conn.execute("SELECT 1 FROM dispatch_ticket t JOIN dispatch d USING (run_id) "
+                    "WHERE t.issue_id=? AND d.state <> 'archived'", (issue["id"],)).fetchone():
+        return "ticket is in a live dispatch"
+    if p.get("target_issue_id"):
+        target = _live(cfg, p["target_issue_id"])
+        if target["state"]["type"] in ("completed", "canceled"):
+            return f"merge target {p.get('target')} is already closed"
+        tdomain = _domain_of_live(conn, target)
+        if tdomain is None or tdomain["id"] != p.get("domain_id"):
+            return f"merge target {p.get('target')} left the reviewed domain"
+    return None
+
+
+def _groom_write(cfg: Config, issue: dict, w, p: dict, states: dict) -> dict:
+    """One pinned domain-groom mutation. Returns {ok, ref, updated_at} (updated_at is the exact Linear updatedAt the
+    write produced, when the mutation reports it; comments report none). A rewrite carries its optional title and
+    description together in one description row and one mutation."""
+    if w["op"] == "description":
+        inp = {}
+        if p.get("title") is not None:
+            inp["title"] = p["title"]
+        if p.get("description") is not None:
+            inp["description"] = p["description"]
+        r = linear.gql(cfg, UPDATE, {"id": w["issue_id"], "input": inp})["issueUpdate"]
+        return {"ok": r["success"], "ref": r["issue"]["updatedAt"], "updated_at": r["issue"]["updatedAt"]}
+    if w["op"] == "state":
+        r = linear.gql(cfg, UPDATE, {"id": w["issue_id"], "input": {
+            "stateId": _state_id(cfg, issue, p["state"], states)}})["issueUpdate"]
+        return {"ok": r["success"] and r["issue"]["state"]["name"] == p["state"],
+                "ref": r["issue"]["updatedAt"], "updated_at": r["issue"]["updatedAt"]}
+    if w["op"] == "comment":
+        r = linear.gql(cfg, COMMENT, {"input": {"issueId": w["issue_id"], "body": p["body"]}})["commentCreate"]
+        return {"ok": r["success"], "ref": r["comment"]["id"], "updated_at": None}
+    raise StageError(f"domain groom op {w['op']} is not writable")
+
+
 def apply(cfg: Config, conn, run_id: str) -> dict:
     """Send planned apply rows (state first: a comment would bump updatedAt), ask about held ones, close the run."""
     # 'sent' = an apply claimed the row and never finished: Linear may or may not have it. Never resend; a person
@@ -217,6 +279,8 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
     order = "CASE op WHEN 'state' THEN 0 WHEN 'description' THEN 1 WHEN 'create' THEN 2 ELSE 3 END"
     states: dict = {}
     touched: set[str] = set()
+    own: dict[str, set[str]] = {}   # issue_id -> exact updatedAt values OUR groom writes produced this run
+    own_state: set[str] = set()     # issue ids WE canceled this run (so a follow-up comment is not "already closed")
     for w in conn.execute(f"SELECT * FROM writeback WHERE run_id=? AND status IN ('planned','failed') "
                           f"ORDER BY issue_id, {order}", (run_id,)).fetchall():
         key = (run_id, w["issue_id"], w["op"])
@@ -226,54 +290,78 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
             continue
         p = json.loads(w["payload_json"])
         decision, reason = w["decision"], w["reason"]
+        groom = (w["rule"] or "").startswith("domain-groom")
         try:
             if decision == "apply":
                 issue = _live(cfg, w["issue_id"])
-                touched.add(w["issue_id"])
-                if w["op"] == "state":
-                    if why := state_gate(cfg, issue, p.get("expect_updated_at")):
+                if groom:
+                    # A person froze this exact payload; every gate is re-checked live, and only the pinned content
+                    # is sent (never reworded). Own writes this run are excluded from freshness/state checks.
+                    if why := _domain_gate(cfg, conn, issue, p, own.get(w["issue_id"], set()), own_state):
                         decision, reason = "flag", f"apply-time gate: {why}"
                         conn.execute("UPDATE writeback SET decision='flag', reason=? WHERE run_id=? AND issue_id=? "
                                      "AND op=?", (reason, *key))
                     else:
-                        r = linear.gql(cfg, UPDATE, {"id": w["issue_id"], "input": {
-                            "stateId": _state_id(cfg, issue, p["state"], states)}})["issueUpdate"]
-                        ok = r["success"] and r["issue"]["state"]["name"] == p["state"]
-                        conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
-                                     ("confirmed" if ok else "failed", r["issue"]["updatedAt"], *key))
-                elif w["op"] == "description":
-                    desc = issue.get("description") or ""
-                    new = (_COMPLETION.sub(lambda _: p["completion"].rstrip("\n") + "\n\n", desc, count=1)
-                           if _COMPLETION.search(desc) else desc.rstrip("\n") + "\n\n" + p["completion"])
-                    r = linear.gql(cfg, UPDATE, {"id": w["issue_id"], "input": {"description": new}})["issueUpdate"]
-                    conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
-                                 ("confirmed" if r["success"] else "failed", r["issue"]["updatedAt"], *key))
-                elif w["op"] == "create":  # follow-up ticket; issue_id is the parent it was split from
-                    r = linear.gql(cfg, CREATE, {"input": {"teamId": p["team_id"], "title": p["title"],
-                                                           "description": p["description"],
-                                                           "stateId": _state_id(cfg, {"team": {"id": p["team_id"]}},
-                                                                                p["state"], states)}})["issueCreate"]
-                    # Record the new id before relating it; the except below leaves a confirmed row alone, so a
-                    # failed relation can never re-create the ticket (the relation is then simply missing).
-                    conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
-                                 ("confirmed" if r["success"] else "failed", r["issue"]["identifier"], *key))
-                    linear.gql(cfg, RELATE, {"input": {"issueId": r["issue"]["id"], "relatedIssueId": w["issue_id"],
-                                                       "type": "related"}})
+                        r = _groom_write(cfg, issue, w, p, states)
+                        if r["ok"]:
+                            conn.execute("UPDATE writeback SET status='confirmed', linear_ref=? "
+                                         "WHERE run_id=? AND issue_id=? AND op=?", (r["ref"], *key))
+                            if r["updated_at"]:
+                                own.setdefault(w["issue_id"], set()).add(r["updated_at"])
+                            if w["op"] == "state":
+                                own_state.add(w["issue_id"])
+                        else:
+                            conn.execute("UPDATE writeback SET status='failed' WHERE run_id=? AND issue_id=? AND op=?",
+                                         key)
                 else:
-                    r = linear.gql(cfg, COMMENT, {"input": {"issueId": w["issue_id"], "body": p["body"]}})
-                    r = r["commentCreate"]
-                    conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
-                                 ("confirmed" if r["success"] else "failed", r["comment"]["id"], *key))
+                    touched.add(w["issue_id"])
+                    if w["op"] == "state":
+                        if why := state_gate(cfg, issue, p.get("expect_updated_at")):
+                            decision, reason = "flag", f"apply-time gate: {why}"
+                            conn.execute("UPDATE writeback SET decision='flag', reason=? WHERE run_id=? AND issue_id=? "
+                                         "AND op=?", (reason, *key))
+                        else:
+                            r = linear.gql(cfg, UPDATE, {"id": w["issue_id"], "input": {
+                                "stateId": _state_id(cfg, issue, p["state"], states)}})["issueUpdate"]
+                            ok = r["success"] and r["issue"]["state"]["name"] == p["state"]
+                            conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
+                                         ("confirmed" if ok else "failed", r["issue"]["updatedAt"], *key))
+                    elif w["op"] == "description":
+                        desc = issue.get("description") or ""
+                        new = (_COMPLETION.sub(lambda _: p["completion"].rstrip("\n") + "\n\n", desc, count=1)
+                               if _COMPLETION.search(desc) else desc.rstrip("\n") + "\n\n" + p["completion"])
+                        r = linear.gql(cfg, UPDATE, {"id": w["issue_id"], "input": {"description": new}})["issueUpdate"]
+                        conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
+                                     ("confirmed" if r["success"] else "failed", r["issue"]["updatedAt"], *key))
+                    elif w["op"] == "create":  # follow-up ticket; issue_id is the parent it was split from
+                        r = linear.gql(cfg, CREATE, {"input": {"teamId": p["team_id"], "title": p["title"],
+                                                               "description": p["description"],
+                                                               "stateId": _state_id(cfg, {"team": {"id": p["team_id"]}},
+                                                                                    p["state"], states)}})["issueCreate"]
+                        # Record the new id before relating it; the except below leaves a confirmed row alone, so a
+                        # failed relation can never re-create the ticket (the relation is then simply missing).
+                        conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
+                                     ("confirmed" if r["success"] else "failed", r["issue"]["identifier"], *key))
+                        linear.gql(cfg, RELATE, {"input": {"issueId": r["issue"]["id"], "relatedIssueId": w["issue_id"],
+                                                           "type": "related"}})
+                    else:
+                        r = linear.gql(cfg, COMMENT, {"input": {"issueId": w["issue_id"], "body": p["body"]}})
+                        r = r["commentCreate"]
+                        conn.execute("UPDATE writeback SET status=?, linear_ref=? WHERE run_id=? AND issue_id=? AND op=?",
+                                     ("confirmed" if r["success"] else "failed", r["comment"]["id"], *key))
             if decision == "flag":  # held: the user decides (apply anyway / skip / do it in Linear)
-                decide.writeback(conn, run_id, w["issue_id"], w["op"], p, reason)
+                decide.writeback(conn, run_id, w["issue_id"], w["op"], p, reason, rule=w["rule"])
             if decision in ("flag", "skip"):
                 conn.execute("UPDATE writeback SET status='confirmed' WHERE run_id=? AND issue_id=? AND op=?", key)
         except Exception as e:  # one bad write never blocks the rest; failed rows retry on the next apply
             conn.execute("UPDATE writeback SET status='failed', reason=? WHERE run_id=? AND issue_id=? AND op=? "
                          "AND status='sent'", (f"{type(e).__name__}: {e}"[:400], *key))
-    # Our own writes bump updatedAt. Record the result so prune does not treat it as a ticket change and
-    # re-verify (which re-plans the same comment every sweep). ponytail: a human edit landing between our
-    # write and this read is also absorbed; the next human edit re-arms it.
+    # Domain grooming records the EXACT updatedAt values its own mutations returned: multi-write tickets record each
+    # write without absorbing an external edit that lands after ours. Legacy writes keep their re-read (a human edit
+    # between the write and read is absorbed there; the next human edit re-arms it).
+    for issue_id, stamps in own.items():
+        for stamp in stamps:
+            conn.execute("INSERT OR IGNORE INTO linear_own_write VALUES (?,?)", (issue_id, stamp))
     for issue_id in touched:
         try:
             conn.execute("INSERT OR IGNORE INTO linear_own_write VALUES (?,?)",
