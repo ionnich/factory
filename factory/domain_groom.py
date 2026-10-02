@@ -82,6 +82,13 @@ def _domain_tickets(cfg, conn, domain_id: str) -> list:
     return out
 
 
+def _domain_of_description(conn, description):
+    """The canonical Domain project a proposed description resolves to (its Domain: line), or None. Used to prove a
+    rewrite does not drop or move the ticket out of the reviewed domain."""
+    return prune.domain_project(conn, {"raw_json": json.dumps({"description": description or "",
+                                                               "labels": {"nodes": []}}), "identifier": None})
+
+
 def _capture(cfg, conn, domain, goal: str) -> dict:
     """Server-captured evidence for the worker: recorded facts only, no model, no network, no Linear."""
     domain_id = domain["id"]
@@ -234,10 +241,11 @@ def _cuts(v, max_items: int = 20) -> list[dict]:
     return out
 
 
-def _tickets(v, ctx: dict, cut_ids: set[str]) -> list[dict]:
+def _tickets(v, ctx: dict, cut_ids: set[str], conn) -> list[dict]:
     if not isinstance(v, list):
         raise StageError("tickets: list of dispositions")
     open_tickets = {t["identifier"]: t for t in ctx["tickets"]}
+    domain_id = ctx["domain"]["id"]
     by_id = {}
     for t in v:
         if not isinstance(t, dict) or set(t) != _TICKET_KEYS:
@@ -262,6 +270,11 @@ def _tickets(v, ctx: dict, cut_ids: set[str]) -> list[dict]:
             description = _opt_str(f"{ident} description", t["description"], 1, 20000)
             if title is None and description is None:
                 raise StageError(f"ticket {ident}: a rewrite needs a new title and/or description")
+            if description is not None:
+                # the exact proposed description must keep the ticket in the SAME canonical Domain project
+                d = _domain_of_description(conn, description)
+                if d is None or d["id"] != domain_id:
+                    raise StageError(f"ticket {ident}: the proposed description drops or moves its Domain line")
         else:
             if t["title"] is not None or t["description"] is not None:
                 raise StageError(f"ticket {ident}: title/description are only for a rewrite")
@@ -286,6 +299,9 @@ def _tickets(v, ctx: dict, cut_ids: set[str]) -> list[dict]:
                 raise StageError(f"ticket {t['identifier']} merge target {target!r} is not in the domain")
             if by_id[target]["action"] not in _RETAINED_ACTIONS:
                 raise StageError(f"ticket {t['identifier']} merge target {target!r} must be kept or rewritten")
+            if not open_tickets[target]["mutable"]:
+                raise StageError(f"ticket {t['identifier']} merge target {target!r} is not mutable "
+                                 f"({open_tickets[target]['blocker']})")
     return [by_id[i] for i in sorted(by_id)]
 
 
@@ -312,7 +328,7 @@ def _simplification(v, tickets: list[dict]) -> dict | None:
     return {"identifiers": identifiers, "body": norm}
 
 
-def _validate_output(value, ctx: dict) -> dict:
+def _validate_output(value, ctx: dict, conn) -> dict:
     if not isinstance(value, dict) or set(value) != _RESULT_KEYS:
         raise StageError(f"domain review output fields must be exactly {sorted(_RESULT_KEYS)}")
     minimum_system = _one_str("minimum_system", value["minimum_system"], 1, 4000)
@@ -320,7 +336,7 @@ def _validate_output(value, ctx: dict) -> dict:
     correctness = _strs("correctness", value["correctness"], max_items=100)
     limitations = _strs("limitations", value["limitations"], max_items=100)
     cuts = _cuts(value["cuts"])
-    tickets = _tickets(value["tickets"], ctx, {c["id"] for c in cuts})
+    tickets = _tickets(value["tickets"], ctx, {c["id"] for c in cuts}, conn)
     simplification = _simplification(value["simplification"], tickets)
     return {"minimum_system": minimum_system, "consumers": consumers, "correctness": correctness,
             "cuts": cuts, "tickets": tickets, "simplification": simplification, "limitations": limitations}
@@ -407,7 +423,7 @@ def run(cfg, conn, review_id: int, runner=subprocess.run) -> dict:
             detail = (proc.stderr or proc.stdout or "no output").strip()[-800:]
             raise StageError(f"omp domain review failed ({proc.returncode}): {detail}")
         parsed = strategy._parse_model_json(proc.stdout)
-        result = _validate_output(parsed, ctx)
+        result = _validate_output(parsed, ctx, conn)
         return _commit(conn, review_id, result)
     except subprocess.TimeoutExpired:
         return _fail(conn, review_id, f"domain review timed out after {TIMEOUT}s", ("running",))
@@ -459,8 +475,36 @@ def list_(cfg, conn) -> dict:
     return {"domains": domains, "reviews": [r for r in rows(conn).values()]}
 
 
-def _stale(cfg, conn, row, identifiers: list[str]) -> str | None:
-    """Why this completed review's recorded evidence no longer holds for the selected tickets, or None."""
+def _ticket_fresh(cfg, conn, ctx, ident: str, own_run: str | None = None) -> str | None:
+    """Why one ticket's recorded evidence no longer holds, or None. `own_run`: the review's writeback run — a merge
+    target may have changed only via THIS review's own confirmed rewrite (exact returned timestamp), never an
+    external edit."""
+    by_ident = {t["identifier"]: t for t in ctx["tickets"]}
+    t = by_ident[ident]
+    cur = conn.execute("SELECT * FROM linear_latest WHERE issue_id=?", (t["issue_id"],)).fetchone()
+    if cur is None:
+        return f"{ident} changed since the review"
+    if cur["updated_at"] != t["snapshot_updated_at"]:
+        ok = own_run is not None and conn.execute(
+            "SELECT 1 FROM writeback WHERE run_id=? AND issue_id=? AND op='description' "
+            "AND rule='domain-groom-rewrite' AND status='confirmed' AND linear_ref=?",
+            (own_run, t["issue_id"], cur["updated_at"])).fetchone() is not None
+        if not ok:
+            return f"{ident} changed since the review"
+    rel = relationships.snapshot(conn, ident)
+    captured = t.get("relationships") or {}
+    if (rel.get("complete") != bool(captured.get("complete"))
+            or rel.get("fingerprint") != captured.get("fingerprint")):
+        return f"{ident} relationships changed since the review"
+    source = strategy._sources_for(cfg, conn, [ident])[0]
+    if fact := strategy._source_safety(cfg, conn, source):
+        return f"{ident} is no longer eligible: {fact['reason']}"
+    return None
+
+
+def _stale(cfg, conn, row, todos: list[dict]) -> str | None:
+    """Why this completed review's recorded evidence no longer holds for the selected dispositions, or None. Both
+    merge endpoints are checked: the source strictly, and the target with the review's own-rewrite allowance."""
     ctx = json.loads(row["context_json"])
     for m in ctx["mirrors"]:
         if m["trunk_sha"] is None:
@@ -468,20 +512,13 @@ def _stale(cfg, conn, row, identifiers: list[str]) -> str | None:
         trunk = conn.execute("SELECT sha FROM repo_trunk WHERE repo=?", (m["repo"],)).fetchone()
         if trunk is None or trunk["sha"] != m["trunk_sha"]:
             return f"mirror {m['repo']} moved since the review"
-    by_ident = {t["identifier"]: t for t in ctx["tickets"]}
-    for ident in identifiers:
-        t = by_ident[ident]
-        cur = conn.execute("SELECT * FROM linear_latest WHERE issue_id=?", (t["issue_id"],)).fetchone()
-        if cur is None or cur["updated_at"] != t["snapshot_updated_at"]:
-            return f"{ident} changed since the review"
-        rel = relationships.snapshot(conn, ident)
-        captured = t.get("relationships") or {}
-        if (rel.get("complete") != bool(captured.get("complete"))
-                or rel.get("fingerprint") != captured.get("fingerprint")):
-            return f"{ident} relationships changed since the review"
-        source = strategy._sources_for(cfg, conn, [ident])[0]
-        if fact := strategy._source_safety(cfg, conn, source):
-            return f"{ident} is no longer eligible: {fact['reason']}"
+    run_id = f"domain-{row['id']}"
+    for t in todos:
+        if why := _ticket_fresh(cfg, conn, ctx, t["identifier"]):
+            return why
+        if t["action"] == "merge":
+            if why := _ticket_fresh(cfg, conn, ctx, t["target"], own_run=run_id):
+                return f"merge target: {why}"
     return None
 
 
@@ -513,13 +550,16 @@ def _queue_writes(conn, review_id: int, domain_id: str, t: dict, issue: dict, op
         insert("state", {**base, "state": state})
         insert("comment", {**base, "body": body})
         return
-    # merge: close this ticket into the retained target, validated at apply time on both endpoints
+    # merge: close this ticket into the retained target, validated at apply time on both endpoints. The target's
+    # pinned updatedAt is the approval-time snapshot, so its own confirmed rewrite is the only allowed drift.
     rule = "domain-groom-merge"
     state = _team_state(cfg, issue["team_key"], "canceled_state")
     body = f"Factory domain grooming: merged into {t['target']}. {t['reason']}"
-    target_id = open_by_ident[t["target"]]["issue_id"]
-    insert("state", {**base, "state": state, "target": t["target"], "target_issue_id": target_id})
-    insert("comment", {**base, "body": body, "target": t["target"], "target_issue_id": target_id})
+    target = open_by_ident[t["target"]]
+    insert("state", {**base, "state": state, "target": t["target"], "target_issue_id": target["issue_id"],
+                     "target_expect_updated_at": target["snapshot_updated_at"]})
+    insert("comment", {**base, "body": body, "target": t["target"], "target_issue_id": target["issue_id"],
+                       "target_expect_updated_at": target["snapshot_updated_at"]})
 
 
 def approve(cfg, conn, review_id: int, identifiers, actor: str) -> dict:
@@ -541,65 +581,91 @@ def approve(cfg, conn, review_id: int, identifiers, actor: str) -> dict:
     selected = [by_id[i] for i in idents]
     if non := sorted({t["identifier"] for t in selected if t["action"] not in _MUTATION_ACTIONS}):
         raise StageError("only rewrite/merge/close dispositions mutate Linear; not: " + ", ".join(non))
-    already = {r[0] for r in conn.execute("SELECT identifier FROM domain_review_approval WHERE review_id=?", (review_id,))}
-    todo = [t for t in selected if t["identifier"] not in already]
-    if not todo:
-        return detail(cfg, conn, review_id)  # idempotent: everything selected is already frozen
-    if why := _stale(cfg, conn, row, [t["identifier"] for t in todo]):
-        raise StageError(f"stale review: {why}; request a fresh review")
     ctx = json.loads(row["context_json"])
     open_by_ident = {t["identifier"]: t for t in ctx["tickets"]}
+    # Re-validate and queue inside ONE transaction: a concurrent approval cannot interleave its already-check.
     with db.tx(conn):
+        already = {r[0] for r in conn.execute("SELECT identifier FROM domain_review_approval WHERE review_id=?",
+                                              (review_id,))}
+        todo = [t for t in selected if t["identifier"] not in already]
+        if not todo:
+            return detail(cfg, conn, review_id)  # idempotent: everything selected is already frozen
+        # a merge whose target is a rewrite needs that rewrite selected (or already approved) — otherwise its source
+        # cancel could never be confirmed and would strand planned forever.
+        frozen = already | {t["identifier"] for t in selected}
+        for t in todo:
+            if t["action"] == "merge" and by_id[t["target"]]["action"] == "rewrite" and t["target"] not in frozen:
+                raise StageError(f"merging {t['identifier']} needs its target rewrite {t['target']} selected")
+        if why := _stale(cfg, conn, row, todo):
+            raise StageError(f"stale review: {why}; request a fresh review")
+        for t in todo:  # the exact proposed description must keep the ticket in the reviewed domain
+            if t["action"] == "rewrite" and t["description"] is not None:
+                d = _domain_of_description(conn, t["description"])
+                if d is None or d["id"] != row["domain_id"]:
+                    raise StageError(f"rewrite of {t['identifier']} drops or moves its Domain line")
         now = db.now()
         for t in todo:
             _queue_writes(conn, review_id, row["domain_id"], t, open_by_ident[t["identifier"]], open_by_ident, cfg, now)
             conn.execute("INSERT INTO domain_review_approval(review_id, identifier, action, approved_at, approved_by) "
                          "VALUES (?,?,?,?,?)", (review_id, t["identifier"], t["action"], now, actor))
-        conn.execute("UPDATE domain_review SET approved_at=coalesce(approved_at, ?), approved_by=? WHERE id=?",
-                     (now, actor, review_id))
+        conn.execute("UPDATE domain_review SET approved_at=coalesce(approved_at, ?), "
+                     "approved_by=coalesce(approved_by, ?) WHERE id=?", (now, actor, review_id))
     return detail(cfg, conn, review_id)
 
 
 def brief(cfg, conn, review_id: int, actor: str) -> dict:
-    """A person creates the unapproved simplification brief from result.simplification, after reconcile finished and
-    the retained sources still hold. Idempotent: returns the existing brief once created."""
+    """A person creates the unapproved simplification brief from result.simplification, after the selected changes
+    were actually applied and the retained sources still hold. Idempotent and atomic: the create and the
+    proposal_brief_id pin commit together, so concurrent requests create at most one brief."""
     if not strategy._is_human(actor):
         raise StageError("only a person creates a simplification brief")
-    row = _one(conn, review_id)
-    if row["status"] != "completed":
-        raise StageError(f"domain review #{review_id} is {row['status']}, not completed")
-    if row["proposal_brief_id"] is not None:
-        return {"brief": strategy.get(conn, row["proposal_brief_id"])}
-    result = json.loads(row["result_json"])
-    simp = result.get("simplification")
-    if not simp:
-        raise StageError("this review proposes no code simplification; no brief to create")
     run_id = f"domain-{review_id}"
-    pending = conn.execute("SELECT count(*) FROM writeback WHERE run_id=? AND status <> 'confirmed' "
-                           "AND decision <> 'skip'", (run_id,)).fetchone()[0]
-    if pending:
-        raise StageError(f"{pending} write(s) for this review are not yet reconciled; create the brief after "
-                         "reconcile finishes")
-    identifiers = simp["identifiers"]
-    ctx = json.loads(row["context_json"])
-    by_ident = {t["identifier"]: t for t in ctx["tickets"]}
-    sources = strategy._sources_for(cfg, conn, identifiers)
-    for s in sources:
-        if fact := strategy._source_safety(cfg, conn, s):
-            raise StageError(f"source {s['identifier']} is no longer eligible: {fact['reason']}")
-        prior = by_ident.get(s["identifier"])
-        if prior is None:
-            raise StageError(f"source {s['identifier']} was not an open ticket of this review")
-        if s["snapshot_updated_at"] != prior["snapshot_updated_at"]:
-            # our own reconciled rewrite/close is not drift; an external change still refuses the proposal
-            if not conn.execute("SELECT 1 FROM linear_own_write WHERE issue_id=? AND updated_at=?",
-                                (s["issue_id"], s["snapshot_updated_at"])).fetchone():
-                raise StageError(f"source {s['identifier']} changed since the review; request a fresh review")
-    norm = strategy._normalize_body(simp["body"], sources, False)
-    candidates = set(strategy._dependency_candidates(sources))
-    if bad := sorted(set(norm["dependencies"]) - candidates):
-        raise StageError("simplification dependency lacks recorded provenance: " + ", ".join(bad))
-    created = strategy.create(cfg, conn, identifiers, actor, body=norm)
     with db.tx(conn):
+        row = _one(conn, review_id)
+        if row["status"] != "completed":
+            raise StageError(f"domain review #{review_id} is {row['status']}, not completed")
+        if row["proposal_brief_id"] is not None:
+            return {"brief": strategy.get(conn, row["proposal_brief_id"])}
+        result = json.loads(row["result_json"])
+        simp = result.get("simplification")
+        if not simp:
+            raise StageError("this review proposes no code simplification; no brief to create")
+        # actually applied, not just terminal: a held/flagged/skipped/failed/sent write is not applied evidence
+        unapplied = conn.execute("SELECT count(*) FROM writeback WHERE run_id=? AND NOT "
+                                 "(status='confirmed' AND decision='apply')", (run_id,)).fetchone()[0]
+        if unapplied:
+            raise StageError(f"{unapplied} selected write(s) were not actually applied; create the brief after "
+                             "reconcile finishes")
+        ctx = json.loads(row["context_json"])
+        for m in ctx["mirrors"]:
+            if m["trunk_sha"] is None:
+                continue
+            trunk = conn.execute("SELECT sha FROM repo_trunk WHERE repo=?", (m["repo"],)).fetchone()
+            if trunk is None or trunk["sha"] != m["trunk_sha"]:
+                raise StageError(f"mirror {m['repo']} moved since the review")
+        identifiers = simp["identifiers"]
+        by_ident = {t["identifier"]: t for t in ctx["tickets"]}
+        sources = strategy._sources_for(cfg, conn, identifiers)
+        for s in sources:
+            if fact := strategy._source_safety(cfg, conn, s):
+                raise StageError(f"source {s['identifier']} is no longer eligible: {fact['reason']}")
+            prior = by_ident.get(s["identifier"])
+            if prior is None:
+                raise StageError(f"source {s['identifier']} was not an open ticket of this review")
+            if s["snapshot_updated_at"] != prior["snapshot_updated_at"]:
+                # accept only THIS review's exact own confirmed write, never an arbitrary linear_own_write row
+                if not conn.execute("SELECT 1 FROM writeback WHERE run_id=? AND issue_id=? AND status='confirmed' "
+                                    "AND linear_ref=?", (run_id, s["issue_id"], s["snapshot_updated_at"])).fetchone():
+                    raise StageError(f"source {s['identifier']} changed since the review; request a fresh review")
+            rel = relationships.snapshot(conn, s["identifier"])
+            captured = prior.get("relationships") or {}
+            if (rel.get("complete") != bool(captured.get("complete"))
+                    or rel.get("fingerprint") != captured.get("fingerprint")):
+                raise StageError(f"source {s['identifier']} relationships changed since the review")
+        norm = strategy._normalize_body(simp["body"], sources, False)
+        candidates = set(strategy._dependency_candidates(sources))
+        if bad := sorted(set(norm["dependencies"]) - candidates):
+            raise StageError("simplification dependency lacks recorded provenance: " + ", ".join(bad))
+        created = strategy.create(cfg, conn, identifiers, actor, body=norm)
         conn.execute("UPDATE domain_review SET proposal_brief_id=? WHERE id=?", (created["id"], review_id))
-    return {"brief": strategy.get(conn, created["id"])}
+        return {"brief": strategy.get(conn, created["id"])}

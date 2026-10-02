@@ -538,6 +538,12 @@ CREATE TABLE work_brief (
   parent_id INTEGER REFERENCES work_brief(id),
   state TEXT NOT NULL
 );
+CREATE TABLE writeback (
+  run_id TEXT NOT NULL, issue_id TEXT NOT NULL,
+  op TEXT NOT NULL, payload_json TEXT NOT NULL, decision TEXT NOT NULL,
+  rule TEXT NOT NULL, reason TEXT, status TEXT NOT NULL, linear_ref TEXT, approved_by TEXT,
+  PRIMARY KEY (run_id, issue_id, op)
+);
 """
 
 

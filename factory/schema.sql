@@ -245,6 +245,14 @@ CREATE TABLE domain_review (
 );
 CREATE UNIQUE INDEX domain_review_active ON domain_review(domain_id)
 WHERE status IN ('pending', 'running');
+-- A completed/failed review's recorded evidence and validated result are immutable (raw sqlite3 too); approval
+-- provenance is set once and is a person only (the table CHECK already rejects agent:/factory: actors).
+CREATE TRIGGER domain_review_frozen BEFORE UPDATE OF result_json, context_json, domain_id, goal ON domain_review
+WHEN OLD.status NOT IN ('pending', 'running')
+BEGIN SELECT RAISE(ABORT, 'a completed or failed domain review is immutable'); END;
+CREATE TRIGGER domain_review_approved_once BEFORE UPDATE OF approved_at, approved_by ON domain_review
+WHEN OLD.approved_at IS NOT NULL AND (NEW.approved_at IS NOT OLD.approved_at OR NEW.approved_by IS NOT OLD.approved_by)
+BEGIN SELECT RAISE(ABORT, 'a domain review approval provenance is set once'); END;
 
 -- Which exact ticket dispositions a person froze into writes. Append-only: a repeated approval of the same ticket is
 -- a no-op (writeback PRIMARY KEY already guards the rows), never a duplicate write.
@@ -486,6 +494,13 @@ CREATE TRIGGER writeback_confirmed_final BEFORE UPDATE OF status ON writeback
 WHEN OLD.status = 'confirmed' AND NEW.status IS NOT OLD.status
   AND NOT (OLD.approved_by IS NULL AND NEW.approved_by IS NOT NULL)
 BEGIN SELECT RAISE(ABORT, 'a confirmed write-back is final unless a person applies it anyway'); END;
+-- The exact selected content a person approved is pinned: payload/rule/op/identity of a domain-groom write can never
+-- change, so the reconcile agent (or raw sqlite3) cannot reword or retarget it.
+CREATE TRIGGER writeback_domain_groom_frozen BEFORE UPDATE OF payload_json, rule, op, issue_id, run_id ON writeback
+WHEN OLD.rule LIKE 'domain-groom%'
+  AND (NEW.payload_json IS NOT OLD.payload_json OR NEW.rule IS NOT OLD.rule OR NEW.op IS NOT OLD.op
+       OR NEW.issue_id IS NOT OLD.issue_id OR NEW.run_id IS NOT OLD.run_id)
+BEGIN SELECT RAISE(ABORT, 'a domain-groom write is pinned by a person; its content is immutable'); END;
 
 -- updatedAt values produced by reconcile's own writes: not a ticket change, so no re-verification.
 CREATE TABLE linear_own_write (

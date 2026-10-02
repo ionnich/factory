@@ -203,22 +203,56 @@ def _state_id(cfg: Config, issue: dict, name: str, cache: dict) -> str:
     return cache[tid][name]
 
 
+def _domain_of_description(conn, description):
+    """The canonical Domain project a description resolves to (its Domain: line), or None."""
+    return prune.domain_project(conn, {"raw_json": json.dumps({"description": description or "",
+                                                               "labels": {"nodes": []}}), "identifier": None})
+
+
 def _domain_of_live(conn, issue: dict):
     """The canonical Domain project of a live Linear issue, resolved from its Domain: line (never issue.project)."""
-    return prune.domain_project(conn, {"raw_json": json.dumps(issue), "identifier": issue["identifier"]})
+    return prune.domain_project(conn, {"raw_json": json.dumps(issue), "identifier": issue.get("identifier")})
 
 
-def _domain_gate(cfg: Config, conn, issue: dict, p: dict, own_updated: set[str], own_state: set[str]) -> str | None:
+def _own_stamps(conn, run_id: str, issue_id: str) -> set[str]:
+    """Exact updatedAt values this review's own confirmed+applied description/state writes produced for one issue."""
+    return {r[0] for r in conn.execute(
+        "SELECT linear_ref FROM writeback WHERE run_id=? AND issue_id=? AND op IN ('description','state') "
+        "AND status='confirmed' AND decision='apply' AND linear_ref IS NOT NULL", (run_id, issue_id))}
+
+
+def _own_canceled(conn, run_id: str, issue_id: str) -> bool:
+    return conn.execute("SELECT 1 FROM writeback WHERE run_id=? AND issue_id=? AND op='state' "
+                        "AND status='confirmed' AND decision='apply'", (run_id, issue_id)).fetchone() is not None
+
+
+def _groom_dependency(conn, run_id: str, w, p: dict) -> str | None:
+    """Why a groom write must WAIT (stay planned) for another actually-applied write in this run, or None. Durable:
+    a separate apply invocation sees the same confirmed evidence."""
+    if w["op"] == "state" and (w["rule"] or "").startswith("domain-groom-merge"):
+        tid = p.get("target_issue_id")
+        if tid and conn.execute("SELECT 1 FROM writeback WHERE run_id=? AND issue_id=? AND op='description' "
+                                "AND rule='domain-groom-rewrite' AND status='confirmed' AND decision='apply'",
+                                (run_id, tid)).fetchone() is None:
+            return f"waiting for the target rewrite of {p.get('target')} to be confirmed"
+    if w["op"] == "comment" and (w["rule"] or "").startswith("domain-groom"):
+        if conn.execute("SELECT 1 FROM writeback WHERE run_id=? AND issue_id=? AND op='state' "
+                        "AND status='confirmed' AND decision='apply'", (run_id, w["issue_id"])).fetchone() is None:
+            return "waiting for the state write to be confirmed"
+    return None
+
+
+def _domain_gate(cfg: Config, conn, run_id: str, issue: dict, p: dict) -> str | None:
     """Why a domain-groom write is NOT allowed now, or None. Every check is re-run against a live read immediately
-    before each write; own writes this run are excluded from the freshness/state checks so a multi-write ticket's
-    title write never stales its own description write (and vice versa)."""
+    before each write; this review's own confirmed+applied writes (durable, via writeback status/linear_ref) are
+    excluded from the freshness/state checks so a multi-write ticket never stales its own remaining writes."""
     expect = p.get("expect_updated_at")
-    if expect and issue["updatedAt"] != expect and issue["updatedAt"] not in own_updated:
+    if expect and issue["updatedAt"] != expect and issue["updatedAt"] not in _own_stamps(conn, run_id, issue["id"]):
         return f"ticket changed since the review ({expect} -> {issue['updatedAt']})"
     who = (issue["assignee"] or {}).get("email")
     if who not in (None, cfg.linear["lead"]):
         return f"assigned to {who}"
-    if issue["state"]["type"] in ("completed", "canceled") and issue["id"] not in own_state:
+    if issue["state"]["type"] in ("completed", "canceled") and not _own_canceled(conn, run_id, issue["id"]):
         return f"already {issue['state']['name']}"
     if issue["state"]["name"] == team_cfg(cfg, issue).get("review_state"):
         return f"waiting on human review ({issue['state']['name']})"
@@ -230,13 +264,33 @@ def _domain_gate(cfg: Config, conn, issue: dict, p: dict, own_updated: set[str],
     if conn.execute("SELECT 1 FROM dispatch_ticket t JOIN dispatch d USING (run_id) "
                     "WHERE t.issue_id=? AND d.state <> 'archived'", (issue["id"],)).fetchone():
         return "ticket is in a live dispatch"
+    if p.get("description") is not None:
+        proposed = _domain_of_description(conn, p["description"])
+        if proposed is None or proposed["id"] != p.get("domain_id"):
+            return "the proposed description drops or moves its Domain line"
     if p.get("target_issue_id"):
         target = _live(cfg, p["target_issue_id"])
+        tname = p.get("target")
         if target["state"]["type"] in ("completed", "canceled"):
-            return f"merge target {p.get('target')} is already closed"
+            return f"merge target {tname} is already closed"
+        if (target["assignee"] or {}).get("email") not in (None, cfg.linear["lead"]):
+            return f"merge target {tname} is assigned to {(target['assignee'] or {}).get('email')}"
+        if target["state"]["name"] == team_cfg(cfg, target).get("review_state"):
+            return f"merge target {tname} is waiting on human review"
         tdomain = _domain_of_live(conn, target)
         if tdomain is None or tdomain["id"] != p.get("domain_id"):
-            return f"merge target {p.get('target')} left the reviewed domain"
+            return f"merge target {tname} left the reviewed domain"
+        texpect = p.get("target_expect_updated_at")
+        if texpect and target["updatedAt"] != texpect:
+            # the target's own confirmed rewrite (exact returned timestamp) is the only allowed drift
+            tconfirmed = conn.execute("SELECT linear_ref FROM writeback WHERE run_id=? AND issue_id=? AND "
+                                      "op='description' AND rule='domain-groom-rewrite' AND status='confirmed' "
+                                      "AND decision='apply'", (run_id, p["target_issue_id"])).fetchone()
+            if tconfirmed is None or tconfirmed[0] != target["updatedAt"]:
+                return f"merge target {tname} changed since the review"
+        if conn.execute("SELECT 1 FROM dispatch_ticket t JOIN dispatch d USING (run_id) "
+                        "WHERE t.issue_id=? AND d.state <> 'archived'", (p["target_issue_id"],)).fetchone():
+            return f"merge target {tname} is in a live dispatch"
     return None
 
 
@@ -274,45 +328,62 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
         with db.tx(conn):
             conn.execute("UPDATE writeback SET decision='flag', reason=? WHERE run_id=? AND issue_id=? AND op=? "
                          "AND decision='apply'", (reason, *key))
-            decide.writeback(conn, run_id, w["issue_id"], w["op"], json.loads(w["payload_json"]), reason)
+            decide.writeback(conn, run_id, w["issue_id"], w["op"], json.loads(w["payload_json"]), reason,
+                             rule=w["rule"])
             conn.execute("UPDATE writeback SET status='confirmed' WHERE run_id=? AND issue_id=? AND op=?", key)
-    order = "CASE op WHEN 'state' THEN 0 WHEN 'description' THEN 1 WHEN 'create' THEN 2 ELSE 3 END"
+    # Groom rows order by dependency (rewrite -> cancel -> comment) so a merge's source cancel only runs after its
+    # target rewrite is confirmed; legacy rows keep their per-issue state/description/create/comment order.
+    order = ("CASE WHEN rule LIKE 'domain-groom%' "
+             "THEN CASE op WHEN 'description' THEN 0 WHEN 'state' THEN 1 ELSE 2 END "
+             "ELSE CASE op WHEN 'state' THEN 0 WHEN 'description' THEN 1 WHEN 'create' THEN 2 ELSE 3 END END")
     states: dict = {}
     touched: set[str] = set()
-    own: dict[str, set[str]] = {}   # issue_id -> exact updatedAt values OUR groom writes produced this run
-    own_state: set[str] = set()     # issue ids WE canceled this run (so a follow-up comment is not "already closed")
     for w in conn.execute(f"SELECT * FROM writeback WHERE run_id=? AND status IN ('planned','failed') "
-                          f"ORDER BY issue_id, {order}", (run_id,)).fetchall():
+                          f"ORDER BY {order}, issue_id, op", (run_id,)).fetchall():
         key = (run_id, w["issue_id"], w["op"])
+        p = json.loads(w["payload_json"])
+        groom = (w["rule"] or "").startswith("domain-groom")
+        if groom and _groom_dependency(conn, run_id, w, p):
+            continue  # dependency not yet applied: stay planned, re-evaluate on the next apply (never flag/send)
         # Claim it first: a second apply (cron agent + manual run) must not send it too.
         if conn.execute("UPDATE writeback SET status='sent' WHERE run_id=? AND issue_id=? AND op=? "
                         "AND status IN ('planned','failed')", key).rowcount != 1:
             continue
-        p = json.loads(w["payload_json"])
         decision, reason = w["decision"], w["reason"]
-        groom = (w["rule"] or "").startswith("domain-groom")
         try:
             if decision == "apply":
                 issue = _live(cfg, w["issue_id"])
                 if groom:
                     # A person froze this exact payload; every gate is re-checked live, and only the pinned content
-                    # is sent (never reworded). Own writes this run are excluded from freshness/state checks.
-                    if why := _domain_gate(cfg, conn, issue, p, own.get(w["issue_id"], set()), own_state):
+                    # is sent (never reworded).
+                    if why := _domain_gate(cfg, conn, run_id, issue, p):
                         decision, reason = "flag", f"apply-time gate: {why}"
                         conn.execute("UPDATE writeback SET decision='flag', reason=? WHERE run_id=? AND issue_id=? "
                                      "AND op=?", (reason, *key))
                     else:
-                        r = _groom_write(cfg, issue, w, p, states)
-                        if r["ok"]:
-                            conn.execute("UPDATE writeback SET status='confirmed', linear_ref=? "
-                                         "WHERE run_id=? AND issue_id=? AND op=?", (r["ref"], *key))
-                            if r["updated_at"]:
-                                own.setdefault(w["issue_id"], set()).add(r["updated_at"])
-                            if w["op"] == "state":
-                                own_state.add(w["issue_id"])
+                        try:
+                            r = _groom_write(cfg, issue, w, p, states)
+                        except Exception as e:
+                            # uncertain send: the mutation may have landed. Hold it; never blindly resend.
+                            reason2 = f"groom send uncertain: {type(e).__name__}: {e}"[:400]
+                            with db.tx(conn):
+                                conn.execute("UPDATE writeback SET decision='flag', reason=? WHERE run_id=? AND "
+                                             "issue_id=? AND op=? AND status='sent'", (reason2, *key))
+                                decide.writeback(conn, run_id, w["issue_id"], w["op"], p, reason2, rule=w["rule"])
+                                conn.execute("UPDATE writeback SET status='confirmed' WHERE run_id=? AND issue_id=? "
+                                             "AND op=?", key)
+                            continue
                         else:
-                            conn.execute("UPDATE writeback SET status='failed' WHERE run_id=? AND issue_id=? AND op=?",
-                                         key)
+                            if r["ok"]:
+                                with db.tx(conn):  # persist the exact returned updatedAt with the confirmation
+                                    conn.execute("UPDATE writeback SET status='confirmed', linear_ref=? "
+                                                 "WHERE run_id=? AND issue_id=? AND op=?", (r["ref"], *key))
+                                    if r["updated_at"]:
+                                        conn.execute("INSERT OR IGNORE INTO linear_own_write VALUES (?,?)",
+                                                     (w["issue_id"], r["updated_at"]))
+                            else:
+                                conn.execute("UPDATE writeback SET status='failed' WHERE run_id=? AND issue_id=? "
+                                             "AND op=?", key)
                 else:
                     touched.add(w["issue_id"])
                     if w["op"] == "state":
@@ -356,12 +427,8 @@ def apply(cfg: Config, conn, run_id: str) -> dict:
         except Exception as e:  # one bad write never blocks the rest; failed rows retry on the next apply
             conn.execute("UPDATE writeback SET status='failed', reason=? WHERE run_id=? AND issue_id=? AND op=? "
                          "AND status='sent'", (f"{type(e).__name__}: {e}"[:400], *key))
-    # Domain grooming records the EXACT updatedAt values its own mutations returned: multi-write tickets record each
-    # write without absorbing an external edit that lands after ours. Legacy writes keep their re-read (a human edit
-    # between the write and read is absorbed there; the next human edit re-arms it).
-    for issue_id, stamps in own.items():
-        for stamp in stamps:
-            conn.execute("INSERT OR IGNORE INTO linear_own_write VALUES (?,?)", (issue_id, stamp))
+    # Legacy writes re-read their own updatedAt after the fact (a human edit between the write and read is absorbed
+    # there; the next human edit re-arms it). Domain grooming persists the exact returned timestamp inline instead.
     for issue_id in touched:
         try:
             conn.execute("INSERT OR IGNORE INTO linear_own_write VALUES (?,?)",

@@ -39,6 +39,12 @@ CREATE TRIGGER dispatch_frozen BEFORE UPDATE ON dispatch
 WHEN OLD.state <> 'draft' AND (NEW.body_sha256 IS NOT OLD.body_sha256 OR NEW.repos_json IS NOT OLD.repos_json
   OR NEW.run_id IS NOT OLD.run_id OR NEW.created_at IS NOT OLD.created_at OR NEW.route IS NOT OLD.route)
 BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;
+CREATE TABLE writeback (
+  run_id TEXT NOT NULL, issue_id TEXT NOT NULL,
+  op TEXT NOT NULL, payload_json TEXT NOT NULL, decision TEXT NOT NULL,
+  rule TEXT NOT NULL, reason TEXT, status TEXT NOT NULL, linear_ref TEXT, approved_by TEXT,
+  PRIMARY KEY (run_id, issue_id, op)
+);
 """
 
 
