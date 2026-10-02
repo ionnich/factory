@@ -167,12 +167,22 @@ def _prompt(ctx: dict, tmpdir: str) -> str:
         "A ticket disposition object has exactly these keys and no others: identifier, action (one of keep|rewrite|"
         "merge|close|investigate), reason (string), evidence (array of strings), cut_ids (array of cut id strings), "
         "title (string or null), description (string or null), target (string or null).",
-        "Action rules: keep = leave as-is (no title/description/target); rewrite = replace the ticket's title and/or "
-        "description (at least one non-null, exact final text); merge = this ticket is a duplicate whose work belongs "
-        "in another retained ticket `target` (the surviving ticket keeps its own identity; if the target must absorb "
-        "this ticket's unique scope, the target itself must be a rewrite describing that); close = cancel as "
-        "unnecessary (no title/description/target; never mark it done); investigate = the recorded evidence cannot "
-        "justify a change (no title/description/target). A merge `target` must itself be keep or rewrite.",
+        "Action rules: keep = leave as-is (title/description/target all null); close = cancel as unnecessary (all "
+        "null; never mark it done); investigate = the recorded evidence cannot justify a change (all null); rewrite "
+        "= replace the ticket's title and/or description (at least one of title/description non-null, exact final "
+        "text; null leaves that field unchanged); merge = this ticket is a duplicate whose work belongs in the "
+        "retained ticket `target`.",
+        "Rewrite description contract (server-enforced): a non-null `description` is the ticket's COMPLETE "
+        "replacement text. It MUST reproduce the source's original canonical `Domain:` metadata line VERBATIM — the "
+        "exact line, including its Linear project link when present — plus its `Repo:`/`Repos:` line(s) where present, "
+        "then the new content. Copy those lines exactly from the recorded description in the context file; the server "
+        "refuses a description that drops or alters the `Domain:` line. `description: null` keeps the existing "
+        "description; `title: null` keeps the existing title.",
+        "Merge target gates (server-enforced): `target` must be another open ticket in the SAME domain, mutable (not "
+        "in human QA, not assigned to someone else, not in a live dispatch), and its disposition must be `keep` or "
+        "`rewrite`. If the target must absorb this ticket's unique scope, the target itself must be a `rewrite` whose "
+        "description covers it — and the source is canceled only AFTER that target rewrite is confirmed. Never merge "
+        "into a completed, canceled, foreign-domain, or blocked target.",
         "A ticket with mutable=false is blocked (blocker explains why: human QA, another assignee, a live dispatch, "
         "unmapped/no route). Such tickets may only be keep or investigate — never rewrite/merge/close.",
         "Coverage: every open ticket in the index must appear exactly once. identifier must come only from the index.",
