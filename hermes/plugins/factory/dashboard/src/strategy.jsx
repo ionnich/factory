@@ -798,23 +798,115 @@ const GROOM_ACTION = {
 const groomAction = (a) => GROOM_ACTION[a] || [a || "unknown", "gray", false];
 const groomMutates = (t) => groomAction(t.action)[2];
 
-function DomainReviewRow({ r, busy, onOpen, onRetry }) {
+// Recursive grooming: a review is one human-facing pass (manual, the default) or an agent-led bounded loop (agentic).
+// Its outcome is null while pending, else ready (substantiated), blocked (stopped on missing data — never substituted
+// with cached facts), or limit_reached (its bounded pass budget was consumed before substantiation).
+const GROOM_OUTCOME = {
+  ready: ["ready", "green"],
+  blocked: ["blocked", "amber"],
+  limit_reached: ["limit reached", "amber"],
+};
+const groomOutcome = (o) => (o ? GROOM_OUTCOME[o] || [o, "gray"] : null);
+
+// The outcome badge: hidden for null, and in compact rows for the default "ready" so stopped outcomes stand out.
+const OutcomeTone = ({ outcome, showReady = false }) => {
+  const oc = groomOutcome(outcome);
+  if (!oc || (!showReady && outcome === "ready")) return null;
+  return <Tone tone={oc[1]}>{oc[0]}</Tone>;
+};
+
+// Witness receipts are the backend's truthfully-mapped read-only witness output: {id,name,query,at,ok,result,error}.
+// An ok receipt shows its result; a failed one shows its error. Nothing is synthesized here.
+const roundReceipts = (round) => (round?.receipts || round?.witness_receipts || []);
+
+function WitnessReceipts({ receipts }) {
+  if (!receipts || !receipts.length) return null;
+  return (
+    <details className="fx-fold">
+      <summary>Witness evidence ({receipts.length})</summary>
+      <ul className="fx-src">
+        {receipts.map((w, i) => {
+          const ok = w && w.ok === true;
+          const failed = w && (w.ok === false || !!w.error);
+          return (
+            <li key={i}>
+              <div className="fx-row fx-row-status">
+                <Tone tone={ok ? "green" : failed ? "red" : "amber"}>{ok ? "ok" : failed ? "error" : "unchecked"}</Tone>
+                {w.name ? <span className="fx-hint">{w.name}</span> : null}
+                {w.id != null ? <span className="fx-id">{w.id}</span> : null}
+                {w.at ? <span className="fx-hint" title={exactTime(w.at)}>{localTime(w.at)}</span> : null}
+              </div>
+              {w.query ? <div className="fx-hint">query: {clip(w.query, 200)}</div> : null}
+              {w.error ? <div className="fx-err">{clip(String(w.error), 240)}</div> : null}
+              {ok && w.result != null
+                ? <div className="fx-hint">result: {clip(typeof w.result === "string" ? w.result : JSON.stringify(w.result), 240)}</div>
+                : null}
+            </li>
+          );
+        })}
+      </ul>
+    </details>
+  );
+}
+
+// One recorded pass: its number, truthful outcome, the model's assessment text, and its witness receipts.
+function RoundPass({ round }) {
+  return (
+    <section className="fx-sec fx-stack-v">
+      <div className="fx-row fx-row-title">
+        <span className="fx-k">Round {round?.number ?? "?"}</span>
+        <OutcomeTone outcome={round?.outcome} showReady />
+      </div>
+      {round?.assessment ? <div className="fx-why">{round.assessment}</div> : null}
+      <WitnessReceipts receipts={roundReceipts(round)} />
+    </section>
+  );
+}
+
+// The status/meta summary shared by the review list row and the read-only lineage list.
+function ReviewSummaryMeta({ r }) {
   const [label, tone] = GROOM_STATUS[r.status] || [r.status || "unknown", "gray"];
+  return (
+    <>
+      <div className="fx-row fx-row-status">
+        <Tone tone={tone}>{label}</Tone>
+        {r.mode === "agentic" ? <Tone tone="blue">agent-led</Tone> : null}
+        <OutcomeTone outcome={r.outcome} />
+        {r.approved_at ? <Tone tone="green">approved {ago(r.approved_at)}</Tone> : null}
+        {r.proposal_brief_id ? <Tone tone="blue">brief #{r.proposal_brief_id}</Tone> : null}
+      </div>
+      <div className="fx-row-title fx-ttitle clamp">{r.domain_name || r.domain_id || `Review #${r.id}`}</div>
+      <div className="fx-row-meta fx-hint">#{r.id} · requested {ago(r.requested_at)}
+        {r.completed_at ? ` · completed ${ago(r.completed_at)}` : ""}{r.run_id ? ` · run ${r.run_id}` : ""}
+        {r.round_count ? ` · ${r.round_count} round${r.round_count === 1 ? "" : "s"}` : ""}
+        {r.parent_review_id ? ` · child of #${r.parent_review_id}` : ""}</div>
+      {r.feedback ? <div className="fx-hint">“{clip(r.feedback, 140)}”</div> : null}
+      {r.error ? <div className="fx-err">{clip(r.error, 160)}</div> : null}
+      {r.blocker ? <div className="fx-hint">{r.blocker}</div> : null}
+    </>
+  );
+}
+
+// Manual (one human-facing revision, default) vs agent-led (bounded automatic critique/evidence/revision passes).
+function ModeToggle({ mode, onChange, disabled, label }) {
+  const manual = mode !== "agentic";
+  return (
+    <div className="fx-seg" role="radiogroup" aria-label={label || "Review mode"}>
+      <button type="button" role="radio" aria-checked={manual} className={manual ? "on" : ""}
+              disabled={disabled} onClick={() => onChange("manual")}>Manual</button>
+      <button type="button" role="radio" aria-checked={!manual} className={manual ? "" : "on"}
+              disabled={disabled} onClick={() => onChange("agentic")}>Agent-led</button>
+    </div>
+  );
+}
+
+function DomainReviewRow({ r, busy, onOpen, onRetry }) {
   return (
     <div className="fx-trow" role="button" tabIndex={0}
          onClick={onOpen}
          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { stop(e); onOpen(); } }}>
       <div className="fx-grow">
-        <div className="fx-row fx-row-status">
-          <Tone tone={tone}>{label}</Tone>
-          {r.approved_at ? <Tone tone="green">approved {ago(r.approved_at)}</Tone> : null}
-          {r.proposal_brief_id ? <Tone tone="blue">brief #{r.proposal_brief_id}</Tone> : null}
-        </div>
-        <div className="fx-row-title fx-ttitle clamp">{r.domain_name || r.domain_id || `Review #${r.id}`}</div>
-        <div className="fx-row-meta fx-hint">#{r.id} · requested {ago(r.requested_at)}
-          {r.completed_at ? ` · completed ${ago(r.completed_at)}` : ""}{r.run_id ? ` · run ${r.run_id}` : ""}</div>
-        {r.error ? <div className="fx-err">{clip(r.error, 160)}</div> : null}
-        {r.blocker ? <div className="fx-hint">{r.blocker}</div> : null}
+        <ReviewSummaryMeta r={r} />
       </div>
       <div className="fx-tc-ne">
         {r.status === "failed"
@@ -825,7 +917,7 @@ function DomainReviewRow({ r, busy, onOpen, onRetry }) {
   );
 }
 
-function DomainGroomSection({ domains, reviews, listErr, loading, busy, domainId, goal, onDomain, onGoal, onStart, onOpen, onRetry }) {
+function DomainGroomSection({ domains, reviews, listErr, loading, busy, domainId, goal, mode, onDomain, onGoal, onMode, onStart, onOpen, onRetry }) {
   const sel = domainId || "";
   const sorted = [...reviews].sort((a, b) => (ts(b.requested_at) ?? 0) - (ts(a.requested_at) ?? 0));
   const active = reviews.some((r) => r.status === "pending" || r.status === "running");
@@ -850,6 +942,7 @@ function DomainGroomSection({ domains, reviews, listErr, loading, busy, domainId
         <Button size="sm" disabled={!!busy || !sel} onClick={() => onStart(sel, goal)}>
           {busy === "domain-start" ? "Starting…" : "Start review"}
         </Button>
+        <ModeToggle mode={mode} onChange={onMode} disabled={!!busy} label="Review mode" />
         {active ? <span className="fx-hint">A review is running; this list refreshes itself.</span> : null}
       </div>
       {listErr ? <div className="fx-err" role="alert">Domain reviews unavailable: {listErr}</div> : null}
@@ -1008,10 +1101,14 @@ function WritebackList({ rows }) {
   );
 }
 
-function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, onDisarm, onBrief, onOpenBrief }) {
+function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, onDisarm, onBrief, onOpenBrief,
+                              mode, feedback, onFeedback, onMode, onRerun }) {
   const [label, tone] = GROOM_STATUS[r.status] || [r.status || "unknown", "gray"];
   const active = r.status === "pending" || r.status === "running";
+  const completed = r.status === "completed";
   const result = r.result || null;
+  const history = r.history || [];
+  const rounds = r.rounds || [];
   const tickets = result?.tickets || [];
   const cuts = result?.cuts || [];
   const ctxTickets = r.context?.tickets || [];
@@ -1043,17 +1140,43 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
           <span className="fx-id">#{r.id}</span>
           <span className="fx-ttitle">{r.domain_name || r.domain_id || "Domain review"}</span>
           <Tone tone={tone}>{label}</Tone>
+          {r.mode === "agentic" ? <Tone tone="blue">agent-led</Tone> : <Tone tone="gray">manual</Tone>}
+          <OutcomeTone outcome={r.outcome} showReady />
           {approved ? <Tone tone="green">approved {ago(r.approved_at)}</Tone> : null}
         </div>
         <Button size="sm" ghost onClick={onBack}>← Back to sources</Button>
       </div>
-      <div className="fx-hint">Requested {ago(r.requested_at)}{r.completed_at ? ` · completed ${ago(r.completed_at)}` : ""}{r.run_id ? ` · run ${r.run_id}` : ""}</div>
+      <div className="fx-hint">Requested {ago(r.requested_at)}{r.completed_at ? ` · completed ${ago(r.completed_at)}` : ""}{r.run_id ? ` · run ${r.run_id}` : ""}
+        {r.round_count ? ` · ${r.round_count} round${r.round_count === 1 ? "" : "s"}` : ""}
+        {r.parent_review_id ? ` · child of #${r.parent_review_id}` : ""}</div>
+      {r.feedback ? <div className="fx-why">Comment: {r.feedback}</div> : null}
+      {r.outcome === "blocked" ? <div className="fx-hint">Stopped on missing data — unavailable evidence is shown below, never substituted with cached facts.</div> : null}
+      {r.outcome === "limit_reached" ? <div className="fx-hint">Evidence budget consumed before the review was substantiated; request another round to continue.</div> : null}
       {active ? (
         <div className="fx-hint" role="status">{r.status === "pending" ? "Queued" : "Reviewing"} — a read-only analysis over cached
           snapshots and mirrors. It changes nothing; this refreshes itself.</div>
       ) : null}
       {r.status === "failed" ? <div className="fx-err" role="alert">Review failed{r.error ? `: ${r.error}` : "."}</div> : null}
       {r.blocker ? <div className="fx-hint">{r.blocker}</div> : null}
+
+      {history.length ? (
+        <section className="fx-sec fx-stack-v" aria-label="Review lineage">
+          <div className="fx-k">Lineage ({history.length} earlier round{history.length === 1 ? "" : "s"})</div>
+          <div className="fx-list">
+            {history.map((p) => (
+              <div key={p.id} className="fx-trow">
+                <div className="fx-grow"><ReviewSummaryMeta r={p} /></div>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
+      {rounds.length ? (
+        <section className="fx-sec fx-stack-v" aria-label="Review rounds">
+          <div className="fx-k">Rounds ({rounds.length})</div>
+          {rounds.map((rd, i) => <RoundPass key={i} round={rd} />)}
+        </section>
+      ) : null}
 
       {result ? (
         <>
@@ -1121,6 +1244,27 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
             Open simplification brief #{r.proposal_brief_id} ›
           </Button>
         </div>
+      ) : null}
+
+      {completed ? (
+        <section className="fx-sec fx-stack-v" aria-label="Request another round">
+          <div className="fx-k">Request another round</div>
+          <div className="fx-hint">Leave a comment and ask for a revised review. Manual runs one human-facing revision;
+            agent-led runs bounded automatic critique/evidence/revision passes that stop when substantiated or blocked on
+            missing data. The parent result and your comment feed the next review.</div>
+          <ModeToggle mode={mode} onChange={onMode} disabled={!!busy} label="Next round mode" />
+          <textarea className="fx-ta" rows={3} maxLength={4000} value={feedback} disabled={!!busy}
+                    aria-label="Review comment" placeholder="Comment for the next review (optional)"
+                    onChange={(e) => onFeedback(e.target.value)} />
+          <div className="fx-row">
+            <Button size="sm" disabled={!!busy} onClick={onRerun}>
+              {busy === "domain-rerun" ? "Requesting…" : "Request next round"}
+            </Button>
+            {mode === "agentic"
+              ? <span className="fx-hint">Agent-led: read-only witnesses only; may stop blocked or at the pass limit.</span>
+              : <span className="fx-hint">Manual: one revised review.</span>}
+          </div>
+        </section>
       ) : null}
 
       {!approved && result && mutableTickets.length ? (
@@ -1232,6 +1376,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const openReview = view?.domainReview || null;
   const groomDomain = view?.groomDomain || null;
   const groomGoal = view?.groomGoal || "";
+  const groomMode = view?.groomMode === "agentic" ? "agentic" : "manual";
   const [groomList, setGroomList] = useState(null);   // {domains, reviews} from GET /strategy/domain-reviews
   const [groomListErr, setGroomListErr] = useState(null);
   const [groomDetail, setGroomDetail] = useState(null);
@@ -1239,6 +1384,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const [groomMut, setGroomMut] = useState(0);        // bump to refetch list + detail after a write
   const [groomSel, setGroomSel] = useState(() => new Set());  // selected mutation identifiers
   const [groomArm, setGroomArm] = useState(false);    // the two-tap approve's second tap
+  const [groomFeedback, setGroomFeedback] = useState("");  // the next-round comment, tied to the open review
   const openReviewRef = useRef(null);
   useEffect(() => { openReviewRef.current = openReview; }, [openReview]);
   const lastReview = useRef(null);
@@ -1262,6 +1408,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
       lastReview.current = openReview;
       setGroomDetail(null); setGroomDetailErr(null);
       setGroomSel(new Set()); setGroomArm(false);
+      setGroomFeedback("");  // a comment never carries across to a different review
     }
     if (openReview == null) return;
     let live = true;
@@ -1426,7 +1573,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
 
   const startReview = async (domainId, goal) => {
     const atNav = NAV_TOKEN, atReview = openReview;
-    const r = await call("/strategy/domain-reviews", { domain_id: domainId, goal: (goal || "").trim() }, "domain-start");
+    const r = await call("/strategy/domain-reviews", { domain_id: domainId, goal: (goal || "").trim(), mode: groomMode }, "domain-start");
     if (!r) return;
     setGroomMut((m) => m + 1);  // refresh the list in the background regardless of where the operator is now
     // Move into the new review only if the operator is still where they started it (mounted + same navigation + same
@@ -1446,6 +1593,25 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
       update({ domainReview: r.id, open: null, briefsOpen: false });
     }
     onDone(r, null, `Restarted domain review #${r.id}`);
+  };
+
+  // A child round: the parent review id links lineage, its original goal is preserved, and the comment + mode drive the
+  // next prompt. A failed reply keeps the comment and mode for another attempt; a late reply never hijacks navigation.
+  const rerunReview = async () => {
+    const atNav = NAV_TOKEN, atReview = openReview;
+    const r = await call("/strategy/domain-reviews", {
+      domain_id: groomDetail?.domain_id,
+      goal: (groomDetail?.context?.goal || "").trim(),
+      mode: groomMode,
+      parent_review_id: openReview,
+      feedback: groomFeedback.trim().slice(0, 4000),
+    }, "domain-rerun");
+    if (!r) return;
+    setGroomMut((m) => m + 1);
+    if (alive.current && NAV_TOKEN === atNav && openReviewRef.current === atReview) {
+      update({ domainReview: r.id, open: null, briefsOpen: false });
+    }
+    onDone(r, null, `Started ${groomMode === "agentic" ? "agent-led" : "manual"} review round #${r.id}`);
   };
 
   const approveReview = async () => {
@@ -1476,6 +1642,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const openGroomBrief = (id) => { update({ domainReview: null }); onNavigate({ stage: "strategy", brief: id }); };
   const setGroomDomain = (id) => update({ groomDomain: id });
   const setGroomGoal = (goal) => update({ groomGoal: goal });
+  const setGroomMode = (mode) => update({ groomMode: mode === "agentic" ? "agentic" : "manual" });
 
   // ---- Sources: grouped-first browsing over the backend's recorded relationship groups -------------------------
   // `groups` (GET /strategy) are the backend's stable, typed link clusters — parent families, dependency chains,
@@ -1661,6 +1828,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
         {busy === "groom" ? "Grooming with DeepSeek (this takes a while)…"
           : busy === "investigate" ? "Starting blocker investigation…"
           : busy === "domain-start" ? "Starting domain review…"
+          : busy === "domain-rerun" ? "Requesting next review round…"
           : busy === "domain-approve" ? "Queueing ticket changes…"
           : busy === "domain-brief" ? "Creating simplification brief…" : "Working…"}
       </div> : null}
@@ -1675,7 +1843,9 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
         ) : (
           <DomainReviewDetail r={groomDetail} busy={busy} sel={groomSel} setSel={changeGroomSel}
                               armed={groomArm} onBack={backFromGroom} onApprove={approveReview}
-                              onDisarm={() => setGroomArm(false)} onBrief={createGroomBrief} onOpenBrief={openGroomBrief} />
+                              onDisarm={() => setGroomArm(false)} onBrief={createGroomBrief} onOpenBrief={openGroomBrief}
+                              mode={groomMode} feedback={groomFeedback} onFeedback={setGroomFeedback}
+                              onMode={setGroomMode} onRerun={rerunReview} />
         )
       ) : open != null ? (
         <>
@@ -1855,8 +2025,8 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
         <section className="fx-stack-v" aria-label="Sources">
           <DomainGroomSection
             domains={groomList?.domains || []} reviews={groomList?.reviews || []} listErr={groomListErr}
-            loading={groomList == null} busy={busy} domainId={groomDomain} goal={groomGoal}
-            onDomain={setGroomDomain} onGoal={setGroomGoal} onStart={startReview}
+            loading={groomList == null} busy={busy} domainId={groomDomain} goal={groomGoal} mode={groomMode}
+            onDomain={setGroomDomain} onGoal={setGroomGoal} onMode={setGroomMode} onStart={startReview}
             onOpen={openGroomReview} onRetry={retryReview} />
           <div className="fx-strategy-toolbar">
             <Input className="fx-search" type="search" placeholder="Search source id or title" value={q}
