@@ -534,6 +534,34 @@ class RecursiveGrooming(unittest.TestCase):
         detail = domain_groom.detail(self.cfg, self.c, child)
         self.assertEqual([h["id"] for h in detail["history"]], [parent, child])
 
+    def test_child_comment_feeds_its_own_round_with_correct_prior_result(self):
+        self.insert("FIN-1")
+        root = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        self._run(root, [self.envelope("ready", review=result([disposition("FIN-1", "keep")],
+                                                              minimum_system="ROOT_RESULT_MARKER"))])
+        child = domain_groom.request(self.cfg, self.c, "", mode="manual", parent_review_id=root,
+                                     feedback="child comment A", spawn=lambda argv, **kw: None)["id"]
+        self._run(child, [self.envelope("ready", review=result([disposition("FIN-1", "keep")],
+                                                               minimum_system="CHILD_RESULT_MARKER"))])
+        grandchild = domain_groom.request(self.cfg, self.c, "", mode="manual", parent_review_id=child,
+                                          feedback="grandchild comment B", spawn=lambda argv, **kw: None)["id"]
+        row = domain_groom._one(self.c, grandchild)
+        feed = domain_groom._parent_feed(self.c, row)
+        self.assertEqual(feed["feedback"], "grandchild comment B")  # the CURRENT comment, never the child's
+        self.assertEqual(feed["parent_review_id"], child)
+        self.assertEqual(feed["result"]["minimum_system"], "CHILD_RESULT_MARKER")  # prior (immediate parent) result
+        # the emitted prompt carries the current comment + prior result, not the grandparent's result or comment
+        ctx = json.loads(row["context_json"])
+        tmp = tempfile.mkdtemp()
+        dw = domain_groom._domain_witnesses(self.cfg, ctx["domain"]["name"])
+        prompt = domain_groom._round_prompt(ctx, tmp, parent_feed=feed, prior_rounds=[], receipts=[],
+                                            witnesses=dw, candidate=None, mode="manual", number=1,
+                                            max_rounds=domain_groom.MANUAL_MAX_ROUNDS)
+        self.assertIn("grandchild comment B", prompt)
+        self.assertIn("CHILD_RESULT_MARKER", prompt)
+        self.assertNotIn("ROOT_RESULT_MARKER", prompt)
+        self.assertNotIn("child comment A", prompt)
+
     def test_superseded_unapproved_parent_cannot_be_approved(self):
         self.insert("FIN-1")
         rewrite = self.envelope("ready", review=result(
