@@ -183,7 +183,8 @@ class Grooming(unittest.TestCase):
     def test_run_commits_valid_result_and_rejects_bad_output(self):
         self.insert("FIN-1")
         rid = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
-        out = json.dumps(result([disposition("FIN-1", "keep")]))
+        out = json.dumps({"outcome": "ready", "assessment": "substantiated",
+                          "witness_queries": [], "review": result([disposition("FIN-1", "keep")])})
         done = self._run(rid, out)
         self.assertEqual(done["status"], "completed")
         self.assertIsNotNone(done["completed_at"])
@@ -379,6 +380,237 @@ class Grooming(unittest.TestCase):
             domain_groom.brief(self.cfg, self.c, rid, "agent:review")
         with self.assertRaises(StageError):
             domain_groom.brief(self.cfg, self.c, rid, "user:dashboard")  # no simplification proposed
+
+
+class RecursiveGrooming(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.c = db.connect(Path(self.tmp.name) / "f.db")
+        self.addCleanup(self.c.close)
+        self.cfg = Config(raw={"linear": {"lead": LEAD, "team": TEAM}},
+                          db=Path(self.tmp.name) / "f.db", mirrors=Path(self.tmp.name) / "m",
+                          dispatches=Path(self.tmp.name) / "d",
+                          contexts=[Context(name="ctx", repo="Finks-ai/finks-ddd", domains=["My Domain"],
+                                            route="fx-news", witnesses=["ch"])],
+                          repos={}, witnesses={"ch": {"kind": "clickhouse", "url": "http://x",
+                                                      "user_env": "U", "password_env": "P"}})
+        self.c.execute("INSERT INTO linear_project(id,slug_id,name,lead_email,fetched_at) VALUES "
+                       "('p1','my-domain','My Domain',?,?)", (LEAD, SNAP))
+        self.c.execute("INSERT INTO repo_trunk VALUES ('Finks-ai/finks-ddd','main','sha1',?)", (SNAP,))
+
+    def insert(self, ident, updated_at=SNAP):
+        stype, r = raw(ident)
+        self.c.execute("INSERT INTO linear_snapshot VALUES (?,?,?,?,?,1,?)",
+                       (ident.lower(), ident, updated_at, SNAP, stype, r))
+        self.c.execute("INSERT OR REPLACE INTO linear_relationship(identifier, observed_at, edges_json, nodes_json, "
+                       "fingerprint) VALUES (?,?,?,?,?)", (ident, SNAP, "[]", "[]", "fp"))
+
+    def envelope(self, outcome, assessment="an assessment", queries=None, review=None):
+        return json.dumps({"outcome": outcome, "assessment": assessment,
+                           "witness_queries": queries or [], "review": review})
+
+    def ready(self, *idents):
+        return self.envelope("ready", review=result([disposition(i, "keep") for i in idents]))
+
+    def _witness(self):
+        def side(cfg, conn, name, query):
+            cur = conn.execute("INSERT INTO witness_log(witness,kind,query,ok,rows,result_sha256,result_excerpt,at) "
+                               "VALUES (?,?,?,1,1,'sha','[[1]]',?)", (name, "clickhouse", query, SNAP))
+            return {"witness_log_id": cur.lastrowid, "ok": True, "rows": 1, "result": [[1]]}
+        return side
+
+    def _run(self, rid, outputs, witness=False):
+        it = iter(outputs)
+        runner = lambda argv, **kw: SimpleProc(next(it))
+        if witness:
+            with mock.patch.object(domain_groom.witness, "run", side_effect=self._witness()):
+                return domain_groom.run(self.cfg, self.c, rid, runner=runner)
+        return domain_groom.run(self.cfg, self.c, rid, runner=runner)
+
+    def test_manual_ready_records_one_round_and_outcome(self):
+        self.insert("FIN-1")
+        rid = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        done = self._run(rid, [self.ready("FIN-1")])
+        self.assertEqual(done["status"], "completed")
+        self.assertEqual(done["outcome"], "ready")
+        self.assertEqual(done["round_count"], 1)
+        detail = domain_groom.detail(self.cfg, self.c, rid)
+        self.assertEqual([r["outcome"] for r in detail["rounds"]], ["ready"])
+        self.assertEqual(len(detail["history"]), 1)
+        self.assertEqual(detail["history"][0]["id"], rid)
+        self.assertEqual(detail["history"][0]["mode"], "manual")
+        # the review summary carries the recursive fields
+        self.assertEqual(done["mode"], "manual")
+        self.assertIsNone(done["parent_review_id"])
+        self.assertIsNone(done["feedback"])
+
+    def test_evidence_then_ready_records_receipts_and_rounds(self):
+        self.insert("FIN-1")
+        rid = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        evidence = self.envelope("evidence", assessment="need a schema check",
+                                 queries=[{"witness": "ch", "query": "SELECT 1"}])
+        done = self._run(rid, [evidence, self.ready("FIN-1")], witness=True)
+        self.assertEqual(done["outcome"], "ready")
+        self.assertEqual(done["round_count"], 2)
+        detail = domain_groom.detail(self.cfg, self.c, rid)
+        self.assertEqual([(r["number"], r["outcome"]) for r in detail["rounds"]], [(1, "evidence"), (2, "ready")])
+        receipt = detail["rounds"][0]["receipts"][0]
+        self.assertEqual(receipt["name"], "ch")
+        self.assertEqual(receipt["query"], "SELECT 1")
+        self.assertTrue(receipt["ok"])
+        self.assertIsNotNone(receipt["id"])  # a real witness_log id
+        # the witness_log row is durable and cited
+        self.assertEqual(self.c.execute("SELECT count(*) FROM witness_log").fetchone()[0], 1)
+
+    def test_blocked_stops_without_result(self):
+        self.insert("FIN-1")
+        rid = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        blocked = self.envelope("blocked", assessment="no recorded evidence for the consumer")
+        done = self._run(rid, [blocked])
+        self.assertEqual(done["status"], "failed")
+        self.assertEqual(done["outcome"], "blocked")
+        self.assertIn("no recorded evidence", done["error"])
+        self.assertIsNone(domain_groom.detail(self.cfg, self.c, rid)["result"])
+
+    def test_agentic_evidence_budget_yields_limit_reached(self):
+        self.insert("FIN-1")
+        rid = domain_groom.request(self.cfg, self.c, "p1", mode="agentic", spawn=lambda argv, **kw: None)["id"]
+        evidence = self.envelope("evidence", assessment="still checking",
+                                 queries=[{"witness": "ch", "query": "SELECT 1"}])
+        done = self._run(rid, [evidence, evidence, evidence], witness=True)
+        self.assertEqual(done["outcome"], "limit_reached")
+        self.assertEqual(done["round_count"], 3)
+        self.assertEqual(self.c.execute("SELECT count(*) FROM domain_review_round WHERE review_id=?",
+                                        (rid,)).fetchone()[0], 3)
+
+    def test_agentic_critique_finalizes_after_candidate(self):
+        self.insert("FIN-1")
+        rid = domain_groom.request(self.cfg, self.c, "p1", mode="agentic", spawn=lambda argv, **kw: None)["id"]
+        done = self._run(rid, [self.ready("FIN-1"), self.ready("FIN-1")])
+        self.assertEqual(done["outcome"], "ready")
+        self.assertEqual(done["round_count"], 2)
+        # the first ready is a retained DRAFT candidate, the second (critique) finalizes
+        rounds = domain_groom.detail(self.cfg, self.c, rid)["rounds"]
+        self.assertEqual([(r["number"], r["outcome"]) for r in rounds], [(1, "ready"), (2, "ready")])
+        self.assertIsNotNone(rounds[0]["review"])  # candidate retained for audit
+
+    def test_agentic_candidate_without_critique_budget_is_limit_reached(self):
+        self.insert("FIN-1")
+        rid = domain_groom.request(self.cfg, self.c, "p1", mode="agentic", spawn=lambda argv, **kw: None)["id"]
+        evidence = self.envelope("evidence", assessment="checking", queries=[{"witness": "ch", "query": "SELECT 1"}])
+        # the draft candidate lands on the final pass with no budget left for its critique
+        done = self._run(rid, [evidence, evidence, self.ready("FIN-1")], witness=True)
+        self.assertEqual(done["outcome"], "limit_reached")
+        self.assertEqual(done["status"], "failed")  # never falsely ready
+        self.assertEqual(done["round_count"], 3)
+        self.assertIsNone(domain_groom.detail(self.cfg, self.c, rid)["result"])
+        # the draft candidate is still retained for audit
+        rounds = domain_groom.detail(self.cfg, self.c, rid)["rounds"]
+        self.assertEqual(rounds[2]["outcome"], "ready")
+        self.assertIsNotNone(rounds[2]["review"])
+
+    def test_child_derives_domain_and_preserves_goal(self):
+        self.insert("FIN-1")
+        parent = domain_groom.request(self.cfg, self.c, "p1", goal="focus on the importer",
+                                      spawn=lambda argv, **kw: None)["id"]
+        self._run(parent, [self.ready("FIN-1")])
+        child = domain_groom.request(self.cfg, self.c, "", mode="manual", parent_review_id=parent,
+                                     feedback="please reconsider FIN-1", spawn=lambda argv, **kw: None)["id"]
+        row = domain_groom._one(self.c, child)
+        self.assertEqual(row["domain_id"], "p1")  # derived server-side, not from the empty body domain_id
+        self.assertEqual(row["goal"], "focus on the importer")  # preserved unless explicitly changed
+        self.assertEqual(row["feedback"], "please reconsider FIN-1")
+        self.assertEqual(row["mode"], "manual")
+        self.assertEqual(row["parent_review_id"], parent)
+
+    def test_child_history_is_chronological_lineage(self):
+        self.insert("FIN-1")
+        parent = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        self._run(parent, [self.ready("FIN-1")])
+        child = domain_groom.request(self.cfg, self.c, "", mode="agentic", parent_review_id=parent,
+                                     spawn=lambda argv, **kw: None)["id"]
+        self._run(child, [self.ready("FIN-1"), self.ready("FIN-1")])
+        detail = domain_groom.detail(self.cfg, self.c, child)
+        self.assertEqual([h["id"] for h in detail["history"]], [parent, child])
+
+    def test_superseded_unapproved_parent_cannot_be_approved(self):
+        self.insert("FIN-1")
+        rewrite = self.envelope("ready", review=result(
+            [disposition("FIN-1", "rewrite", title="New title", description="New\nDomain: My Domain")]))
+        parent = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        self._run(parent, [rewrite])
+        child = domain_groom.request(self.cfg, self.c, "", mode="manual", parent_review_id=parent,
+                                     spawn=lambda argv, **kw: None)["id"]
+        self._run(child, [rewrite])
+        with self.assertRaises(StageError) as cm:
+            domain_groom.approve(self.cfg, self.c, parent, ["FIN-1"], "user:dashboard")
+        self.assertIn("superseded", str(cm.exception))
+        # the child itself is still approvable (it has no child of its own)
+        domain_groom.approve(self.cfg, self.c, child, ["FIN-1"], "user:dashboard")
+
+    def test_request_refuses_bad_mode_and_parentless_feedback(self):
+        with self.assertRaises(StageError):
+            domain_groom.request(self.cfg, self.c, "p1", mode="bogus", spawn=lambda argv, **kw: None)
+        with self.assertRaises(StageError):
+            domain_groom.request(self.cfg, self.c, "p1", feedback="a comment", spawn=lambda argv, **kw: None)
+
+    def test_superseded_by_exposed_on_parent_summary(self):
+        self.insert("FIN-1")
+        parent = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        self._run(parent, [self.ready("FIN-1")])
+        child = domain_groom.request(self.cfg, self.c, "", mode="manual", parent_review_id=parent,
+                                     spawn=lambda argv, **kw: None)["id"]
+        self._run(child, [self.ready("FIN-1")])
+        self.assertEqual(domain_groom.detail(self.cfg, self.c, parent)["superseded_by"], child)
+        self.assertIsNone(domain_groom.detail(self.cfg, self.c, child)["superseded_by"])
+
+    def test_superseded_review_refuses_new_brief(self):
+        self.insert("FIN-1")
+        parent = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        self._run(parent, [self.ready("FIN-1")])
+        child = domain_groom.request(self.cfg, self.c, "", mode="manual", parent_review_id=parent,
+                                     spawn=lambda argv, **kw: None)["id"]
+        self._run(child, [self.ready("FIN-1")])
+        with self.assertRaises(StageError) as cm:
+            domain_groom.brief(self.cfg, self.c, parent, "user:dashboard")
+        self.assertIn("superseded", str(cm.exception))
+
+    def test_parse_round_output_enforces_the_envelope(self):
+        with self.assertRaises(StageError):
+            domain_groom._parse_round_output('{"outcome": "bogus", "assessment": "x", '
+                                             '"witness_queries": [], "review": null}')
+        with self.assertRaises(StageError):  # evidence needs queries
+            domain_groom._parse_round_output('{"outcome": "evidence", "assessment": "x", '
+                                             '"witness_queries": [], "review": null}')
+        with self.assertRaises(StageError):  # ready needs a review object
+            domain_groom._parse_round_output('{"outcome": "ready", "assessment": "x", '
+                                             '"witness_queries": [], "review": null}')
+        # a bare review object (the legacy single-pass shape) is refused for NEW replies
+        with self.assertRaises(StageError):
+            domain_groom._parse_round_output(json.dumps(result([disposition("FIN-1", "keep")])))
+
+    def test_witness_receipt_maps_truthfully_on_failure(self):
+        def fail(cfg, conn, name, query):
+            cur = conn.execute("INSERT INTO witness_log(witness,kind,query,ok,rows,result_sha256,result_excerpt,at) "
+                               "VALUES (?,?,?,0,NULL,NULL,?,?)", (name, "clickhouse", query, "unknown table", SNAP))
+            return {"witness_log_id": cur.lastrowid, "ok": False, "error": "unknown table"}
+        allowed = domain_groom._domain_witnesses(self.cfg, "My Domain")
+        with mock.patch.object(domain_groom.witness, "run", side_effect=fail):
+            receipt = domain_groom._execute_witnesses(self.cfg, self.c, [{"witness": "ch", "query": "SELECT nope"}],
+                                                      allowed)[0]
+        self.assertFalse(receipt["ok"])
+        self.assertIsNone(receipt["result"])
+        self.assertEqual(receipt["error"], "unknown table")
+
+    def test_domain_external_witness_refused(self):
+        # a witness configured globally but not mapped to this domain's contexts is refused (never executed)
+        self.cfg.witnesses["other"] = {"kind": "clickhouse", "url": "http://x", "user_env": "U", "password_env": "P"}
+        allowed = domain_groom._domain_witnesses(self.cfg, "My Domain")
+        self.assertEqual(set(allowed), {"ch"})  # only the context-mapped witness is exposed
+        with self.assertRaises(StageError) as cm:
+            domain_groom._execute_witnesses(self.cfg, self.c, [{"witness": "other", "query": "SELECT 1"}], allowed)
+        self.assertIn("not mapped", str(cm.exception))
 
 
 class SimpleProc:
@@ -649,6 +881,47 @@ class Migration(unittest.TestCase):
             # the writeback op enum is untouched: an arbitrary op is still refused by the CHECK
             with self.assertRaises(sqlite3.IntegrityError):
                 c.execute("INSERT INTO writeback VALUES ('r','i','title','{}','apply','r',NULL,'planned',NULL,NULL)")
+
+    def test_v27_adds_recursive_columns_and_round_table(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "f.db"
+            raw = sqlite3.connect(path)
+            raw.executescript(
+                "CREATE TABLE linear_project (id TEXT PRIMARY KEY, slug_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, "
+                "lead_email TEXT, fetched_at TEXT NOT NULL);"
+                "CREATE TABLE work_brief (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL, parent_id INTEGER, "
+                "state TEXT NOT NULL, body_json TEXT NOT NULL, sources_json TEXT NOT NULL, created_at TEXT NOT NULL, "
+                "created_by TEXT NOT NULL, approved_at TEXT, approved_by TEXT, amendment_reason TEXT, hold_reason TEXT);"
+                "CREATE TABLE domain_review (id INTEGER PRIMARY KEY, domain_id TEXT NOT NULL REFERENCES "
+                "linear_project(id), goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL CHECK (status IN "
+                "('pending','running','completed','failed')), requested_at TEXT NOT NULL, started_at TEXT, "
+                "completed_at TEXT, error TEXT, approved_at TEXT, approved_by TEXT, proposal_brief_id INTEGER "
+                "REFERENCES work_brief(id), result_json TEXT, context_json TEXT NOT NULL, CHECK (status IN "
+                "('pending','running') OR completed_at IS NOT NULL), CHECK (status <> 'completed' OR result_json IS "
+                "NOT NULL), CHECK (status <> 'failed' OR error IS NOT NULL));"
+                "CREATE TRIGGER domain_review_frozen BEFORE UPDATE OF result_json, context_json, domain_id, goal ON "
+                "domain_review WHEN OLD.status NOT IN ('pending','running') BEGIN SELECT RAISE(ABORT, 'frozen'); END;"
+                "INSERT INTO linear_project VALUES ('p1','my-domain','My Domain','me@example.com','2026-09-01T00:00:00.000Z');"
+                "INSERT INTO domain_review(domain_id,goal,status,requested_at,completed_at,result_json,context_json) "
+                "VALUES ('p1','','completed','2026-09-01T00:00:00.000Z','2026-09-01T00:00:00.000Z',"
+                "'{\"minimum_system\":\"m\",\"consumers\":[],\"correctness\":[],\"cuts\":[],\"tickets\":[],"
+                "\"simplification\":null,\"limitations\":[]}','{\"domain\":{\"id\":\"p1\"}}');"
+                "PRAGMA user_version=26;")
+            raw.commit()
+            raw.close()
+            c = db.connect(path)
+            self.addCleanup(c.close)
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+            self.assertTrue(c.execute("SELECT 1 FROM sqlite_master WHERE name='domain_review_round'").fetchone())
+            row = c.execute("SELECT mode, parent_review_id, feedback, round_count, outcome, progress_at "
+                            "FROM domain_review WHERE id=1").fetchone()
+            self.assertEqual(row["mode"], "manual")  # migrated defaults, evidence intact
+            self.assertIsNone(row["parent_review_id"])
+            self.assertIsNone(row["outcome"])
+            self.assertEqual(row["round_count"], 0)
+            # a completed review's mode/parent/feedback are now frozen like its result
+            with self.assertRaises(sqlite3.IntegrityError):
+                c.execute("UPDATE domain_review SET mode='agentic' WHERE id=1")
 
 
 if __name__ == "__main__":

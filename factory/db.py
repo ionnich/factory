@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -723,6 +723,37 @@ WHEN OLD.rule LIKE 'domain-groom%'
   AND (NEW.payload_json IS NOT OLD.payload_json OR NEW.rule IS NOT OLD.rule OR NEW.op IS NOT OLD.op
        OR NEW.issue_id IS NOT OLD.issue_id OR NEW.run_id IS NOT OLD.run_id)
 BEGIN SELECT RAISE(ABORT, 'a domain-groom write is pinned by a person; its content is immutable'); END;""",
+    # v27: recursive domain grooming. Extend domain_review with mode/parent/feedback/rounds/outcome and a worker
+    # heartbeat (progress_at), and add immutable per-pass round records citing witness_log receipts. Existing rows
+    # keep mode='manual', no parent, round_count=0 and outcome NULL: their captured evidence/result stay intact.
+    27: """ALTER TABLE domain_review ADD COLUMN mode TEXT NOT NULL DEFAULT 'manual' CHECK (mode IN ('manual','agentic'));
+ALTER TABLE domain_review ADD COLUMN parent_review_id INTEGER REFERENCES domain_review(id);
+ALTER TABLE domain_review ADD COLUMN feedback TEXT CHECK (feedback IS NULL OR length(feedback) <= 4000);
+ALTER TABLE domain_review ADD COLUMN round_count INTEGER NOT NULL DEFAULT 0 CHECK (round_count >= 0);
+ALTER TABLE domain_review ADD COLUMN outcome TEXT CHECK (outcome IS NULL OR outcome IN ('ready','blocked','limit_reached'));
+ALTER TABLE domain_review ADD COLUMN progress_at TEXT;
+DROP TRIGGER domain_review_frozen;
+CREATE TRIGGER domain_review_frozen BEFORE UPDATE OF result_json, context_json, domain_id, goal, mode, parent_review_id, feedback ON domain_review
+WHEN OLD.status NOT IN ('pending', 'running')
+BEGIN SELECT RAISE(ABORT, 'a completed or failed domain review is immutable'); END;
+CREATE TABLE domain_review_round (
+  id               INTEGER PRIMARY KEY,
+  review_id        INTEGER NOT NULL REFERENCES domain_review(id),
+  number           INTEGER NOT NULL CHECK (number >= 1),
+  assessment       TEXT NOT NULL CHECK (length(assessment) BETWEEN 1 AND 4000),
+  outcome          TEXT NOT NULL CHECK (outcome IN ('ready', 'blocked', 'evidence')),
+  witness_ids_json TEXT NOT NULL DEFAULT '[]'
+    CHECK (json_valid(witness_ids_json) AND json_type(witness_ids_json) = 'array'),
+  review_json      TEXT CHECK (review_json IS NULL OR json_valid(review_json)),
+  completed_at     TEXT NOT NULL,
+  UNIQUE (review_id, number),
+  CHECK ((outcome = 'evidence') = (json_array_length(witness_ids_json) > 0)),
+  CHECK ((outcome = 'ready') = (review_json IS NOT NULL))
+);
+CREATE TRIGGER domain_review_round_immutable BEFORE UPDATE ON domain_review_round
+BEGIN SELECT RAISE(ABORT, 'domain review rounds are immutable'); END;
+CREATE TRIGGER domain_review_round_no_delete BEFORE DELETE ON domain_review_round
+BEGIN SELECT RAISE(ABORT, 'domain review rounds are never deleted'); END;""",
 }
 
 

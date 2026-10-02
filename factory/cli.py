@@ -679,7 +679,8 @@ def cmd_strategy(cfg, conn, a):
         return out(domain_groom.detail(cfg, conn, a.review_id))
     if a.scmd == "domain-groom":
         from . import domain_groom
-        return out(domain_groom.request(cfg, conn, a.domain_id, a.goal or ""))
+        return out(domain_groom.request(cfg, conn, a.domain_id or "", a.goal or "", mode=a.mode,
+                                        parent_review_id=a.parent_review, feedback=a.feedback or None))
     if a.scmd == "domain-run":
         from . import domain_groom
         return out(domain_groom.run(cfg, conn, a.review_id))
@@ -905,8 +906,13 @@ def main(argv=None):
     s.add_argument("review_id", type=int)
     s.set_defaults(fn=cmd_strategy)
     s = st.add_parser("domain-groom", help="start a durable read-only DeepSeek review of a domain's open tickets")
-    s.add_argument("domain_id")
+    s.add_argument("domain_id", nargs="?", default="", help="canonical domain id; omitted for a child review")
     s.add_argument("--goal", default="", help="optional focus for this review (bounded)")
+    s.add_argument("--mode", choices=("manual", "agentic"), default="manual",
+                   help="manual = one human-facing revision; agentic = bounded auto critique/evidence passes")
+    s.add_argument("--parent-review", type=int, dest="parent_review", default=None,
+                   help="parent review id; starts a child review on the SAME domain")
+    s.add_argument("--feedback", default="", help="the comment feeding a child review (<=4000 chars)")
     s.set_defaults(fn=cmd_strategy)
     s = st.add_parser("domain-run", help=argparse.SUPPRESS)
     s.add_argument("review_id", type=int)

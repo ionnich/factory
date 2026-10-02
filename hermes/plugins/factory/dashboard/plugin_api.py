@@ -53,11 +53,12 @@ def jobs() -> list[dict]:
     keep = ("name", "schedule_display", "last_run_at", "last_status", "last_error", "next_run_at",
             "paused_at", "enabled")
     out = []
-    for path in JOB_FILES:
+    for profile, path in (("default", JOB_FILES[0]), ("planner", JOB_FILES[1])):
         if not path.exists():
             continue
         data = json.loads(path.read_text())
-        out += [{k: j.get(k) for k in keep} for j in (data.get("jobs", data) if isinstance(data, dict) else data)
+        out += [{**{k: j.get(k) for k in keep}, "id": j.get("id"), "profile": profile}
+                for j in (data.get("jobs", data) if isinstance(data, dict) else data)
                 if str(j.get("name", "")).startswith(("factory-", "[bot:planner]"))]
     return out
 
@@ -282,8 +283,11 @@ async def strategy_create(body: StrategyCreate):
 # Fixed routes first (before /strategy/{brief_id}). Starting a review returns a pending row at once; the detached
 # worker appends the validated result. Approval and the simplification brief are human actions (user:dashboard).
 class DomainReviewRequest(BaseModel):
-    domain_id: str = Field(min_length=1, max_length=200)
+    domain_id: str | None = Field(default=None, max_length=200)
     goal: str = Field(default="", max_length=2000)
+    mode: str = Field(default="manual", pattern=r"^(manual|agentic)$")
+    parent_review_id: int | None = None
+    feedback: str = Field(default="", max_length=4000)
 
 
 class DomainReviewApprove(BaseModel):
@@ -301,9 +305,15 @@ async def domain_reviews_list():
 
 @router.post("/strategy/domain-reviews")
 async def domain_review_start(body: DomainReviewRequest):
-    args = ["strategy", "domain-groom", body.domain_id.strip()]
+    # A child review (parent_review_id set) derives its domain server-side; mode selects one manual revision or a
+    # bounded agentic critique/evidence loop. Returns the pending row at once; the detached worker appends the result.
+    args = ["strategy", "domain-groom", (body.domain_id or "").strip(), f"--mode={body.mode}"]
     if body.goal.strip():
         args.append(f"--goal={body.goal.strip()}")
+    if body.parent_review_id is not None:
+        args.append(f"--parent-review={body.parent_review_id}")
+    if body.feedback.strip():
+        args.append(f"--feedback={body.feedback.strip()}")
     return await factory(*args)
 
 
