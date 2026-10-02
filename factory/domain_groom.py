@@ -39,8 +39,9 @@ _CUT_KEYS = {"id", "title", "reason", "evidence", "risk", "migration"}
 _TICKET_KEYS = {"identifier", "action", "reason", "evidence", "cut_ids", "title", "description", "target"}
 _SIMPLIFICATION_KEYS = {"identifiers", "body"}
 _CUT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-_SELECT = ("SELECT d.*, p.name AS domain_name FROM domain_review d "
-           "JOIN linear_project p ON p.id = d.domain_id")
+_SELECT = ("SELECT d.*, p.name AS domain_name, "
+           "(SELECT max(c.id) FROM domain_review c WHERE c.parent_review_id = d.id) AS superseded_by "
+           "FROM domain_review d JOIN linear_project p ON p.id = d.domain_id")
 
 
 def _expired(row) -> bool:
@@ -58,7 +59,7 @@ def _public(row) -> dict:
             "approved_at": row["approved_at"], "run_id": f"domain-{row['id']}",
             "proposal_brief_id": row["proposal_brief_id"],
             "parent_review_id": row["parent_review_id"], "feedback": row["feedback"], "mode": row["mode"],
-            "round_count": row["round_count"], "outcome": row["outcome"]}
+            "round_count": row["round_count"], "outcome": row["outcome"], "superseded_by": row["superseded_by"]}
 
 
 def _one(conn, review_id: int):
@@ -232,6 +233,22 @@ def _compact_receipt(r: dict) -> dict:
             "result": (r["result"] or "")[:500] or None, "error": (r["error"] or "")[:500] or None}
 
 
+def _compact_result(result: dict) -> dict:
+    """The meaningful parts of a validated review, bounded for prompt inclusion (not the full evidence arrays)."""
+    return {"minimum_system": result["minimum_system"], "limitations": result["limitations"],
+            "cuts": [{"id": c["id"], "title": c["title"]} for c in result["cuts"]],
+            "tickets": [{"identifier": t["identifier"], "action": t["action"], "reason": t["reason"],
+                         "title": t["title"], "description": t["description"], "target": t["target"]}
+                        for t in result["tickets"]]}
+
+
+def _domain_witnesses(cfg, domain_name: str) -> dict:
+    """Read-only witnesses mapped to the contexts of this canonical domain. The prompt and execution are restricted
+    to this set; secret/connection fields are never exposed (only name + kind)."""
+    allowed = {w for ctx in cfg.contexts if ctx.matches(domain_name, []) for w in ctx.witnesses}
+    return {n: cfg.witnesses[n] for n in sorted(allowed)}
+
+
 def _parent_feed(conn, row) -> dict | None:
     """The parent result + human feedback that feed a child review's prompt, or None for a root review."""
     parent_id = row["parent_review_id"]
@@ -239,15 +256,9 @@ def _parent_feed(conn, row) -> dict | None:
         return None
     parent = _one(conn, parent_id)
     result = json.loads(parent["result_json"]) if parent["result_json"] else None
-    compact = None
-    if result:
-        compact = {"minimum_system": result["minimum_system"], "limitations": result["limitations"],
-                   "cuts": [{"id": c["id"], "title": c["title"]} for c in result["cuts"]],
-                   "tickets": [{"identifier": t["identifier"], "action": t["action"], "reason": t["reason"],
-                                "title": t["title"], "description": t["description"], "target": t["target"]}
-                               for t in result["tickets"]]}
     return {"parent_review_id": parent_id, "feedback": parent["feedback"],
-            "parent_assessment": _last_assessment(conn, parent_id), "result": compact}
+            "parent_assessment": _last_assessment(conn, parent_id),
+            "result": _compact_result(result) if result else None}
 
 
 def _last_assessment(conn, review_id: int) -> str | None:
@@ -257,12 +268,21 @@ def _last_assessment(conn, review_id: int) -> str | None:
 
 
 def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rounds: list[dict],
-                  receipts: list[dict], witnesses: dict, mode: str, number: int, max_rounds: int) -> str:
+                  receipts: list[dict], witnesses: dict, candidate: dict | None, mode: str,
+                  number: int, max_rounds: int) -> str:
     detail = Path(tmpdir) / "context.json"
     detail.write_text(json.dumps(ctx, indent=2))
+    if mode == "agentic":
+        intro = (f"You are grooming one canonical Factory Domain project (agentic mode, pass {number} of at most "
+                 f"{max_rounds}). Inspect the open tickets and the code consumers they name. Your first `ready` is a "
+                 "DRAFT candidate the server retains; a later critique pass re-examines it, and only a later `ready` "
+                 "after that critique finalizes the review. Report ONE pass outcome.")
+    else:
+        intro = (f"You are grooming one canonical Factory Domain project (manual mode, pass {number} of at most "
+                 f"{max_rounds}). Inspect the open tickets and the code consumers they name, then report ONE pass "
+                 "outcome.")
     lines = [
-        f"You are grooming one canonical Factory Domain project ({mode} mode, pass {number} of at most {max_rounds}). "
-        "Inspect the open tickets and the code consumers they name, then report ONE pass outcome.",
+        intro,
         "Output ONLY one JSON object — no prose, no markdown fences, no commentary. The object must have exactly "
         "these keys and no others:",
         "  outcome: one of ready|blocked|evidence",
@@ -278,9 +298,14 @@ def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rou
         "A witness query is {\"witness\": <name>, \"query\": <read-only SQL or GraphQL>}. You may ask a schema/"
         "metadata query before a business query; keep each query a single read-only statement and cite returned "
         "receipt ids. Never ask for credentials or secrets.",
-        "Configured read-only witnesses (use ONLY these names, never invent one):",
+        "Read-only witnesses for THIS domain (use ONLY these names, never invent one):",
         json.dumps([{"name": n, "kind": w["kind"]} for n, w in sorted(witnesses.items())], indent=2),
     ]
+    if candidate is not None:
+        lines += ["Your DRAFT candidate review from a prior pass. Critique it against the recorded evidence: confirm "
+                  "it (ready with the same or a revised review), request more evidence, or block — never mark it "
+                  "final without that critique:",
+                  json.dumps(_compact_result(candidate), indent=2)]
     if parent_feed is not None:
         lines += ["Parent review (a person reviewed it and left feedback; address it):",
                   json.dumps(parent_feed, indent=2)]
@@ -442,13 +467,11 @@ def _validate_output(value, ctx: dict, conn) -> dict:
 
 
 def _parse_round_output(raw: str) -> dict:
-    """One model pass: strict envelope {outcome, assessment, witness_queries, review}. A legacy bare review object
-    (the original single-pass shape) is accepted as an implicit ready pass."""
+    """One model pass: strict envelope {outcome, assessment, witness_queries, review}. Every NEW model reply must
+    match this shape exactly; legacy pre-recursion rows stay readable from their already-persisted result_json."""
     parsed = strategy._parse_model_json(raw)
     if not isinstance(parsed, dict):
         raise StageError("round output is not a JSON object")
-    if "outcome" not in parsed:
-        return {"outcome": "ready", "assessment": "single-pass review", "witness_queries": [], "review": parsed}
     if set(parsed) != _ENVELOPE_KEYS:
         raise StageError(f"round output must be exactly {sorted(_ENVELOPE_KEYS)}")
     outcome = parsed["outcome"]
@@ -481,14 +504,14 @@ def _validate_witness_query(q) -> dict:
             "query": _one_str("witness query", q["query"], 1, 8000)}
 
 
-def _execute_witnesses(cfg, conn, queries: list[dict]) -> list[dict]:
-    """Run model-requested queries through the configured read-only witnesses ONLY. Every call is logged to
+def _execute_witnesses(cfg, conn, queries: list[dict], allowed: dict) -> list[dict]:
+    """Run model-requested queries through the domain-scoped read-only witnesses ONLY. Every call is logged to
     witness_log; a failed query is recorded (ok=false) so unavailable data is visible, never substituted."""
     receipts = []
     for q in queries:
         name = q["witness"]
-        if name not in cfg.witnesses:
-            raise StageError(f"unknown witness {name!r}; the model may only use configured witnesses")
+        if name not in allowed:
+            raise StageError(f"witness {name!r} is not mapped to this domain; it cannot be used here")
         out = witness.run(cfg, conn, name, q["query"])
         row = conn.execute("SELECT * FROM witness_log WHERE id=?", (out["witness_log_id"],)).fetchone()
         receipts.append({"id": row["id"], "name": row["witness"], "query": row["query"], "at": row["at"],
@@ -498,11 +521,12 @@ def _execute_witnesses(cfg, conn, queries: list[dict]) -> list[dict]:
 
 
 def _record_round(conn, review_id: int, number: int, assessment: str, outcome: str,
-                  receipts: list[dict]) -> None:
+                  receipts: list[dict], review_json: dict | None) -> None:
     with db.tx(conn):
         conn.execute("INSERT INTO domain_review_round(review_id, number, assessment, outcome, witness_ids_json, "
-                     "completed_at) VALUES (?,?,?,?,?,?)",
-                     (review_id, number, assessment, outcome, json.dumps([r["id"] for r in receipts]), db.now()))
+                     "review_json, completed_at) VALUES (?,?,?,?,?,?,?)",
+                     (review_id, number, assessment, outcome, json.dumps([r["id"] for r in receipts]),
+                      json.dumps(review_json) if review_json is not None else None, db.now()))
 
 
 def _rounds(conn, review_id: int) -> list[dict]:
@@ -510,8 +534,8 @@ def _rounds(conn, review_id: int) -> list[dict]:
     for r in conn.execute("SELECT * FROM domain_review_round WHERE review_id=? ORDER BY number", (review_id,)):
         out.append({"number": r["number"], "assessment": r["assessment"], "outcome": r["outcome"],
                     "completed_at": r["completed_at"],
-                    "witness_receipts": [_witness_receipt(conn, wid)
-                                         for wid in json.loads(r["witness_ids_json"])]})
+                    "receipts": [_witness_receipt(conn, wid) for wid in json.loads(r["witness_ids_json"])],
+                    "review": json.loads(r["review_json"]) if r["review_json"] else None})
     return out
 
 
@@ -638,10 +662,10 @@ def _model_turn(prompt: str, runner) -> dict:
 
 
 def run(cfg, conn, review_id: int, runner=subprocess.run) -> dict:
-    """Claim one pending review, then run the bounded pass loop: each pass either gathers witness evidence
-    (read-only, logged) or concludes ready/blocked. Every pass and receipt is recorded durably before the terminal
-    outcome is committed. Agentic mode runs up to MAX_AGENTIC_ROUNDS critique/evidence passes; manual is one
-    human-facing revision that may gather evidence first."""
+    """Claim one pending review, then run the bounded pass loop. Each pass gathers witness evidence (domain-scoped,
+    read-only, logged) or concludes ready/blocked. In agentic mode the first `ready` is a retained DRAFT candidate;
+    a later critique pass must re-examine it, and only a later `ready` finalizes. No budget left for that critique
+    yields limit_reached, never a falsely-final ready. Manual finalizes on its first ready."""
     with db.tx(conn):
         claimed = conn.execute("UPDATE domain_review SET status='running', started_at=?, progress_at=? "
                                "WHERE id=? AND status='pending'", (db.now(), db.now(), review_id)).rowcount
@@ -652,6 +676,8 @@ def run(cfg, conn, review_id: int, runner=subprocess.run) -> dict:
     mode = job["mode"]
     max_rounds = MAX_AGENTIC_ROUNDS if mode == "agentic" else MANUAL_MAX_ROUNDS
     parent_feed = _parent_feed(conn, job)
+    domain_witnesses = _domain_witnesses(cfg, ctx["domain"]["name"])
+    candidate = None
     prior_rounds, receipts = [], []
     tmpdir = tempfile.mkdtemp(prefix="factory-domain-groom-")
     try:
@@ -660,25 +686,29 @@ def run(cfg, conn, review_id: int, runner=subprocess.run) -> dict:
                 conn.execute("UPDATE domain_review SET progress_at=? WHERE id=? AND status='running'",
                              (db.now(), review_id))
             prompt = _round_prompt(ctx, tmpdir, parent_feed=parent_feed, prior_rounds=prior_rounds,
-                                   receipts=receipts, witnesses=cfg.witnesses, mode=mode,
-                                   number=number, max_rounds=max_rounds)
+                                   receipts=receipts, witnesses=domain_witnesses, candidate=candidate,
+                                   mode=mode, number=number, max_rounds=max_rounds)
             env = _model_turn(prompt, runner)
             summary = {"number": number, "assessment": env["assessment"], "outcome": env["outcome"]}
             if env["outcome"] == "evidence":
-                new_receipts = _execute_witnesses(cfg, conn, env["witness_queries"])
-                _record_round(conn, review_id, number, env["assessment"], "evidence", new_receipts)
-                prior_rounds.append({**summary, "witness_receipt_ids": [r["id"] for r in new_receipts]})
+                new_receipts = _execute_witnesses(cfg, conn, env["witness_queries"], domain_witnesses)
+                _record_round(conn, review_id, number, env["assessment"], "evidence", new_receipts, None)
+                prior_rounds.append({**summary, "receipt_ids": [r["id"] for r in new_receipts]})
                 receipts.extend(new_receipts)
                 continue
-            if env["outcome"] == "ready":
-                result = _validate_output(env["review"], ctx, conn)
-                _record_round(conn, review_id, number, env["assessment"], "ready", [])
+            if env["outcome"] == "blocked":
+                _record_round(conn, review_id, number, env["assessment"], "blocked", [], None)
+                return _commit_stop(conn, review_id, "blocked", env["assessment"], number)
+            # ready: validate and retain the candidate; manual (or the critique pass in agentic) finalizes it.
+            result = _validate_output(env["review"], ctx, conn)
+            _record_round(conn, review_id, number, env["assessment"], "ready", [], result)
+            if mode == "manual" or candidate is not None:
                 return _commit(conn, review_id, result, outcome="ready", round_count=number)
-            _record_round(conn, review_id, number, env["assessment"], "blocked", [])
-            return _commit_stop(conn, review_id, "blocked", env["assessment"], number)
-        # the bounded budget was consumed without ready/blocked
+            candidate = result  # agentic first candidate: retained, now subject to a critique pass
+            continue
+        # the bounded budget was consumed without a critique-finalized ready
         return _commit_stop(conn, review_id, "limit_reached",
-                            f"no substantiated result after {max_rounds} passes", max_rounds)
+                            f"no critique-finalized result after {max_rounds} passes", max_rounds)
     except subprocess.TimeoutExpired:
         return _fail(conn, review_id, f"domain review timed out after {TIMEOUT}s per pass", ("running",))
     except OSError as exc:
@@ -828,9 +858,9 @@ def approve(cfg, conn, review_id: int, identifiers, actor: str) -> dict:
         raise StageError("domain review is still pending/running; retry it")
     if row["status"] != "completed":
         raise StageError(f"domain review #{review_id} is {row['status']}, not completed")
-    if row["approved_at"] is None and conn.execute(
-            "SELECT 1 FROM domain_review WHERE parent_review_id=?", (review_id,)).fetchone():
-        raise StageError(f"domain review #{review_id} is superseded by a newer review; it cannot be approved")
+    if row["approved_at"] is None and row["superseded_by"] is not None:
+        raise StageError(f"domain review #{review_id} is superseded by review #{row['superseded_by']}; "
+                         "it cannot be approved")
     idents = strategy._idents(identifiers)
     result = json.loads(row["result_json"])
     by_id = {t["identifier"]: t for t in result["tickets"]}
@@ -885,6 +915,9 @@ def brief(cfg, conn, review_id: int, actor: str) -> dict:
             raise StageError(f"domain review #{review_id} is {row['status']}, not completed")
         if row["proposal_brief_id"] is not None:
             return {"brief": strategy.get(conn, row["proposal_brief_id"])}
+        if row["superseded_by"] is not None:
+            raise StageError(f"domain review #{review_id} is superseded by review #{row['superseded_by']}; "
+                             "create the brief from the latest review")
         result = json.loads(row["result_json"])
         simp = result.get("simplification")
         if not simp:

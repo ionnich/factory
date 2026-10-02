@@ -744,9 +744,11 @@ CREATE TABLE domain_review_round (
   outcome          TEXT NOT NULL CHECK (outcome IN ('ready', 'blocked', 'evidence')),
   witness_ids_json TEXT NOT NULL DEFAULT '[]'
     CHECK (json_valid(witness_ids_json) AND json_type(witness_ids_json) = 'array'),
+  review_json      TEXT CHECK (review_json IS NULL OR json_valid(review_json)),
   completed_at     TEXT NOT NULL,
   UNIQUE (review_id, number),
-  CHECK ((outcome = 'evidence') = (json_array_length(witness_ids_json) > 0))
+  CHECK ((outcome = 'evidence') = (json_array_length(witness_ids_json) > 0)),
+  CHECK ((outcome = 'ready') = (review_json IS NOT NULL))
 );
 CREATE TRIGGER domain_review_round_immutable BEFORE UPDATE ON domain_review_round
 BEGIN SELECT RAISE(ABORT, 'domain review rounds are immutable'); END;

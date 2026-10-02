@@ -53,11 +53,12 @@ def jobs() -> list[dict]:
     keep = ("name", "schedule_display", "last_run_at", "last_status", "last_error", "next_run_at",
             "paused_at", "enabled")
     out = []
-    for path in JOB_FILES:
+    for profile, path in (("default", JOB_FILES[0]), ("planner", JOB_FILES[1])):
         if not path.exists():
             continue
         data = json.loads(path.read_text())
-        out += [{k: j.get(k) for k in keep} for j in (data.get("jobs", data) if isinstance(data, dict) else data)
+        out += [{**{k: j.get(k) for k in keep}, "id": j.get("id"), "profile": profile}
+                for j in (data.get("jobs", data) if isinstance(data, dict) else data)
                 if str(j.get("name", "")).startswith(("factory-", "[bot:planner]"))]
     return out
 
