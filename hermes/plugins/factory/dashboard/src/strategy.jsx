@@ -1187,7 +1187,9 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
                               mode, feedback, onFeedback, onMode, onRerun, onOpenReview }) {
   const [label, tone] = GROOM_STATUS[r.status] || [r.status || "unknown", "gray"];
   const active = r.status === "pending" || r.status === "running";
-  const completed = r.status === "completed";
+  // A terminal review (completed OR failed — a blocked/limit_reached stop is honestly 'failed' with no result) may
+  // request another round; pending/running stay absent.
+  const terminal = r.status === "completed" || r.status === "failed";
   const supersededBy = r.superseded_by ?? null;
   const superseded = supersededBy != null;
   const result = r.result || null;
@@ -1346,7 +1348,7 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
         </div>
       ) : null}
 
-      {completed ? (
+      {terminal ? (
         <section className="fx-sec fx-stack-v" aria-label="Request another round">
           <div className="fx-k">Request another round</div>
           <div className="fx-hint">Leave a comment and ask for a revised review. Manual runs one human-facing revision;
