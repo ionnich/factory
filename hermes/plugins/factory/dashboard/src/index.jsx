@@ -25,7 +25,8 @@ import { PRReviews, usePRReviews } from "./prs.jsx";
 const SDK = window.__HERMES_PLUGIN_SDK__;
 const { React } = SDK;
 const { useState, useEffect, useCallback, useRef, useMemo } = SDK.hooks;
-const { Button, Badge, Card, CardContent, Input, Toast } = SDK.components;
+const { Button, Badge, Card, CardContent, Input, Toast,
+        Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } = SDK.components;
 const h = React.createElement;
 const Fragment = React.Fragment;  // for <>…</>
 const API = "/api/plugins/factory";
@@ -684,10 +685,9 @@ const epochLocal = (v) => (v == null ? "never" : new Date((typeof v === "number"
   .toLocaleString([], { hour: "2-digit", minute: "2-digit", month: "short", day: "numeric" }));
 const epochAgoS = (v) => (v == null ? "never" : SDK.utils.timeAgo((typeof v === "number" ? v : Number(v)) * 1000));
 
-// Job health: a tap opens a sheet with each job's own last run — its exact recorded error and time — plus the
+// Job health: a tap opens a dialog with each job's own last run — its exact recorded error and time — plus the
 // run history read from the dashboard's existing cron endpoint (never a second log backend). The overview carries
-// name/status/error but not the cron id; the sheet resolves id/profile from the cron list (the same store the
-// overview reads) so history works without a backend change, and prefers id/profile on the job once plugin_api adds them.
+// each job's canonical cron id/profile; a run row opens its recorded error/status and output preview in a dialog.
 function Health({ jobs }) {
   const name = (j) => JOB_NAME[j.name] || j.name;
   const bad = jobs.filter(badJob);
@@ -703,46 +703,23 @@ function Health({ jobs }) {
 }
 
 function HealthPanel({ jobs, onClose }) {
-  const [cron, setCron] = useState(null);  // null=loading, [..]=jobs, {err}=unavailable
-  useEffect(() => {  // Escape closes, like the ticket sheet
-    const k = (e) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", k);
-    return () => window.removeEventListener("keydown", k);
-  }, [onClose]);
-  useEffect(() => {  // cron identities by name (id + owning profile) for the run-history endpoint
-    let live = true;
-    SDK.fetchJSON("/api/cron/jobs?profile=all")
-      .then((rows) => { if (live) setCron(Array.isArray(rows) ? rows : []); },
-            (e) => { if (live) setCron({ err: errText(e) }); });
-    return () => { live = false; };
-  }, []);
-  const byName = useMemo(() => {
-    const m = {};
-    if (Array.isArray(cron)) cron.forEach((c) => { if (c && c.name && !(c.name in m)) m[c.name] = c; });
-    return m;
-  }, [cron]);
-  const ident = (j) => {
-    if (j.id) return { id: j.id, profile: j.profile };
-    const c = byName[j.name];
-    return c ? { id: c.id, profile: c.profile || c.profile_name } : null;
-  };
   const sorted = [...jobs].sort((a, b) => (badJob(b) ? 1 : 0) - (badJob(a) ? 1 : 0) || (a.name < b.name ? -1 : 1));
   return (
-    <div className="fx-sheet-bg" onClick={onClose}>
-      <div className="fx-sheet" role="dialog" aria-modal="true" aria-label="Job health" onClick={stop}>
-        <div className="fx-row between">
-          <div className="fx-title small">Job health</div>
-          <Button size="sm" ghost onClick={onClose} aria-label="Close">✕</Button>
+    <Dialog open onOpenChange={(v) => !v && onClose()}>
+      <DialogContent className="fx-dialog">
+        <DialogHeader>
+          <DialogTitle>Job health</DialogTitle>
+          <DialogDescription>Each cron job's own last run, exactly as its store records it — the whole job, never one ticket or dispatch.</DialogDescription>
+        </DialogHeader>
+        <div className="fx-dialog-body">
+          {sorted.map((j) => <JobHealth key={j.name} j={j} />)}
         </div>
-        <div className="fx-hint">Each cron job's own last run, exactly as its store records it — the whole job, never one ticket or dispatch.</div>
-        {sorted.map((j) => <JobHealth key={j.name} j={j} ident={ident(j)} />)}
-        <CronLink />
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
-function JobHealth({ j, ident }) {
+function JobHealth({ j }) {
   const name = JOB_NAME[j.name] || j.name;
   const bad = badJob(j);
   return (
@@ -757,14 +734,14 @@ function JobHealth({ j, ident }) {
         {j.schedule_display ? ` · ${j.schedule_display}` : ""}
       </div>
       {bad && j.last_error ? <div className="fx-health-err">{j.last_error}</div> : null}
-      {bad ? <RunHistory ident={ident} /> : null}
+      {bad ? <RunHistory id={j.id} profile={j.profile} /> : null}
     </section>
   );
 }
 
-function RunHistory({ ident }) {
-  const id = ident && ident.id, profile = ident && ident.profile;
+function RunHistory({ id, profile }) {
   const [state, setState] = useState(null);  // null=loading, {runs,err}=settled
+  const [openRun, setOpenRun] = useState(null);  // the run whose error/status and output preview are open
   useEffect(() => {
     if (!id) { setState({ runs: [], err: null }); return; }
     let live = true;
@@ -775,27 +752,51 @@ function RunHistory({ ident }) {
     return () => { live = false; };
   }, [id, profile]);
   if (!id) return <div className="fx-hint">Run history needs the cron job id, which this overview does not carry.</div>;
-  return (
+  const runs = state && state.runs ? state.runs : [];
+  return (<>
     <details className="fx-health-runs">
-      <summary>{state && state.runs ? `Recent runs (${state.runs.length})` : "Recent runs"}</summary>
+      <summary>{state && state.runs ? `Recent runs (${runs.length})` : "Recent runs"}</summary>
       {state && state.err ? <div className="fx-err">Run history unavailable: {state.err}</div>
-        : state && state.runs ? (state.runs.length ? <ul className="fx-health-runs-list">{state.runs.map((r) => (
-            <li key={r.id} className={r.source === "cron_output" ? "r-script" : "r-session"}>
-              <span className="fx-hint">{epochAgoS(r.started_at || r.last_active)} · {epochLocal(r.started_at || r.last_active)}</span>
-              <span className="t">{r.title || r.preview || r.id}</span>
+        : state && state.runs ? (runs.length ? <ul className="fx-health-runs-list">{runs.map((r) => (
+            <li key={r.id}>
+              <button type="button" className="fx-run" onClick={() => setOpenRun(r)}
+                      aria-label={`${epochLocal(r.started_at || r.last_active)} — ${clip(r.title || r.preview || r.id, 60)}`}>
+                <span className="fx-hint">{epochAgoS(r.started_at || r.last_active)} · {epochLocal(r.started_at || r.last_active)}</span>
+                <span className="t">{r.title || r.preview || r.id}</span>
+              </button>
             </li>))}</ul> : <div className="fx-hint">No completed runs recorded.</div>)
         : <div className="fx-hint">Loading…</div>}
     </details>
-  );
+    {openRun ? <RunDetail run={openRun} onClose={() => setOpenRun(null)} /> : null}
+  </>);
 }
 
-function CronLink() {
-  const open = () => {
-    if (typeof SDK.navigate === "function") { SDK.navigate("/cron"); return; }
-    const base = (window.__HERMES_BASE_PATH__ || "").replace(/\/+$/, "");
-    window.open(base + "/cron", "_blank", "noopener");
-  };
-  return <button type="button" className="fx-link-btn" onClick={open}>Open in Cron ›</button>;
+// A run's recorded error/status (title, untruncated) and its output preview (the cron runs endpoint truncates
+// preview to 180 chars). Read-only; the SDK dialog traps focus, focuses on open and returns it to the row that
+// opened it on close.
+function RunDetail({ run, onClose }) {
+  const when = run.started_at || run.last_active;
+  const title = run.title, preview = run.preview;
+  return (
+    <Dialog open onOpenChange={(v) => !v && onClose()}>
+      <DialogContent className="fx-dialog">
+        <DialogHeader>
+          <DialogTitle>Run detail</DialogTitle>
+          <DialogDescription>{when != null ? `${epochAgoS(when)} · ${epochLocal(when)}` : "time unknown"}</DialogDescription>
+        </DialogHeader>
+        <div className="fx-dialog-body">
+          {title ? <pre className="fx-run-out">{title}</pre> : null}
+          {preview && !(title && title.includes(preview)) ? (
+            <>
+              <div className="fx-k">Output preview (up to 180 characters)</div>
+              <pre className="fx-run-out muted">{preview}</pre>
+            </>
+          ) : null}
+          {!title && !preview ? <div className="fx-hint">No output recorded for this run.</div> : null}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
 }
 
 // A cron job's own last run, as its store records it. The job covers every ticket or draft: its status and error are
