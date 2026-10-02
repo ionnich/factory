@@ -118,22 +118,23 @@
                        display: grid; gap: .15rem; font-size: .82rem; }
 .fx-health-runs-list li { display: grid; }
 .fx-health-runs-list .fx-run { display: grid; gap: .1rem; width: 100%; text-align: left; background: none; border: 0;
-                               padding: .35rem .5rem; border-radius: var(--fx-r-sm); font: inherit; cursor: pointer; }
+                               min-height: 44px; padding: .35rem .5rem; border-radius: var(--fx-r-sm); font: inherit; cursor: pointer; }
 .fx-health-runs-list .fx-run:hover { background: var(--fx-fill); }
 .fx-health-runs-list .fx-run:focus-visible { outline: 2px solid var(--fx-lavender); outline-offset: 2px; }
 .fx-health-runs-list .t { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fx-fg); }
-/* The SDK Dialog portals its content outside .fx, so the skin's tokens must travel with the panel (they mirror
-   the .fx token block; the host's global theme tokens fill every fallback). */
+/* The SDK Dialog portals its content outside .fx, so the theme's customCSS overrides (scoped to .fx) never reach
+   it. Resolve the skin's text tokens from the host's GLOBAL semantic tokens instead — card text, muted text and
+   muted fill — which the theme loader sets on :root, so both light and dark themes stay readable. */
 .fx-dialog {
   max-height: 88vh; overflow-y: auto;
   --fx-canvas: var(--background-base, #282828);
-  --fx-fg: var(--theme-terminal-foreground, var(--midground-base, #ebdbb2));
+  --fx-fg: var(--color-card-foreground, var(--midground-base, #ebdbb2));
   --fx-panel: var(--color-card, color-mix(in srgb, var(--midground-base, #ebdbb2) 5%, var(--background-base, #282828)));
-  --fx-muted: color-mix(in srgb, var(--fx-fg) 78%, var(--fx-canvas));
+  --fx-muted: var(--color-muted-foreground, color-mix(in srgb, var(--fx-fg) 78%, var(--fx-canvas)));
   --fx-dim: var(--fx-muted);
   --fx-border: var(--color-border, color-mix(in srgb, var(--midground-base, #ebdbb2) 18%, transparent));
   --fx-line: color-mix(in srgb, var(--fx-border) 68%, transparent);
-  --fx-fill: color-mix(in srgb, var(--midground-base, #ebdbb2) 7%, transparent);
+  --fx-fill: var(--color-muted, color-mix(in srgb, var(--midground-base, #ebdbb2) 7%, transparent));
   --a: color-mix(in srgb, var(--fx-amber, var(--color-warning, #f59e0b)) 50%, var(--fx-fg));
   --g: color-mix(in srgb, var(--fx-green, var(--color-success, #10b981)) 50%, var(--fx-fg));
   --b: var(--fx-blue, var(--color-ring, #a78bfa));
@@ -143,7 +144,12 @@
   --fx-lavender: var(--b);
   --fx-r-sm: 6px; --fx-r: 8px;
 }
+/* The host DialogContent defaults to text-foreground-base (a decorative pale layer in light themes); force the
+   panel's base text to the theme's card text so titles and inherited text stay readable. */
+.fx-dialog[data-slot="dialog-content"] { color: var(--fx-fg); }
 .fx-dialog-body { display: grid; gap: .6rem; padding: .8rem; }
+/* The SDK dialog's built-in close (X) is 24px; give it a 44px hit target while keeping the icon in place. */
+.fx-dialog [data-slot="dialog-close"] { width: 44px; height: 44px; top: 2px; right: 2px; }
 /* A run's recorded error/status and its output preview, opened from a run row (read-only). */
 .fx-run-out { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font: inherit; font-size: .82rem;
               color: var(--fx-fg); background: var(--fx-panel); border: 1px solid var(--fx-line);

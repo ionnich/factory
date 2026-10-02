@@ -692,34 +692,42 @@ function Health({ jobs }) {
   const name = (j) => JOB_NAME[j.name] || j.name;
   const bad = jobs.filter(badJob);
   const [open, setOpen] = useState(false);
+  const btnRef = useRef(null);  // the header button; focus returns here when the dialog closes
   return (<>
-    <button type="button" className={`fx-health${bad.length ? " bad" : ""}`} aria-haspopup="dialog"
+    <button type="button" ref={btnRef} className={`fx-health${bad.length ? " bad" : ""}`} aria-haspopup="dialog"
             aria-expanded={open} onClick={() => setOpen((o) => !o)}
             title={bad.length ? "Jobs failed — tap for errors and logs" : "Job health"}>
       <i />{bad.length ? bad.map((j) => `${name(j)} failed`).join(" · ") : "all jobs fine"}
     </button>
-    {open ? <HealthPanel jobs={jobs} onClose={() => setOpen(false)} /> : null}
+    {open ? <HealthPanel jobs={jobs} onClose={() => setOpen(false)} openerRef={btnRef} /> : null}
   </>);
 }
 
-function HealthPanel({ jobs, onClose }) {
+function HealthPanel({ jobs, onClose, openerRef }) {
+  const [openRun, setOpenRun] = useState(null);   // the run whose detail is open (nested dialog)
+  const rowRef = useRef(null);                     // the run row that opened it; focus returns there
+  const openRunRef = useRef(null);                 // read by event handlers after this render
+  openRunRef.current = openRun;
   const sorted = [...jobs].sort((a, b) => (badJob(b) ? 1 : 0) - (badJob(a) ? 1 : 0) || (a.name < b.name ? -1 : 1));
-  return (
-    <Dialog open onOpenChange={(v) => !v && onClose()}>
-      <DialogContent className="fx-dialog">
+  return (<>
+    <Dialog open onOpenChange={(v) => { if (!v && !openRunRef.current) onClose(); }}>
+      <DialogContent className="fx-dialog"
+        onEscapeKeyDown={(e) => { if (openRunRef.current) e.preventDefault(); }}
+        onCloseAutoFocus={(e) => { e.preventDefault(); openerRef.current?.focus(); }}>
         <DialogHeader>
           <DialogTitle>Job health</DialogTitle>
           <DialogDescription>Each cron job's own last run, exactly as its store records it — the whole job, never one ticket or dispatch.</DialogDescription>
         </DialogHeader>
         <div className="fx-dialog-body">
-          {sorted.map((j) => <JobHealth key={j.name} j={j} />)}
+          {sorted.map((j) => <JobHealth key={j.name} j={j} rowRef={rowRef} onOpenRun={setOpenRun} />)}
         </div>
       </DialogContent>
     </Dialog>
-  );
+    {openRun ? <RunDetail run={openRun} onClose={() => setOpenRun(null)} rowRef={rowRef} /> : null}
+  </>);
 }
 
-function JobHealth({ j }) {
+function JobHealth({ j, rowRef, onOpenRun }) {
   const name = JOB_NAME[j.name] || j.name;
   const bad = badJob(j);
   return (
@@ -734,14 +742,13 @@ function JobHealth({ j }) {
         {j.schedule_display ? ` · ${j.schedule_display}` : ""}
       </div>
       {bad && j.last_error ? <div className="fx-health-err">{j.last_error}</div> : null}
-      {bad ? <RunHistory id={j.id} profile={j.profile} /> : null}
+      {bad ? <RunHistory id={j.id} profile={j.profile} rowRef={rowRef} onOpenRun={onOpenRun} /> : null}
     </section>
   );
 }
 
-function RunHistory({ id, profile }) {
+function RunHistory({ id, profile, rowRef, onOpenRun }) {
   const [state, setState] = useState(null);  // null=loading, {runs,err}=settled
-  const [openRun, setOpenRun] = useState(null);  // the run whose error/status and output preview are open
   useEffect(() => {
     if (!id) { setState({ runs: [], err: null }); return; }
     let live = true;
@@ -753,13 +760,14 @@ function RunHistory({ id, profile }) {
   }, [id, profile]);
   if (!id) return <div className="fx-hint">Run history needs the cron job id, which this overview does not carry.</div>;
   const runs = state && state.runs ? state.runs : [];
-  return (<>
+  return (
     <details className="fx-health-runs">
       <summary>{state && state.runs ? `Recent runs (${runs.length})` : "Recent runs"}</summary>
       {state && state.err ? <div className="fx-err">Run history unavailable: {state.err}</div>
         : state && state.runs ? (runs.length ? <ul className="fx-health-runs-list">{runs.map((r) => (
             <li key={r.id}>
-              <button type="button" className="fx-run" onClick={() => setOpenRun(r)}
+              <button type="button" className="fx-run"
+                      onClick={(e) => { rowRef.current = e.currentTarget; onOpenRun(r); }}
                       aria-label={`${epochLocal(r.started_at || r.last_active)} — ${clip(r.title || r.preview || r.id, 60)}`}>
                 <span className="fx-hint">{epochAgoS(r.started_at || r.last_active)} · {epochLocal(r.started_at || r.last_active)}</span>
                 <span className="t">{r.title || r.preview || r.id}</span>
@@ -767,19 +775,19 @@ function RunHistory({ id, profile }) {
             </li>))}</ul> : <div className="fx-hint">No completed runs recorded.</div>)
         : <div className="fx-hint">Loading…</div>}
     </details>
-    {openRun ? <RunDetail run={openRun} onClose={() => setOpenRun(null)} /> : null}
-  </>);
+  );
 }
 
 // A run's recorded error/status (title, untruncated) and its output preview (the cron runs endpoint truncates
-// preview to 180 chars). Read-only; the SDK dialog traps focus, focuses on open and returns it to the row that
-// opened it on close.
-function RunDetail({ run, onClose }) {
+// preview to 180 chars). Read-only; Escape closes only this nested dialog and focus returns to the row that opened it.
+function RunDetail({ run, onClose, rowRef }) {
   const when = run.started_at || run.last_active;
   const title = run.title, preview = run.preview;
   return (
     <Dialog open onOpenChange={(v) => !v && onClose()}>
-      <DialogContent className="fx-dialog">
+      <DialogContent className="fx-dialog"
+        onEscapeKeyDown={(e) => { e.preventDefault(); onClose(); }}
+        onCloseAutoFocus={(e) => { e.preventDefault(); rowRef.current?.focus(); }}>
         <DialogHeader>
           <DialogTitle>Run detail</DialogTitle>
           <DialogDescription>{when != null ? `${epochAgoS(when)} · ${epochLocal(when)}` : "time unknown"}</DialogDescription>
