@@ -558,6 +558,62 @@ class RecursiveGrooming(unittest.TestCase):
         done = self._run(agentic, [self.envelope("confirmed", assessment="unchanged")])
         self.assertEqual(done["status"], "failed")
 
+    def test_agentic_child_confirms_inherited_draft_in_one_pass(self):
+        self.insert("FIN-1")
+        parent = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        self._run(parent, [self.envelope("ready", review=result([disposition("FIN-1", "keep")],
+                                                                minimum_system="INHERITED_RESULT_MARKER"))])
+        child = domain_groom.request(self.cfg, self.c, "", mode="agentic", parent_review_id=parent,
+                                     feedback="please substantiate", spawn=lambda argv, **kw: None)["id"]
+        done = self._run(child, [self.envelope("confirmed", assessment="inherited draft verified")])
+        self.assertEqual(done["status"], "completed")
+        self.assertEqual(done["outcome"], "ready")
+        self.assertEqual(done["round_count"], 1)  # ONE child pass: the inherited draft was critiqued directly
+        self.assertIsNone(done["approved_at"])  # never auto-approved
+        self.assertEqual(self.c.execute("SELECT count(*) FROM writeback WHERE run_id=?",
+                                        (f"domain-{child}",)).fetchone()[0], 0)
+        detail = domain_groom.detail(self.cfg, self.c, child)
+        parent_detail = domain_groom.detail(self.cfg, self.c, parent)
+        self.assertEqual(detail["result"], parent_detail["result"])  # EXACT inherited result, not regenerated
+        self.assertEqual(detail["result"]["minimum_system"], "INHERITED_RESULT_MARKER")
+        rounds = detail["rounds"]
+        self.assertEqual([(r["number"], r["outcome"]) for r in rounds], [(1, "ready")])
+        self.assertEqual(rounds[0]["review"], parent_detail["result"])
+
+    def test_zero_pass_failed_parent_carries_nearest_ancestor_draft_and_comment(self):
+        self.insert("FIN-1")
+        candidate = result([disposition("FIN-1", "keep")], minimum_system="ANCESTOR_DRAFT_MARKER")
+        candidate_env = self.envelope("ready", assessment="candidate pass", review=candidate)
+        evidence = self.envelope("evidence", assessment="need live facts",
+                                 queries=[{"witness": "ch", "query": "SELECT 1"}])
+        ancestor = domain_groom.request(self.cfg, self.c, "p1", mode="agentic", spawn=lambda argv, **kw: None)["id"]
+        done = self._run(ancestor, [candidate_env, evidence, evidence], witness=True)
+        self.assertEqual(done["outcome"], "limit_reached")
+        # an intervening child that failed with zero passes (never ran a model turn)
+        empty = domain_groom.request(self.cfg, self.c, "", mode="agentic", parent_review_id=ancestor,
+                                     feedback="intermediate comment", spawn=lambda argv, **kw: None)["id"]
+        self.c.execute("UPDATE domain_review SET status='failed', completed_at=?, error='zero-pass' WHERE id=?",
+                       (SNAP, empty))
+        child = domain_groom.request(self.cfg, self.c, "", mode="agentic", parent_review_id=empty,
+                                     feedback="current comment", spawn=lambda argv, **kw: None)["id"]
+        feed = domain_groom._parent_feed(self.c, domain_groom._one(self.c, child))
+        self.assertEqual(feed["feedback"], "current comment")  # the current child comment, never the ancestor's
+        self.assertTrue(feed["draft"])
+        self.assertEqual(feed["result"]["minimum_system"], "ANCESTOR_DRAFT_MARKER")
+        self.assertEqual(len(feed["passes"]), 3)  # the nearest ancestor's passes, carried past the empty parent
+        self.assertTrue(all(p["review_id"] == ancestor for p in feed["passes"]))
+
+    def test_incompatible_inherited_candidate_cannot_be_confirmed(self):
+        self.insert("FIN-1")
+        parent = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        self._run(parent, [self.envelope("ready", review=result([disposition("FIN-1", "keep")]))])
+        self.insert("FIN-2")  # a new open ticket makes the inherited result incompatible
+        child = domain_groom.request(self.cfg, self.c, "", mode="agentic", parent_review_id=parent,
+                                     feedback="redo with both tickets", spawn=lambda argv, **kw: None)["id"]
+        done = self._run(child, [self.envelope("confirmed", assessment="unchanged")])
+        self.assertEqual(done["status"], "failed")  # the stale candidate was not seeded, so confirmed is refused
+        self.assertIsNone(domain_groom.detail(self.cfg, self.c, child)["result"])
+
     def test_agentic_candidate_without_critique_budget_is_limit_reached(self):
         self.insert("FIN-1")
         rid = domain_groom.request(self.cfg, self.c, "p1", mode="agentic", spawn=lambda argv, **kw: None)["id"]

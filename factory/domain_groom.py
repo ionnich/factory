@@ -236,30 +236,39 @@ def _domain_witnesses(cfg, domain_name: str) -> dict:
 
 
 def _parent_feed(conn, row) -> dict | None:
-    """The parent's terminal result (or, for a failed/limit_reached parent, its latest retained candidate, labeled
-    `draft`) plus the parent's ordered pass records feed this child review's prompt; None for a root review.
-    `feedback` is the current review's own comment (row.feedback) — never the parent's."""
+    """Walk this review's ancestor chain to the nearest committed result (or, for a failed/limit_reached ancestor,
+    its latest retained candidate, labeled `draft`) and collect every ancestor's ordered pass records, each tagged
+    with its source review id. Feeds the child's prompt; None for a root review. `feedback` is the current review's
+    own comment (row.feedback) — never an ancestor's."""
     parent_id = row["parent_review_id"]
     if parent_id is None:
         return None
-    parent = _one(conn, parent_id)
-    rounds = _rounds(conn, parent_id)
-    result = json.loads(parent["result_json"]) if parent["result_json"] else None
-    draft = False
-    if result is None:
-        for r in reversed(rounds):  # a failed/limit_reached parent keeps its latest retained candidate
+    result, draft = None, False
+    passes = []
+    cur = parent_id
+    while cur is not None:
+        ancestor = _one(conn, cur)
+        rounds = _rounds(conn, cur)
+        passes = [{"review_id": cur, "number": r["number"], "outcome": r["outcome"],
+                   "assessment": r["assessment"], "receipts": r["receipts"]} for r in rounds] + passes
+        committed = json.loads(ancestor["result_json"]) if ancestor["result_json"] else None
+        if committed is not None:
+            result, draft = committed, False
+            break
+        for r in reversed(rounds):  # a failed/limit_reached ancestor keeps its latest retained candidate
             if r["outcome"] == "ready" and r["review"] is not None:
                 result, draft = r["review"], True
                 break
-    passes = [{"number": r["number"], "outcome": r["outcome"], "assessment": r["assessment"],
-               "receipts": r["receipts"]} for r in rounds]
+        if result is not None:
+            break
+        cur = ancestor["parent_review_id"]
     return {"parent_review_id": parent_id, "feedback": row["feedback"], "result": result,
             "draft": draft, "passes": passes}
 
 
 def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rounds: list[dict],
                   receipts: list[dict], witnesses: dict, candidate: dict | None, mode: str,
-                  number: int, max_rounds: int) -> str:
+                  number: int, max_rounds: int, inherited_note: str | None = None) -> str:
     detail = Path(tmpdir) / "context.json"
     detail.write_text(json.dumps(ctx, indent=2))
     if mode == "agentic":
@@ -297,22 +306,33 @@ def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rou
         json.dumps([{"name": n, "kind": w["kind"]} for n, w in sorted(witnesses.items())], indent=2),
     ]
     if candidate is not None:
-        lines += ["Your DRAFT candidate review from a prior pass. CRITIQUE it — do not re-do the review or "
-                  "re-inventory the domain. Challenge each disposition's specific claims against the recorded "
-                  "evidence and the person's feedback: confirm only what the cited evidence genuinely supports, "
-                  "flag contradictions and missing evidence, and re-read only the files a specific claim actually "
-                  "needs (the full context file remains available). Server-recorded identifiers, eligibility, and "
-                  "snapshot timestamps are input facts to cite, not facts to re-verify.",
+        lines += ["Your DRAFT candidate review (inherited from a prior review, or retained from a prior pass). "
+                  "CRITIQUE it — do not re-do the review or re-inventory the domain. Challenge each disposition's "
+                  "specific claims against the recorded evidence and the person's feedback: confirm only what the "
+                  "cited evidence genuinely supports, flag contradictions and missing evidence, and re-read only "
+                  "the files a specific claim actually needs (the full context file remains available). "
+                  "Server-recorded identifiers, eligibility, and snapshot timestamps are input facts to cite, not "
+                  "facts to re-verify.",
                   "If every claim holds and the candidate needs NO revision, return outcome `confirmed` with "
                   "`review: null` and a substantive assessment — do NOT reprint the candidate. Only if it needs "
                   "changes return `ready` with the FULL revised review; otherwise request more evidence or block. "
                   "Never finalize without genuinely testing the candidate's evidence. The DRAFT candidate:",
                   json.dumps(candidate, indent=2)]
     if parent_feed is not None:
-        lines += ["Parent review (a person reviewed it and left feedback; address it). `result` is the parent's "
-                  "recorded result — `draft: true` means it is a retained candidate, not a finalized review — and "
-                  "`passes` are the parent's ordered passes with assessments and witness receipts:",
-                  json.dumps(parent_feed, indent=2)]
+        if candidate is None:
+            lines += ["Prior review (a person reviewed it and left feedback; address it). `result` is the prior "
+                      "review's recorded result — `draft: true` means it is a retained candidate, not a finalized "
+                      "review — and `passes` are the ancestor chain's ordered passes (tagged with review_id) with "
+                      "assessments and witness receipts:",
+                      json.dumps(parent_feed, indent=2)]
+        else:
+            lines += ["Person feedback (address it) and the ancestor chain's ordered passes (tagged with review_id) "
+                      "with assessments and witness receipts:",
+                      json.dumps({"parent_review_id": parent_feed["parent_review_id"],
+                                  "feedback": parent_feed["feedback"], "passes": parent_feed["passes"]}, indent=2)]
+    if inherited_note:
+        lines += ["The inherited prior review could NOT be reused against the current recorded context and was "
+                  "discarded — produce a fresh review. Reason: " + inherited_note]
     if prior_rounds:
         lines += ["Prior passes in this review (carry these findings forward; most recent last):",
                   json.dumps(prior_rounds, indent=2)]
@@ -678,9 +698,11 @@ def _model_turn(prompt: str, runner) -> dict:
 
 def run(cfg, conn, review_id: int, runner=subprocess.run) -> dict:
     """Claim one pending review, then run the bounded pass loop. Each pass gathers witness evidence (domain-scoped,
-    read-only, logged) or concludes ready/blocked. In agentic mode the first `ready` is a retained DRAFT candidate;
-    a later critique pass must re-examine it, and only a later `ready` finalizes. No budget left for that critique
-    yields limit_reached, never a falsely-final ready. Manual finalizes on its first ready."""
+    read-only, logged) or concludes ready/blocked/confirmed. In agentic mode the first `ready` is a retained DRAFT
+    candidate; a later critique pass must re-examine it, and only a later `ready`/`confirmed` finalizes. An agentic
+    child seeds its inherited ancestor candidate (re-validated against the current context) so its first pass is
+    already the critique. No budget left for that critique yields limit_reached, never a falsely-final ready. Manual
+    finalizes on its first ready."""
     with db.tx(conn):
         claimed = conn.execute("UPDATE domain_review SET status='running', started_at=?, progress_at=? "
                                "WHERE id=? AND status='pending'", (db.now(), db.now(), review_id)).rowcount
@@ -693,6 +715,12 @@ def run(cfg, conn, review_id: int, runner=subprocess.run) -> dict:
     parent_feed = _parent_feed(conn, job)
     domain_witnesses = _domain_witnesses(cfg, ctx["domain"]["name"])
     candidate = None
+    inherited_note = None
+    if mode == "agentic" and parent_feed is not None and parent_feed.get("result") is not None:
+        try:
+            candidate = _validate_output(parent_feed["result"], ctx, conn)  # re-validate against the NEW context
+        except StageError as exc:
+            inherited_note = str(exc)  # incompatible with the current context: the model must redraft, not confirm
     prior_rounds, receipts = [], []
     tmpdir = tempfile.mkdtemp(prefix="factory-domain-groom-")
     try:
@@ -704,7 +732,8 @@ def run(cfg, conn, review_id: int, runner=subprocess.run) -> dict:
                     raise StageError(f"domain review #{review_id} is no longer running")
             prompt = _round_prompt(ctx, tmpdir, parent_feed=parent_feed, prior_rounds=prior_rounds,
                                    receipts=receipts, witnesses=domain_witnesses, candidate=candidate,
-                                   mode=mode, number=number, max_rounds=max_rounds)
+                                   mode=mode, number=number, max_rounds=max_rounds,
+                                   inherited_note=inherited_note)
             env = _model_turn(prompt, runner)
             summary = {"number": number, "assessment": env["assessment"], "outcome": env["outcome"]}
             if env["outcome"] == "evidence":
