@@ -277,13 +277,15 @@ def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rou
         intro = (f"You are grooming one canonical Factory Domain project (agentic mode, pass {number} of at most "
                  f"{max_rounds}). Inspect the open tickets and the code consumers they name. Your first `ready` is a "
                  "DRAFT candidate the server retains; a later critique pass re-examines it, and only a later `ready` "
-                 "after that critique finalizes the review. Report ONE pass outcome.")
+                 "after that critique finalizes the review.")
     else:
         intro = (f"You are grooming one canonical Factory Domain project (manual mode, pass {number} of at most "
-                 f"{max_rounds}). Inspect the open tickets and the code consumers they name, then report ONE pass "
-                 "outcome.")
+                 f"{max_rounds}). Inspect the open tickets and the code consumers they name.")
     lines = [
         intro,
+        "This is exactly ONE pass: do only this pass's work, then return the JSON envelope promptly. When you need "
+        "live facts not already recorded, return outcome `evidence` with witness_queries at once — the server runs "
+        "them and starts a later pass. Never run, wait for, or simulate later passes yourself.",
         "Output ONLY one JSON object — no prose, no markdown fences, no commentary. The object must have exactly "
         "these keys and no others:",
         "  outcome: one of ready|blocked|evidence",
@@ -658,7 +660,8 @@ def _model_turn(prompt: str, runner) -> dict:
         with os.fdopen(fd, "w") as handle:
             handle.write(prompt)
         proc = runner([strategy.OMP, "--model", MODEL, "--thinking", "high", "--tools", "read,grep,glob",
-                       "--no-extensions", "--no-session", "-p", f"@{path}"],
+                       "--no-extensions", "--no-session", "--no-prewalk", "--no-pty", "--approval-mode", "yolo",
+                       "-p", f"@{path}"],
                       capture_output=True, text=True, timeout=TIMEOUT)
     finally:
         os.unlink(path)
