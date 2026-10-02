@@ -576,6 +576,46 @@ class RecursiveGrooming(unittest.TestCase):
             domain_groom.brief(self.cfg, self.c, parent, "user:dashboard")
         self.assertIn("superseded", str(cm.exception))
 
+    def test_partial_approval_after_child_replays_but_refuses_new(self):
+        self.insert("FIN-1")
+        self.insert("FIN-2")
+        rewrites = self.envelope("ready", review=result([
+            disposition("FIN-1", "rewrite", title="T1", description="D1\nDomain: My Domain"),
+            disposition("FIN-2", "rewrite", title="T2", description="D2\nDomain: My Domain"),
+        ]))
+        parent = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        self._run(parent, [rewrites])
+        run_id = f"domain-{parent}"
+        domain_groom.approve(self.cfg, self.c, parent, ["FIN-1"], "user:dashboard")  # partial approval
+        self.assertEqual(self.c.execute("SELECT count(*) FROM writeback WHERE run_id=?", (run_id,)).fetchone()[0], 1)
+        domain_groom.request(self.cfg, self.c, "", mode="manual", parent_review_id=parent,
+                             spawn=lambda argv, **kw: None)["id"]  # child now supersedes the parent
+        # exact replay of the already-approved identifier stays idempotent (todo empty, no superseded refusal)
+        domain_groom.approve(self.cfg, self.c, parent, ["FIN-1"], "user:dashboard")
+        self.assertEqual(self.c.execute("SELECT count(*) FROM writeback WHERE run_id=?", (run_id,)).fetchone()[0], 1)
+        # a NEW identifier after the child exists is refused even though approved_at is already set
+        with self.assertRaises(StageError) as cm:
+            domain_groom.approve(self.cfg, self.c, parent, ["FIN-2"], "user:dashboard")
+        self.assertIn("superseded", str(cm.exception))
+        # the existing queued write is untouched
+        write = self.c.execute("SELECT * FROM writeback WHERE run_id=?", (run_id,)).fetchone()
+        self.assertEqual(write["issue_id"], "fin-1")
+        self.assertEqual(write["status"], "planned")
+
+    def test_record_round_advances_round_count_and_refuses_retired_review(self):
+        self.insert("FIN-1")
+        rid = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        self.c.execute("UPDATE domain_review SET status='running' WHERE id=?", (rid,))
+        review = result([disposition("FIN-1", "keep")])
+        domain_groom._record_round(self.c, rid, 1, "candidate", "ready", [], review)
+        self.assertEqual(self.c.execute("SELECT round_count FROM domain_review WHERE id=?",
+                                        (rid,)).fetchone()[0], 1)  # progress is real, not stuck at 0
+        # a retired worker cannot append a late round
+        self.c.execute("UPDATE domain_review SET status='failed', completed_at=?, error='retired' WHERE id=?",
+                       (SNAP, rid))
+        with self.assertRaises(StageError):
+            domain_groom._record_round(self.c, rid, 2, "late", "ready", [], review)
+
     def test_parse_round_output_enforces_the_envelope(self):
         with self.assertRaises(StageError):
             domain_groom._parse_round_output('{"outcome": "bogus", "assessment": "x", '

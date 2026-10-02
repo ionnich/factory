@@ -522,7 +522,13 @@ def _execute_witnesses(cfg, conn, queries: list[dict], allowed: dict) -> list[di
 
 def _record_round(conn, review_id: int, number: int, assessment: str, outcome: str,
                   receipts: list[dict], review_json: dict | None) -> None:
+    """Append one pass AND advance round_count/progress_at atomically, only while the review is still running — a
+    retired worker cannot append late rounds and the summary's round_count tracks recorded passes in real time."""
     with db.tx(conn):
+        changed = conn.execute("UPDATE domain_review SET round_count=?, progress_at=? "
+                               "WHERE id=? AND status='running'", (number, db.now(), review_id)).rowcount
+        if not changed:
+            raise StageError(f"domain review #{review_id} is no longer running")
         conn.execute("INSERT INTO domain_review_round(review_id, number, assessment, outcome, witness_ids_json, "
                      "review_json, completed_at) VALUES (?,?,?,?,?,?,?)",
                      (review_id, number, assessment, outcome, json.dumps([r["id"] for r in receipts]),
@@ -683,8 +689,10 @@ def run(cfg, conn, review_id: int, runner=subprocess.run) -> dict:
     try:
         for number in range(1, max_rounds + 1):
             with db.tx(conn):
-                conn.execute("UPDATE domain_review SET progress_at=? WHERE id=? AND status='running'",
-                             (db.now(), review_id))
+                changed = conn.execute("UPDATE domain_review SET progress_at=? WHERE id=? AND status='running'",
+                                       (db.now(), review_id)).rowcount
+                if not changed:
+                    raise StageError(f"domain review #{review_id} is no longer running")
             prompt = _round_prompt(ctx, tmpdir, parent_feed=parent_feed, prior_rounds=prior_rounds,
                                    receipts=receipts, witnesses=domain_witnesses, candidate=candidate,
                                    mode=mode, number=number, max_rounds=max_rounds)
@@ -858,9 +866,6 @@ def approve(cfg, conn, review_id: int, identifiers, actor: str) -> dict:
         raise StageError("domain review is still pending/running; retry it")
     if row["status"] != "completed":
         raise StageError(f"domain review #{review_id} is {row['status']}, not completed")
-    if row["approved_at"] is None and row["superseded_by"] is not None:
-        raise StageError(f"domain review #{review_id} is superseded by review #{row['superseded_by']}; "
-                         "it cannot be approved")
     idents = strategy._idents(identifiers)
     result = json.loads(row["result_json"])
     by_id = {t["identifier"]: t for t in result["tickets"]}
@@ -879,6 +884,12 @@ def approve(cfg, conn, review_id: int, identifiers, actor: str) -> dict:
         todo = [t for t in selected if t["identifier"] not in already]
         if not todo:
             return detail(cfg, conn, review_id)  # idempotent: everything selected is already frozen
+        # Re-read the current superseded state under the lock: a partially-approved review must not gain NEW
+        # identifiers once a child exists, even though its approved_at is already set.
+        current = _one(conn, review_id)
+        if current["superseded_by"] is not None:
+            raise StageError(f"domain review #{review_id} is superseded by review #{current['superseded_by']}; "
+                             "it cannot be approved")
         # a merge whose target is a rewrite needs that rewrite selected (or already approved) — otherwise its source
         # cancel could never be confirmed and would strand planned forever.
         frozen = already | {t["identifier"] for t in selected}
