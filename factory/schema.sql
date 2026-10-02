@@ -237,17 +237,29 @@ CREATE TABLE domain_review (
   proposal_brief_id INTEGER REFERENCES work_brief(id),
   result_json       TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
   context_json      TEXT NOT NULL CHECK (json_valid(context_json)),
+  -- Recursive grooming: mode (manual = one human-facing revision, agentic = bounded auto passes), an optional parent
+  -- (child reviews derive/check the same domain and feed the parent result + feedback), round_count and the terminal
+  -- outcome (ready|blocked|limit_reached). progress_at is the worker heartbeat: a healthy multi-pass worker updates it
+  -- each turn so a GET never expires it mid-loop.
+  mode              TEXT NOT NULL DEFAULT 'manual' CHECK (mode IN ('manual', 'agentic')),
+  parent_review_id  INTEGER REFERENCES domain_review(id),
+  feedback          TEXT CHECK (feedback IS NULL OR length(feedback) <= 4000),
+  round_count       INTEGER NOT NULL DEFAULT 0 CHECK (round_count >= 0),
+  outcome           TEXT CHECK (outcome IS NULL OR outcome IN ('ready', 'blocked', 'limit_reached')),
+  progress_at       TEXT,
   CHECK (status IN ('pending', 'running') OR completed_at IS NOT NULL),
   CHECK (status <> 'completed' OR result_json IS NOT NULL),
   CHECK (status <> 'failed' OR error IS NOT NULL),
   CHECK ((approved_at IS NULL) = (approved_by IS NULL)),
-  CHECK (approved_at IS NULL OR (approved_by NOT GLOB 'agent:*' AND approved_by NOT GLOB 'factory:*'))
+  CHECK (approved_at IS NULL OR (approved_by NOT GLOB 'agent:*' AND approved_by NOT GLOB 'factory:*')),
+  CHECK (feedback IS NULL OR parent_review_id IS NOT NULL)
 );
 CREATE UNIQUE INDEX domain_review_active ON domain_review(domain_id)
 WHERE status IN ('pending', 'running');
 -- A completed/failed review's recorded evidence and validated result are immutable (raw sqlite3 too); approval
--- provenance is set once and is a person only (the table CHECK already rejects agent:/factory: actors).
-CREATE TRIGGER domain_review_frozen BEFORE UPDATE OF result_json, context_json, domain_id, goal ON domain_review
+-- provenance is set once and is a person only (the table CHECK already rejects agent:/factory: actors). Mode, parent
+-- and feedback are chosen at request time and never change after the review leaves pending/running.
+CREATE TRIGGER domain_review_frozen BEFORE UPDATE OF result_json, context_json, domain_id, goal, mode, parent_review_id, feedback ON domain_review
 WHEN OLD.status NOT IN ('pending', 'running')
 BEGIN SELECT RAISE(ABORT, 'a completed or failed domain review is immutable'); END;
 CREATE TRIGGER domain_review_approved_once BEFORE UPDATE OF approved_at, approved_by ON domain_review
@@ -268,6 +280,26 @@ CREATE TRIGGER domain_review_approval_append_u BEFORE UPDATE ON domain_review_ap
 BEGIN SELECT RAISE(ABORT, 'domain review approvals are append-only'); END;
 CREATE TRIGGER domain_review_approval_append_d BEFORE DELETE ON domain_review_approval
 BEGIN SELECT RAISE(ABORT, 'domain review approvals are append-only'); END;
+
+-- Each domain review round is one model pass: evidence gathering (witness queries executed server-side through the
+-- read-only witness runner, receipts cited by witness_log id) or a ready/blocked conclusion. Rounds are written once
+-- and immutable; the ordered passes and their receipts are the durable evidence trail of a recursive review.
+CREATE TABLE domain_review_round (
+  id               INTEGER PRIMARY KEY,
+  review_id        INTEGER NOT NULL REFERENCES domain_review(id),
+  number           INTEGER NOT NULL CHECK (number >= 1),
+  assessment       TEXT NOT NULL CHECK (length(assessment) BETWEEN 1 AND 4000),
+  outcome          TEXT NOT NULL CHECK (outcome IN ('ready', 'blocked', 'evidence')),
+  witness_ids_json TEXT NOT NULL DEFAULT '[]'
+    CHECK (json_valid(witness_ids_json) AND json_type(witness_ids_json) = 'array'),
+  completed_at     TEXT NOT NULL,
+  UNIQUE (review_id, number),
+  CHECK ((outcome = 'evidence') = (json_array_length(witness_ids_json) > 0))
+);
+CREATE TRIGGER domain_review_round_immutable BEFORE UPDATE ON domain_review_round
+BEGIN SELECT RAISE(ABORT, 'domain review rounds are immutable'); END;
+CREATE TRIGGER domain_review_round_no_delete BEFORE DELETE ON domain_review_round
+BEGIN SELECT RAISE(ABORT, 'domain review rounds are never deleted'); END;
 
 -- Exact version -> verdict bridge, written by the prune slice. A source is verified for a specific brief VERSION,
 -- never borrowed from a prior version: each newly approved version/amendment must be explicitly re-pruned. One
