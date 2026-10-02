@@ -179,6 +179,20 @@ class AutoBriefs(unittest.TestCase):
         self.assertEqual(self.tick()["brief"]["sources"], ["FIN-1"])
         self.assertEqual(self.tick()["brief"]["sources"], ["FIN-2"])
 
+    def test_todo_precedes_urgent_backlog_then_backlog_remains_eligible(self):
+        self.source(2)
+        self.source(3)
+        raw = json.loads(self.conn.execute("SELECT raw_json FROM linear_snapshot WHERE identifier='FIN-2'").fetchone()[0])
+        raw.update(identifier="FIN-1", title="Urgent backlog", priority=1, state={"name": "Backlog", "type": "backlog"})
+        self.conn.execute("INSERT INTO linear_snapshot VALUES ('fin-1','FIN-1',?,?,'backlog',0,?)",
+                          (SNAP, SNAP, json.dumps(raw)))
+        self.relationships("FIN-1")
+        self.conn.execute("INSERT INTO linear_due VALUES ('fin-1',?,'2026-08-01')", (SNAP,))
+        self.conn.execute("INSERT INTO linear_due VALUES ('fin-3',?,'2026-09-01')", (SNAP,))
+        self.assertEqual(self.tick()["brief"]["sources"], ["FIN-3"])
+        self.assertEqual(self.tick()["brief"]["sources"], ["FIN-2"])
+        self.assertEqual(self.tick()["brief"]["sources"], ["FIN-1"])
+
     def test_large_related_group_is_bounded_and_due_date_breaks_priority_ties(self):
         for number in range(1, 14):
             self.source(number)

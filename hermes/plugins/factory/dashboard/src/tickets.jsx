@@ -10,7 +10,7 @@
 // audit stays here.
 //
 // <TicketsTab data mode active view onViewChange onDone onNavigate />: data is the overview; mode tickets|verify|draft;
-//   active false = no fetch and no sheet (default true). view {q, filter, picked, open} is the parent's, one per mode,
+//   active false = no fetch and no sheet (default true). view {q, filter, onlyMine, picked, open} is the parent's, one per mode,
 //   so a workspace keeps it while unmounted. onViewChange is that mode's React-style setter; this file only passes
 //   updaters (latest view) => next view, so a call that lands after its workspace moved on or unmounted patches only
 //   picked. onNavigate({stage, run?, ticket?, sources?}): the parent owns history and the pane. A row opens with
@@ -182,6 +182,7 @@ export function TicketsTab({ data, mode, active = true, view, onViewChange, onDo
   const filters = FILTERS[mode];
   const q = view?.q || "", picked = view?.picked || [], open = view?.open || null;
   const filter = filters.some(([k]) => k === view?.filter) ? view.filter : "all";
+  const onlyMine = mode === "tickets" && !!view?.onlyMine;
   const update = (patch) => onViewChange((v) => ({ ...v, ...patch }));  // lands on the view as it is by then
   const [all, setAll] = useState(null);
   const [loadErr, setLoadErr] = useState(null);
@@ -201,6 +202,7 @@ export function TicketsTab({ data, mode, active = true, view, onViewChange, onDo
   const titles = Object.fromEntries((cands.candidates || []).map((c) => [c.identifier, c.title]));
   // The server's phase says which workspace a ticket is in; Tickets is the whole ledger.
   const rows = (all || []).filter((t) => mode === "tickets" || t.phase === mode)
+    .filter((t) => !onlyMine || (t.assignee && t.assignee === data.status?.lead))
     .map((t) => ({ t, why: whyOf(t, skipped) }))
     .sort((a, b) => (Date.parse(b.t.last_at) || 0) - (Date.parse(a.t.last_at) || 0));
   const within = (k) => (k === "all" ? rows : rows.filter(({ t }) => t.group === k));
@@ -220,6 +222,10 @@ export function TicketsTab({ data, mode, active = true, view, onViewChange, onDo
   return (
     <>
       <Input className="fx-search" type="search" placeholder="Search id or title" value={q} onChange={(e) => update({ q: e.target.value })} />
+      {mode === "tickets" ? <div className="fx-chips" role="group" aria-label="Ticket assignee filter">
+        <button className={`fx-chip${onlyMine ? " on" : ""}`} aria-pressed={onlyMine}
+                onClick={() => update({ onlyMine: !onlyMine })}>Only mine</button>
+      </div> : null}
       <div className="fx-chips" role="group" aria-label="Ticket filter">
         {filters.map(([k, label]) => (
           <button key={k} aria-pressed={!needle && filter === k} className={`fx-chip${!needle && filter === k ? " on" : ""}`}
@@ -248,7 +254,8 @@ export function TicketsTab({ data, mode, active = true, view, onViewChange, onDo
             checked: sel.includes(t.identifier), disabled: !sel.includes(t.identifier) && sel.length >= max,
             toggle: () => update({ picked: sel.includes(t.identifier) ? sel.filter((i) => i !== t.identifier) : [...sel, t.identifier] }),
           } : null} />
-        )) : <div className="fx-empty">{needle ? "No ticket here matches." : filters.find(([k]) => k === filter)[2]}</div>}
+        )) : <div className="fx-empty">{onlyMine ? "No tickets assigned to you match this filter." :
+          needle ? "No ticket here matches." : filters.find(([k]) => k === filter)[2]}</div>}
       </div>
       {mode === "draft" && sel.length ? (
         <div className="fx-draftbar">

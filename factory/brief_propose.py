@@ -47,7 +47,8 @@ def _covered(conn, sources):
 
 
 def _order(ticket):
-    return (ticket["priority"] or 5, ticket["due_date"] or "9999-12-31", ticket["identifier"])
+    return (ticket["state_type"] == "backlog", ticket["priority"] or 5,
+            ticket["due_date"] or "9999-12-31", ticket["identifier"])
 
 
 def _candidates(cfg, conn):

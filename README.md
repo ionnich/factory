@@ -240,6 +240,9 @@ One-time, by hand:
 **Assembly** owns verification, implementation planning and execution proof. Its eight lifecycle stages
 (Tickets, Verify, Draft, Plan, Review, Run, Reconcile, Archive) are unchanged. Linear snapshots are source and
 provenance plus reconciliation ids, not the runtime instruction source for a brief-backed dispatch.
+Tickets' **Only mine** toggle limits the ledger to tickets assigned to the configured `linear.lead` email;
+unassigned tickets and other assignees are excluded, regardless of Domain ownership. Search and status-chip
+counts respect this limit. The toggle starts off and survives switching stages within the dashboard.
 
 - **Grouped browsing (default):** browse collapsed parent families, dependency chains, one-hop related candidates,
   then explicitly organizational project/context buckets. Related links never form transitive mega-groups;
@@ -284,8 +287,9 @@ provenance plus reconciliation ids, not the runtime instruction source for a bri
 - **Automatic brief generation:** the existing `factory-propose` tick now selects and grooms at most **one**
   new draft after normal dispatch/notification handling, stopping at **three** pending brief reviews (manual and
   automatic combined). Drafts appear in **Needs you** and Strategy; creation announces a direct review link.
-  Selection uses current owned/routed sources, priority then due date, known relationship snapshots, and recorded
-  parent/dependency/related groups within one repo/context/route. A shared project alone produces singleton briefs,
+  Selection uses current owned/routed sources, ranking Todo and other active states above Backlog, then priority
+  and due date. Known parent/dependency/related groups stay within one repo/context/route and rank by their
+  highest-ranked member. A shared project alone produces singleton briefs,
   not a grab-bag. Backlog sources without verdicts are allowed; completed, canceled, QA, foreign-assigned,
   explicitly invalid and already-covered work is excluded. Generation does not verify or approve anything.
   Existing drafts/approved/held briefs are not rewritten. Archived or dismissed source versions, including only
