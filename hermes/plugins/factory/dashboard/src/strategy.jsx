@@ -782,6 +782,351 @@ function RelationshipReview({ picked, memberGroupId, groupById, missingIds, rela
   );
 }
 
+// ---- Domain grooming: a read-only DeepSeek domain review + explicit human-approved dispositions -----------------
+// A review analyses one owned canonical domain's open tickets against cached source snapshots and repository mirrors.
+// It proposes a minimum system, consumers, correctness notes, a few complexity cuts, and a per-ticket disposition —
+// but changes nothing. Approving here queues the EXACT reviewed ticket edits into the existing reconcile writeback
+// run; the actual Linear mutations happen later in reconcile cron, never in this UI, and only for tickets you select.
+const GROOM_STATUS = {
+  pending: ["queued", "amber"], running: ["reviewing", "blue"],
+  completed: ["completed", "green"], failed: ["failed", "red"],
+};
+const GROOM_ACTION = {
+  keep: ["Keep", "gray", false], rewrite: ["Rewrite", "blue", true], merge: ["Merge", "amber", true],
+  close: ["Cancel", "red", true], investigate: ["Investigate", "amber", false],
+};
+const groomAction = (a) => GROOM_ACTION[a] || [a || "unknown", "gray", false];
+const groomMutates = (t) => groomAction(t.action)[2];
+
+function DomainReviewRow({ r, busy, onOpen, onRetry }) {
+  const [label, tone] = GROOM_STATUS[r.status] || [r.status || "unknown", "gray"];
+  return (
+    <div className="fx-trow" role="button" tabIndex={0}
+         onClick={onOpen}
+         onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { stop(e); onOpen(); } }}>
+      <div className="fx-grow">
+        <div className="fx-row fx-row-status">
+          <Tone tone={tone}>{label}</Tone>
+          {r.approved_at ? <Tone tone="green">approved {ago(r.approved_at)}</Tone> : null}
+          {r.proposal_brief_id ? <Tone tone="blue">brief #{r.proposal_brief_id}</Tone> : null}
+        </div>
+        <div className="fx-row-title fx-ttitle clamp">{r.domain_name || r.domain_id || `Review #${r.id}`}</div>
+        <div className="fx-row-meta fx-hint">#{r.id} · requested {ago(r.requested_at)}
+          {r.completed_at ? ` · completed ${ago(r.completed_at)}` : ""}{r.run_id ? ` · run ${r.run_id}` : ""}</div>
+        {r.error ? <div className="fx-err">{clip(r.error, 160)}</div> : null}
+        {r.blocker ? <div className="fx-hint">{r.blocker}</div> : null}
+      </div>
+      <div className="fx-tc-ne">
+        {r.status === "failed"
+          ? <Button size="sm" disabled={!!busy} onClick={(e) => { stop(e); onRetry(); }}>Retry</Button>
+          : <span className="fx-hint">›</span>}
+      </div>
+    </div>
+  );
+}
+
+function DomainGroomSection({ domains, reviews, listErr, loading, busy, domainId, goal, onDomain, onGoal, onStart, onOpen, onRetry }) {
+  const sel = domainId || "";
+  const sorted = [...reviews].sort((a, b) => (ts(b.requested_at) ?? 0) - (ts(a.requested_at) ?? 0));
+  const active = reviews.some((r) => r.status === "pending" || r.status === "running");
+  return (
+    <section className="fx-sec fx-stack-v" aria-label="Groom domain">
+      <div className="fx-k">Groom domain</div>
+      <div className="fx-hint">A read-only DeepSeek review of one owned domain's open tickets against cached snapshots and
+        repository mirrors. It proposes a minimum system and per-ticket dispositions — it changes no code and no ticket.
+        Approving a change queues it into reconcile; the actual Linear edit happens later in reconcile cron.</div>
+      <div className="fx-row">
+        <select className="fx-select" value={sel} aria-label="Domain"
+                onChange={(e) => onDomain(e.target.value)}>
+          {!sel ? <option value="">Choose a domain…</option> : null}
+          {domains.map((d) => (
+            <option key={d.id} value={d.id}>{d.name} · {d.open_count ?? 0}/{d.ticket_count ?? 0} open</option>
+          ))}
+        </select>
+        <Input value={goal || ""} placeholder="Optional focus/goal" maxLength={200} aria-label="Review goal"
+               onChange={(e) => onGoal(e.target.value)} />
+      </div>
+      <div className="fx-row">
+        <Button size="sm" disabled={!!busy || !sel} onClick={() => onStart(sel, goal)}>
+          {busy === "domain-start" ? "Starting…" : "Start review"}
+        </Button>
+        {active ? <span className="fx-hint">A review is running; this list refreshes itself.</span> : null}
+      </div>
+      {listErr ? <div className="fx-err" role="alert">Domain reviews unavailable: {listErr}</div> : null}
+      {loading
+        ? <div className="fx-hint">Loading domain reviews…</div>
+        : reviews.length
+          ? <div className="fx-k">Past reviews ({reviews.length})</div>
+          : <div className="fx-empty">No domain reviews yet.</div>}
+      <div className="fx-list">
+        {sorted.map((r) => <DomainReviewRow key={r.id} r={r} busy={busy} onOpen={() => onOpen(r.id)} onRetry={() => onRetry(r)} />)}
+      </div>
+    </section>
+  );
+}
+
+function GroomTicket({ t, ctx, sel, disabled, onToggle }) {
+  const [label, tone, mutate] = groomAction(t.action);
+  const blocked = ctx?.mutable === false;
+  const target = t.target || null;
+  const after = t.action === "rewrite"
+    ? { title: t.title, description: t.description }
+    : t.action === "merge" ? { title: target ? `merged into ${target}` : "merged into its retained target", description: null }
+    : t.action === "close" ? { title: "canceled (no longer necessary)", description: null } : null;
+  const checked = mutate && sel.has(t.identifier);
+  return (
+    <div className="fx-groom-ticket">
+      <div className="fx-row fx-row-title">
+        {mutate ? (
+          <label className="fx-check-target" aria-label={`Select ${t.identifier}`}>
+            <input type="checkbox" className="fx-pick" checked={checked} disabled={disabled || blocked} onChange={onToggle} />
+          </label>
+        ) : <span className="fx-check-target fx-groom-noop" aria-hidden="true">–</span>}
+        <div className="fx-grow">
+          <div className="fx-row fx-row-status">
+            <Tone tone={tone}>{label}</Tone>
+            {t.action === "merge" && target ? <Tone tone="amber">into {target}</Tone> : null}
+            {blocked ? <Tone tone="red">not mutable</Tone> : null}
+            {ctx?.state ? <Tone tone="gray">{ctx.state}</Tone> : null}
+          </div>
+          <div className="fx-row-meta">
+            <span className="fx-id">{t.identifier}</span>
+            {ctx?.title ? <span className="fx-hint">{clip(ctx.title, 60)}</span> : null}
+            {ctx?.assignee ? <span className="fx-hint">{ctx.assignee}</span> : null}
+            {ctx?.snapshot_updated_at ? <span className="fx-hint">snapshot {localTime(ctx.snapshot_updated_at)}</span> : null}
+          </div>
+          {t.reason ? <div className="fx-hint">{t.reason}</div> : null}
+          {blocked && ctx?.blocker ? <div className="fx-err">{ctx.blocker}</div> : null}
+          {t.evidence?.length ? (
+            <details className="fx-fold"><summary>Evidence ({t.evidence.length})</summary>
+              <ul className="fx-src">{t.evidence.map((e, i) => <li key={i}>{e}</li>)}</ul>
+            </details>
+          ) : null}
+          {after ? (
+            <details className="fx-fold">
+              <summary>Before → after</summary>
+              <div className="fx-diff">
+                <div className="fx-diff-line fx-diff-old">− {ctx?.title || "(untitled)"}</div>
+                <div className="fx-diff-line fx-diff-new">+ {after.title || "(untitled)"}</div>
+                {after.description ? <div className="fx-hint">{after.description}</div> : null}
+              </div>
+            </details>
+          ) : null}
+          {t.cut_ids?.length ? <div className="fx-hint">cuts: {t.cut_ids.join(", ")}</div> : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GroomCut({ cut, tickets, ctxById, sel, setSel, disabled }) {
+  const selectable = tickets.filter((t) => groomMutates(t) && ctxById[t.identifier]?.mutable !== false);
+  const allOn = selectable.length > 0 && selectable.every((t) => sel.has(t.identifier));
+  const toggleCut = () => {
+    const next = new Set(sel);
+    selectable.forEach((t) => (allOn ? next.delete(t.identifier) : next.add(t.identifier)));
+    setSel(next);
+  };
+  const toggle = (id) => {
+    const next = new Set(sel);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    setSel(next);
+  };
+  return (
+    <section className="fx-groom-cut">
+      <div className="fx-groom-cut-head">
+        <span className="fx-groom-cut-title">{cut.title || cut.id || "Scope decision"}</span>
+        {selectable.length ? (
+          <label className="fx-check-target fx-groom-cut-check">
+            <input type="checkbox" className="fx-pick" checked={allOn} disabled={disabled} onChange={toggleCut}
+                   aria-label={`Select all changes in ${cut.title || cut.id}`} />
+            <span className="fx-hint">Select changes ({selectable.length})</span>
+          </label>
+        ) : null}
+      </div>
+      <div className="fx-groom-cut-body">
+        {cut.reason ? <div className="fx-hint">{cut.reason}</div> : null}
+        {cut.evidence?.length ? (
+          <details className="fx-fold"><summary>Evidence ({cut.evidence.length})</summary>
+            <ul className="fx-src">{cut.evidence.map((e, i) => <li key={i}>{e}</li>)}</ul>
+          </details>
+        ) : null}
+        {cut.risk ? <div className="fx-hint">Risk: {cut.risk}</div> : null}
+        {cut.migration ? <div className="fx-hint">Migration: {cut.migration}</div> : null}
+        {tickets.length ? (
+          <div className="fx-member-list">
+            {tickets.map((t) => (
+              <GroomTicket key={t.identifier} t={t} ctx={ctxById[t.identifier]} sel={sel} disabled={disabled}
+                           onToggle={() => toggle(t.identifier)} />
+            ))}
+          </div>
+        ) : <div className="fx-hint">No ticket changes for this scope decision.</div>}
+      </div>
+    </section>
+  );
+}
+
+function WritebackList({ rows }) {
+  return (
+    <section className="fx-sec fx-stack-v" aria-label="Reconcile writebacks">
+      <div className="fx-k">{plural(rows.length, "Linear write")} from this review</div>
+      <ul className="fx-writes">{rows.map((w, i) => {
+        const held = w.decision === "flag";
+        return (
+          <li key={i} className={`w-${held ? "held" : w.status}`}>
+            <span className="mark">{held ? "⏸" : w.status === "confirmed" ? "✓" : w.status === "failed" ? "✕" : "…"}</span>
+            {w.identifier || "?"} · {w.op || "change"} · {held ? "held" : w.status || "queued"}
+            {w.reason ? <span className="fx-hint"> · {w.reason}</span> : null}
+          </li>
+        );
+      })}</ul>
+    </section>
+  );
+}
+
+function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, onDisarm, onBrief, onOpenBrief }) {
+  const [label, tone] = GROOM_STATUS[r.status] || [r.status || "unknown", "gray"];
+  const active = r.status === "pending" || r.status === "running";
+  const result = r.result || null;
+  const tickets = result?.tickets || [];
+  const cuts = result?.cuts || [];
+  const ctxTickets = r.context?.tickets || [];
+  const ctxById = Object.fromEntries(ctxTickets.map((t) => [t.identifier, t]));
+  const cutById = Object.fromEntries(cuts.map((c) => [c.id, c]));
+  const writebacks = r.writebacks || [];
+  const approved = !!r.approved_at;
+  const primaryCutOf = (t) => (t.cut_ids || []).find((id) => cutById[id]) || null;
+  const groups = cuts.map((c) => ({ cut: c, tickets: tickets.filter((t) => primaryCutOf(t) === c.id) }));
+  const ungrouped = tickets.filter((t) => primaryCutOf(t) == null);
+  const mutableTickets = tickets.filter(groomMutates);
+  const selTickets = tickets.filter((t) => sel.has(t.identifier) && groomMutates(t));
+  const counts = { rewrite: 0, merge: 0, close: 0 };
+  selTickets.forEach((t) => { counts[t.action] = (counts[t.action] || 0) + 1; });
+  const countParts = [];
+  if (counts.rewrite) countParts.push(`${counts.rewrite} rewrite${counts.rewrite === 1 ? "" : "s"}`);
+  if (counts.merge) countParts.push(`${counts.merge} merge${counts.merge === 1 ? "" : "s"}`);
+  if (counts.close) countParts.push(`${counts.close} cancel${counts.close === 1 ? "" : "s"}`);
+  const toggle = (id) => {
+    const next = new Set(sel);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    setSel(next);
+  };
+  return (
+    <section className="fx-stack-v fx-groom" aria-label={`Domain review #${r.id}`}>
+      <div className="fx-row between">
+        <div className="fx-row fx-groom-head">
+          <span className="fx-id">#{r.id}</span>
+          <span className="fx-ttitle">{r.domain_name || r.domain_id || "Domain review"}</span>
+          <Tone tone={tone}>{label}</Tone>
+          {approved ? <Tone tone="green">approved {ago(r.approved_at)}</Tone> : null}
+        </div>
+        <Button size="sm" ghost onClick={onBack}>← Back to sources</Button>
+      </div>
+      <div className="fx-hint">Requested {ago(r.requested_at)}{r.completed_at ? ` · completed ${ago(r.completed_at)}` : ""}{r.run_id ? ` · run ${r.run_id}` : ""}</div>
+      {active ? (
+        <div className="fx-hint" role="status">{r.status === "pending" ? "Queued" : "Reviewing"} — a read-only analysis over cached
+          snapshots and mirrors. It changes nothing; this refreshes itself.</div>
+      ) : null}
+      {r.status === "failed" ? <div className="fx-err" role="alert">Review failed{r.error ? `: ${r.error}` : "."}</div> : null}
+      {r.blocker ? <div className="fx-hint">{r.blocker}</div> : null}
+
+      {result ? (
+        <>
+          <div className="fx-k">Minimum system</div>
+          <div className="fx-why">{result.minimum_system || "No summary recorded."}</div>
+          {result.consumers?.length ? (
+            <details className="fx-fold"><summary>Consumers ({result.consumers.length})</summary>
+              <ul className="fx-src">{result.consumers.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </details>
+          ) : null}
+          {result.correctness?.length ? (
+            <details className="fx-fold"><summary>Correctness ({result.correctness.length})</summary>
+              <ul className="fx-src">{result.correctness.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </details>
+          ) : null}
+          {cuts.length ? (
+            <>
+              <div className="fx-k">Scope decisions ({cuts.length})</div>
+              {groups.map((g) => (
+                <GroomCut key={g.cut.id} cut={g.cut} tickets={g.tickets} ctxById={ctxById} sel={sel}
+                          setSel={setSel} disabled={approved} />
+              ))}
+            </>
+          ) : null}
+          {ungrouped.length ? (
+            <div className="fx-groom-ungrouped">
+              <div className="fx-k">Dispositions without a specific cut ({ungrouped.length})</div>
+              {ungrouped.map((t) => (
+                <GroomTicket key={t.identifier} t={t} ctx={ctxById[t.identifier]} sel={sel}
+                             disabled={approved} onToggle={() => toggle(t.identifier)} />
+              ))}
+            </div>
+          ) : null}
+          {!cuts.length && !tickets.length ? <div className="fx-empty">No scope decisions or dispositions recorded.</div> : null}
+          {!mutableTickets.length && tickets.length ? (
+            <div className="fx-hint">No ticket edits proposed — keep/investigate dispositions require no Linear change.</div>
+          ) : null}
+          {result.limitations?.length ? (
+            <details className="fx-fold" open>
+              <summary>Recorded-evidence limitations ({result.limitations.length})</summary>
+              <ul className="fx-src">{result.limitations.map((l, i) => <li key={i}>{l}</li>)}</ul>
+            </details>
+          ) : null}
+        </>
+      ) : active ? null : <div className="fx-err">No result recorded.</div>}
+
+      {writebacks.length ? <WritebackList rows={writebacks} /> : null}
+
+      {result?.simplification && !approved ? (
+        <section className="fx-sec fx-stack-v">
+          <div className="fx-k">Simplification brief</div>
+          <div className="fx-hint">Draft an unapproved code-simplification brief from this review's retained sources. It is
+            never staged or executed automatically; create it, then review it in the normal brief flow.</div>
+          <div className="fx-row">
+            <Button size="sm" disabled={!!busy} onClick={onBrief}>
+              {busy === "domain-brief" ? "Creating…" : "Create simplification brief"}
+            </Button>
+          </div>
+        </section>
+      ) : null}
+      {r.proposal_brief_id ? (
+        <div className="fx-row">
+          <Button size="sm" ghost onClick={() => onOpenBrief(r.proposal_brief_id)}>
+            Open simplification brief #{r.proposal_brief_id} ›
+          </Button>
+        </div>
+      ) : null}
+
+      {!approved && result && mutableTickets.length ? (
+        <section className="fx-sec fx-stack-v">
+          <div className="fx-row">
+            <Button size="sm" disabled={!!busy || !sel.size} onClick={onApprove}>
+              {busy === "domain-approve" ? "Queuing…"
+                : armed ? `Confirm ticket changes (${sel.size})` : `Approve ticket changes${sel.size ? ` (${sel.size})` : ""}`}
+            </Button>
+            {!sel.size ? <span className="fx-hint">Select at least one change above to approve.</span> : null}
+          </div>
+          {armed ? (
+            <div className="fx-sw">
+              <div className="fx-sw-q">Queue these {sel.size} ticket change(s) for reconcile?</div>
+              <div className="fx-sw-detail">This queues the exact reviewed edits — {countParts.join(", ") || "selected changes"} —
+                into the existing reconcile writeback run. Reconcile cron then edits Linear titles/descriptions and cancels
+                tickets, subject to fresh ownership and eligibility checks. Nothing is edited here.</div>
+              <div className="fx-row">
+                <Button size="sm" disabled={!!busy || !sel.size} onClick={onApprove}>{busy === "domain-approve" ? "Queuing…" : "Confirm ticket changes"}</Button>
+                <Button size="sm" ghost disabled={!!busy} onClick={onDisarm}>Cancel</Button>
+              </div>
+            </div>
+          ) : null}
+        </section>
+      ) : approved ? (
+        <div className="fx-why">Approved {ago(r.approved_at)} — changes queued for reconcile. Watch Reconcile for the applied
+          results; held or failed writes surface there too.</div>
+      ) : null}
+    </section>
+  );
+}
+
 export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const q = view?.q || "", picked = view?.picked || [], open = view?.open || null;
   const stateFilter = view?.stateFilter || "all", ctxFilter = view?.ctxFilter || "all",
@@ -855,6 +1200,56 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   const investigation = summary?.investigation || null;
   const investigationEligible = !!summary && ["approved", "held"].includes(current?.state) &&
     !summary.dispatch && summary.readiness !== "superseded" && (summary.blockers || []).length > 0;
+
+  // ---- Domain grooming: one read-only review per owned domain, human-approved dispositions ----------------------
+  // The open review id and the start form's domain/goal live in the parent view so they survive leaving Strategy.
+  const openReview = view?.domainReview || null;
+  const groomDomain = view?.groomDomain || null;
+  const groomGoal = view?.groomGoal || "";
+  const [groomList, setGroomList] = useState(null);   // {domains, reviews} from GET /strategy/domain-reviews
+  const [groomListErr, setGroomListErr] = useState(null);
+  const [groomDetail, setGroomDetail] = useState(null);
+  const [groomDetailErr, setGroomDetailErr] = useState(null);
+  const [groomMut, setGroomMut] = useState(0);        // bump to refetch list + detail after a write
+  const [groomSel, setGroomSel] = useState(() => new Set());  // selected mutation identifiers
+  const [groomArm, setGroomArm] = useState(false);    // the two-tap approve's second tap
+  const openReviewRef = useRef(null);
+  useEffect(() => { openReviewRef.current = openReview; }, [openReview]);
+  const lastReview = useRef(null);
+
+  // The domain-review list is a pure cached read: fetched on mount and on every overview refresh, and polled only
+  // while a review is pending/running so a durable job's completion appears without a manual refresh.
+  useEffect(() => {
+    let live = true;
+    let running = false;
+    const load = () => SDK.fetchJSON(`${API}/strategy/domain-reviews`)
+      .then((x) => { if (live) { setGroomList(x); setGroomListErr(null);
+                                 running = (x?.reviews || []).some((r) => r.status === "pending" || r.status === "running"); } },
+            (e) => { if (live) setGroomListErr(errText(e)); });
+    load();
+    const timer = setInterval(() => { if (running) load(); }, 4000);
+    return () => { live = false; clearInterval(timer); };
+  }, [data, groomMut]);
+
+  // The open review's full detail (context + result + writebacks), refetched on selection/actions and polled while
+  // pending/running. Switching reviews drops the old detail and resets the selection/arm so a late reply is rejected.
+  useEffect(() => {
+    if (lastReview.current !== openReview) {
+      lastReview.current = openReview;
+      setGroomDetail(null); setGroomDetailErr(null);
+      setGroomSel(new Set()); setGroomArm(false);
+    }
+    if (openReview == null) return;
+    let live = true;
+    let running = false;
+    const load = () => SDK.fetchJSON(`${API}/strategy/domain-reviews/${openReview}`)
+      .then((x) => { if (live) { setGroomDetail(x); setGroomDetailErr(null);
+                                 running = x?.status === "pending" || x?.status === "running"; } },
+            (e) => { if (live) setGroomDetailErr(errText(e)); });
+    load();
+    const timer = setInterval(() => { if (running) load(); }, 4000);
+    return () => { live = false; clearInterval(timer); };
+  }, [openReview, groomMut]);
 
   const call = async (path, body, what) => {  // one write at a time; busy/err live in the parent view (survive leaving)
     update({ busy: what, err: null });
@@ -1000,6 +1395,56 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     const r = await call("/strategy/refresh", {}, "refresh");
     if (r) onDone(r, null, "Sources refreshed");
   };
+
+  // ---- domain grooming actions ---------------------------------------------------------------------------------
+  // A reply is applied only if the operator is still on the same review (navigation generation) and the same review
+  // id; switching reviews resets the detail + selection, so a late reply can never mutate the wrong review.
+  const groomStillHere = (atReview, atNav) => NAV_TOKEN === atNav && openReviewRef.current === atReview;
+
+  const startReview = async (domainId, goal) => {
+    const r = await call("/strategy/domain-reviews", { domain_id: domainId, goal: (goal || "").trim() }, "domain-start");
+    if (!r) return;
+    setGroomMut((m) => m + 1);
+    update({ domainReview: r.id, open: null, briefsOpen: false });
+    onDone(r, null, `Started domain review #${r.id}`);
+  };
+
+  const retryReview = async (rv) => {
+    const r = await call("/strategy/domain-reviews", { domain_id: rv.domain_id, goal: "" }, "domain-start");
+    if (!r) return;
+    setGroomMut((m) => m + 1);
+    update({ domainReview: r.id, open: null, briefsOpen: false });
+    onDone(r, null, `Restarted domain review #${r.id}`);
+  };
+
+  const approveReview = async () => {
+    if (!groomArm) { setGroomArm(true); return; }
+    setGroomArm(false);
+    const atReview = openReview, atNav = NAV_TOKEN;
+    const ids = [...groomSel];
+    const r = await call(`/strategy/domain-reviews/${openReview}/approve`, { identifiers: ids }, "domain-approve");
+    if (!r) return;
+    if (!groomStillHere(atReview, atNav)) return;
+    setGroomDetail(r);
+    setGroomSel(new Set());
+    setGroomMut((m) => m + 1);
+    onDone(r, null, `Queued ${ids.length} ticket change${ids.length === 1 ? "" : "s"} for reconcile`);
+  };
+
+  const createGroomBrief = async () => {
+    const atReview = openReview, atNav = NAV_TOKEN;
+    const r = await call(`/strategy/domain-reviews/${openReview}/brief`, {}, "domain-brief");
+    if (!r) return;
+    if (!groomStillHere(atReview, atNav)) return;
+    setGroomMut((m) => m + 1);
+    onDone(r, null, `Created simplification brief draft #${r.brief?.id ?? ""}`);
+  };
+
+  const openGroomReview = (id) => update({ domainReview: id, open: null, briefsOpen: false });
+  const backFromGroom = () => update({ domainReview: null });
+  const openGroomBrief = (id) => { update({ domainReview: null }); onNavigate({ stage: "strategy", brief: id }); };
+  const setGroomDomain = (id) => update({ groomDomain: id });
+  const setGroomGoal = (goal) => update({ groomGoal: goal });
 
   // ---- Sources: grouped-first browsing over the backend's recorded relationship groups -------------------------
   // `groups` (GET /strategy) are the backend's stable, typed link clusters — parent families, dependency chains,
@@ -1159,11 +1604,11 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
 
   const openBrief = (id) => onNavigate({ stage: "strategy", brief: id });
   const showSources = () => {
-    update({ briefsOpen: false });
+    update({ briefsOpen: false, domainReview: null });
     if (open != null) onNavigate({ stage: "strategy", brief: null });
   };
   const showBriefs = () => {
-    update({ briefsOpen: true });
+    update({ briefsOpen: true, domainReview: null });
     if (open != null) onNavigate({ stage: "strategy", brief: null });
   };
   const openDispatch = (d) => onNavigate({ stage: d.phase || DISPATCH_STAGE[d.state] || "draft", run: d.run_id });
@@ -1183,11 +1628,25 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
       {loadErr ? <div className="fx-err" role="alert">{all ? `Refreshing strategy failed: ${loadErr}. Showing the last loaded.` : `Strategy did not load: ${loadErr}`}</div> : null}
       {busy ? <div className="fx-hint" role="status">
         {busy === "groom" ? "Grooming with DeepSeek (this takes a while)…"
-          : busy === "investigate" ? "Starting blocker investigation…" : "Working…"}
+          : busy === "investigate" ? "Starting blocker investigation…"
+          : busy === "domain-start" ? "Starting domain review…"
+          : busy === "domain-approve" ? "Queueing ticket changes…"
+          : busy === "domain-brief" ? "Creating simplification brief…" : "Working…"}
       </div> : null}
       {err ? <div className="fx-err" role="alert">{err}</div> : null}
 
-      {open != null ? (
+      {openReview != null ? (
+        !groomDetail && !groomDetailErr ? <div className="fx-hint">Loading domain review #{openReview}…</div>
+        : groomDetailErr ? (
+          <div className="fx-err" role="alert">Domain review #{openReview} did not load: {groomDetailErr}
+            <div className="fx-row"><Button size="sm" ghost onClick={backFromGroom}>← Back to sources</Button></div>
+          </div>
+        ) : (
+          <DomainReviewDetail r={groomDetail} busy={busy} sel={groomSel} setSel={setGroomSel}
+                              armed={groomArm} onBack={backFromGroom} onApprove={approveReview}
+                              onDisarm={() => setGroomArm(false)} onBrief={createGroomBrief} onOpenBrief={openGroomBrief} />
+        )
+      ) : open != null ? (
         <>
           <div className="fx-row">
             <Button size="sm" ghost onClick={showSources}>← Back to sources</Button>
@@ -1363,6 +1822,11 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
         </section>
       ) : (
         <section className="fx-stack-v" aria-label="Sources">
+          <DomainGroomSection
+            domains={groomList?.domains || []} reviews={groomList?.reviews || []} listErr={groomListErr}
+            loading={groomList == null} busy={busy} domainId={groomDomain} goal={groomGoal}
+            onDomain={setGroomDomain} onGoal={setGroomGoal} onStart={startReview}
+            onOpen={openGroomReview} onRetry={retryReview} />
           <div className="fx-strategy-toolbar">
             <Input className="fx-search" type="search" placeholder="Search source id or title" value={q}
                    onChange={(e) => changeFilter({ q: e.target.value })} />

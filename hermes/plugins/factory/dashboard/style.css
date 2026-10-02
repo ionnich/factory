@@ -573,6 +573,25 @@ ul.fx-ev { margin: 0 0 0 1rem; font-size: .78rem; color: var(--fx-muted); overfl
 .fx-dag-text { fill: var(--fx-fg); font-size: 12px; font-family: var(--font-mono, ui-monospace, monospace); }
 .fx-dag-phone { display: none; font-size: .8rem; color: var(--fx-muted); }
 
+/* Domain grooming: read-only review + explicit human-approved dispositions. Cuts are scope decisions; a checkbox
+   selects the associated changes, individual dispositions refine, and before/after diffs expand on demand. */
+.fx-groom { display: grid; gap: .75rem; min-width: 0; }
+.fx-groom-head { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; min-width: 0; }
+.fx-groom-cut { border: 1px solid var(--fx-line); border-radius: var(--fx-r); background: var(--fx-panel); min-width: 0; }
+.fx-groom-cut-head { display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+                     min-height: 44px; padding: .6rem .75rem; border-bottom: 1px solid var(--fx-line); flex-wrap: wrap; }
+.fx-groom-cut-title { font-weight: 600; font-size: .95rem; overflow-wrap: anywhere; min-width: 0; }
+.fx-groom-cut-check { justify-content: flex-start; gap: .4rem; cursor: pointer; }
+.fx-groom-cut-body { padding: .2rem .75rem .8rem; display: grid; gap: .5rem; min-width: 0; }
+.fx-groom-ticket { display: grid; gap: .15rem; padding: .45rem .25rem; border-top: 1px solid var(--fx-line); min-width: 0; }
+.fx-groom-noop { color: var(--fx-dim); user-select: none; }
+.fx-groom-ungrouped { display: grid; gap: .3rem; min-width: 0; }
+.fx-groom-ungrouped .fx-groom-ticket { border: 0; border-bottom: 1px solid var(--fx-line); }
+.fx-diff { display: grid; gap: .1rem; font-family: var(--font-mono, ui-monospace, monospace); font-size: .78rem;
+           padding: .35rem .5rem; border-radius: var(--fx-r-sm); background: var(--fx-canvas); overflow-wrap: anywhere; }
+.fx-diff-line.fx-diff-old { color: var(--r); }
+.fx-diff-line.fx-diff-new { color: var(--g); }
+
 /* Pull-request review inbox: flat rows, explicit check state, external and dispatch actions kept distinct. */
 .fx-pr { display: grid; gap: .75rem; min-width: 0; }
 .fx-pr-head { display: flex; align-items: flex-end; justify-content: space-between; gap: .75rem; flex-wrap: wrap; }
