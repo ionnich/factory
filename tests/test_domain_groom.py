@@ -562,6 +562,54 @@ class RecursiveGrooming(unittest.TestCase):
         self.assertNotIn("ROOT_RESULT_MARKER", prompt)
         self.assertNotIn("child comment A", prompt)
 
+    def test_failed_parent_carries_draft_and_receipts_to_child(self):
+        self.insert("FIN-1")
+        cut = {"id": "c1", "title": "cut title", "reason": "cut reason", "evidence": ["cut evidence"],
+               "risk": "CUT_RISK_MARKER", "migration": "CUT_MIGRATION_MARKER"}
+        candidate = result([disposition("FIN-1", "keep", cut_ids=["c1"])], cuts=[cut],
+                           simplification={"identifiers": ["FIN-1"], "body": body(title="SIMPLIFICATION_MARKER")},
+                           minimum_system="DRAFT_MINIMUM_MARKER", consumers=["CONSUMER_MARKER"],
+                           correctness=["CORRECTNESS_MARKER"])
+        candidate_env = self.envelope("ready", assessment="candidate pass", review=candidate)
+        evidence = self.envelope("evidence", assessment="need live facts",
+                                 queries=[{"witness": "ch", "query": "SELECT COUNT(*) FROM filings"}])
+        parent = domain_groom.request(self.cfg, self.c, "p1", mode="agentic", spawn=lambda argv, **kw: None)["id"]
+
+        def witness_side(cfg, conn, name, query):
+            cur = conn.execute("INSERT INTO witness_log(witness,kind,query,ok,rows,result_sha256,result_excerpt,at) "
+                               "VALUES (?,?,?,1,1,'sha','WITNESS_RESULT_MARKER',?)", (name, "clickhouse", query, SNAP))
+            return {"witness_log_id": cur.lastrowid, "ok": True, "rows": 1, "result": [[1]]}
+
+        with mock.patch.object(domain_groom.witness, "run", side_effect=witness_side):
+            done = self._run(parent, [candidate_env, evidence, evidence])
+        self.assertEqual(done["outcome"], "limit_reached")  # never a false ready
+        self.assertEqual(done["status"], "failed")
+        self.assertIsNone(domain_groom.detail(self.cfg, self.c, parent)["result"])
+        with self.assertRaises(StageError):  # no automatic approval of a failed parent
+            domain_groom.approve(self.cfg, self.c, parent, ["FIN-1"], "user:dashboard")
+
+        child = domain_groom.request(self.cfg, self.c, "", mode="manual", parent_review_id=parent,
+                                     feedback="carry on from the draft", spawn=lambda argv, **kw: None)["id"]
+        feed = domain_groom._parent_feed(self.c, domain_groom._one(self.c, child))
+        self.assertTrue(feed["draft"])
+        self.assertEqual(feed["result"]["minimum_system"], "DRAFT_MINIMUM_MARKER")
+        self.assertEqual(feed["result"]["consumers"], ["CONSUMER_MARKER"])
+        self.assertEqual(feed["result"]["cuts"][0]["risk"], "CUT_RISK_MARKER")
+        self.assertEqual(feed["result"]["cuts"][0]["migration"], "CUT_MIGRATION_MARKER")
+        self.assertEqual(feed["result"]["simplification"]["body"]["title"], "SIMPLIFICATION_MARKER")
+        self.assertEqual(len(feed["passes"]), 3)
+        self.assertEqual(feed["passes"][0]["outcome"], "ready")
+
+        ctx = json.loads(domain_groom._one(self.c, child)["context_json"])
+        tmp = tempfile.mkdtemp()
+        dw = domain_groom._domain_witnesses(self.cfg, ctx["domain"]["name"])
+        prompt = domain_groom._round_prompt(ctx, tmp, parent_feed=feed, prior_rounds=[], receipts=[],
+                                            witnesses=dw, candidate=None, mode="manual", number=1,
+                                            max_rounds=domain_groom.MANUAL_MAX_ROUNDS)
+        for marker in ("CUT_RISK_MARKER", "CUT_MIGRATION_MARKER", "SIMPLIFICATION_MARKER", "DRAFT_MINIMUM_MARKER",
+                       "CONSUMER_MARKER", "SELECT COUNT(*) FROM filings", "WITNESS_RESULT_MARKER"):
+            self.assertIn(marker, prompt)
+
     def test_superseded_unapproved_parent_cannot_be_approved(self):
         self.insert("FIN-1")
         rewrite = self.envelope("ready", review=result(

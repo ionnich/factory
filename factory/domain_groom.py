@@ -228,20 +228,6 @@ def _index_lines(ctx: dict) -> list[str]:
     ]
 
 
-def _compact_receipt(r: dict) -> dict:
-    return {"id": r["id"], "name": r["name"], "ok": r["ok"], "at": r["at"],
-            "result": (r["result"] or "")[:500] or None, "error": (r["error"] or "")[:500] or None}
-
-
-def _compact_result(result: dict) -> dict:
-    """The meaningful parts of a validated review, bounded for prompt inclusion (not the full evidence arrays)."""
-    return {"minimum_system": result["minimum_system"], "limitations": result["limitations"],
-            "cuts": [{"id": c["id"], "title": c["title"]} for c in result["cuts"]],
-            "tickets": [{"identifier": t["identifier"], "action": t["action"], "reason": t["reason"],
-                         "title": t["title"], "description": t["description"], "target": t["target"]}
-                        for t in result["tickets"]]}
-
-
 def _domain_witnesses(cfg, domain_name: str) -> dict:
     """Read-only witnesses mapped to the contexts of this canonical domain. The prompt and execution are restricted
     to this set; secret/connection fields are never exposed (only name + kind)."""
@@ -250,22 +236,25 @@ def _domain_witnesses(cfg, domain_name: str) -> dict:
 
 
 def _parent_feed(conn, row) -> dict | None:
-    """The parent result + the human comment that triggered THIS child review feed its prompt (None for a root
-    review). `feedback` is the current review's own comment (row.feedback) — never the parent's."""
+    """The parent's terminal result (or, for a failed/limit_reached parent, its latest retained candidate, labeled
+    `draft`) plus the parent's ordered pass records feed this child review's prompt; None for a root review.
+    `feedback` is the current review's own comment (row.feedback) — never the parent's."""
     parent_id = row["parent_review_id"]
     if parent_id is None:
         return None
     parent = _one(conn, parent_id)
+    rounds = _rounds(conn, parent_id)
     result = json.loads(parent["result_json"]) if parent["result_json"] else None
-    return {"parent_review_id": parent_id, "feedback": row["feedback"],
-            "parent_assessment": _last_assessment(conn, parent_id),
-            "result": _compact_result(result) if result else None}
-
-
-def _last_assessment(conn, review_id: int) -> str | None:
-    row = conn.execute("SELECT assessment FROM domain_review_round WHERE review_id=? ORDER BY number DESC LIMIT 1",
-                       (review_id,)).fetchone()
-    return row["assessment"] if row else None
+    draft = False
+    if result is None:
+        for r in reversed(rounds):  # a failed/limit_reached parent keeps its latest retained candidate
+            if r["outcome"] == "ready" and r["review"] is not None:
+                result, draft = r["review"], True
+                break
+    passes = [{"number": r["number"], "outcome": r["outcome"], "assessment": r["assessment"],
+               "receipts": r["receipts"]} for r in rounds]
+    return {"parent_review_id": parent_id, "feedback": row["feedback"], "result": result,
+            "draft": draft, "passes": passes}
 
 
 def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rounds: list[dict],
@@ -308,16 +297,18 @@ def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rou
         lines += ["Your DRAFT candidate review from a prior pass. Critique it against the recorded evidence: confirm "
                   "it (ready with the same or a revised review), request more evidence, or block — never mark it "
                   "final without that critique:",
-                  json.dumps(_compact_result(candidate), indent=2)]
+                  json.dumps(candidate, indent=2)]
     if parent_feed is not None:
-        lines += ["Parent review (a person reviewed it and left feedback; address it):",
+        lines += ["Parent review (a person reviewed it and left feedback; address it). `result` is the parent's "
+                  "recorded result — `draft: true` means it is a retained candidate, not a finalized review — and "
+                  "`passes` are the parent's ordered passes with assessments and witness receipts:",
                   json.dumps(parent_feed, indent=2)]
     if prior_rounds:
         lines += ["Prior passes in this review (carry these findings forward; most recent last):",
                   json.dumps(prior_rounds, indent=2)]
     if receipts:
-        lines += ["Witness receipts so far (cite these ids/timestamps; results are excerpted):",
-                  json.dumps([_compact_receipt(r) for r in receipts], indent=2)]
+        lines += ["Witness receipts so far (cite these ids/timestamps; `result` is the bounded witness_log excerpt):",
+                  json.dumps(receipts, indent=2)]
     lines += _result_shape_lines()
     lines += ["The context file holds the FULL recorded context (descriptions, evidence, relationships, briefs, "
               f"completed sources, mirrors). Read it: {detail}. Mirrors are cached git checkouts with trunk SHAs and "
