@@ -250,13 +250,14 @@ def _domain_witnesses(cfg, domain_name: str) -> dict:
 
 
 def _parent_feed(conn, row) -> dict | None:
-    """The parent result + human feedback that feed a child review's prompt, or None for a root review."""
+    """The parent result + the human comment that triggered THIS child review feed its prompt (None for a root
+    review). `feedback` is the current review's own comment (row.feedback) — never the parent's."""
     parent_id = row["parent_review_id"]
     if parent_id is None:
         return None
     parent = _one(conn, parent_id)
     result = json.loads(parent["result_json"]) if parent["result_json"] else None
-    return {"parent_review_id": parent_id, "feedback": parent["feedback"],
+    return {"parent_review_id": parent_id, "feedback": row["feedback"],
             "parent_assessment": _last_assessment(conn, parent_id),
             "result": _compact_result(result) if result else None}
 
