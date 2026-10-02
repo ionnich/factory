@@ -74,7 +74,16 @@ query($after: String) {
 
 
 def sync_projects(cfg: Config, conn) -> int:
-    """Replace linear_project with Linear's current projects (~150 rows, 2 pages)."""
+    """Upsert Linear's current projects (~150 rows, 2 pages) without destroying referenced identities.
+
+    domain_review.domain_id references linear_project(id), so the old blanket DELETE fails with a
+    foreign-key error once any review exists. Fetched projects are upserted in place: new, renamed
+    and reassigned rows update by id. Projects absent from the fetch are handled truthfully:
+    unreferenced rows are deleted, while a removed project a review still points at keeps its row
+    (the identity stays resolvable) but loses ownership — lead_email becomes NULL, which every
+    ownership path (prune.owned, domain_groom.request/list_, strategy._ticket_list) already treats
+    as "not ours". The whole fetch happens before the single write, so a failed fetch changes nothing.
+    """
     rows, after = [], None
     while True:
         page = gql(cfg, PROJECTS_QUERY, {"after": after})["projects"]
@@ -84,9 +93,22 @@ def sync_projects(cfg: Config, conn) -> int:
         after = page["pageInfo"]["endCursor"]
     at = db.now()
     with db.tx(conn):
-        conn.execute("DELETE FROM linear_project")
-        conn.executemany("INSERT INTO linear_project VALUES (?,?,?,?,?)",
-                         [(p["id"], p["slugId"], p["name"], (p["lead"] or {}).get("email"), at) for p in rows])
+        conn.executemany(
+            "INSERT INTO linear_project(id, slug_id, name, lead_email, fetched_at) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET slug_id=excluded.slug_id, name=excluded.name, "
+            "lead_email=excluded.lead_email, fetched_at=excluded.fetched_at",
+            [(p["id"], p["slugId"], p["name"], (p["lead"] or {}).get("email"), at) for p in rows])
+        fetched = {p["id"] for p in rows}
+        referenced = {r[0] for r in conn.execute("SELECT DISTINCT domain_id FROM domain_review")}
+        for row in conn.execute("SELECT id FROM linear_project"):
+            if row["id"] in fetched:
+                continue
+            if row["id"] in referenced:
+                # A review still cites this project; keep the identity but drop the stale owner so it
+                # is no longer listed, requestable, or counted as owned.
+                conn.execute("UPDATE linear_project SET lead_email=NULL, fetched_at=? WHERE id=?", (at, row["id"]))
+            else:
+                conn.execute("DELETE FROM linear_project WHERE id=?", (row["id"],))
     return len(rows)
 
 
