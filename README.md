@@ -402,16 +402,21 @@ Safety:
 - Only a person (never a review/model actor) approves. Approval freezes the exact selected rewrite/merge/close
   dispositions into writeback rows (`run_id = domain-<id>`) for the normal reconcile cron, idempotently (a repeat
   approval never duplicates writes). Stale reviews refuse approval: a mirror trunk moved, a selected ticket or its
-  relationships changed, or it left the reviewed domain.
+  relationships changed, or it left the reviewed domain. The reviewed result/context and the approved writeback
+  payloads are SQL-frozen (triggers refuse any later edit).
 - Only `reconcile` writes Linear. It re-checks every gate against a live read immediately before each write
   (assignee, freshness, already-closed, human QA, domain membership, live dispatch, and both merge endpoints) and
-  sends only the pinned payload — the reconcile agent cannot edit or hold a domain-groom write. Multi-write tickets
-  record each write's own `updatedAt` so one write never stales its own remaining writes or absorbs an external edit.
-- `keep`/`investigate` cause no Linear mutation. `close` cancels as unnecessary (never marks done). `merge` closes the
-  duplicate into a retained target, which must itself be keep or rewrite. Immutable tickets (human QA, another
-  assignee, live dispatch, unmapped/no route) may only be kept or investigated.
-- The separate simplification brief is created only by a person, always unapproved, and refuses pending writes,
-  changed evidence, or invalid membership; it never creates a fake empty-source brief.
+  sends only the pinned payload — the reconcile agent cannot edit or hold a domain-groom write. A rewrite's
+  replacement description must keep its canonical `Domain:` line in the reviewed domain. Multi-write tickets record
+  each write's own `updatedAt`; an uncertain send (sent but never confirmed) is held for a person to inspect, never
+  automatically re-sent.
+- `keep`/`investigate` cause no Linear mutation. `close` cancels as unnecessary (never marks done). `merge` is not a
+  native Linear merge: it cancels the duplicate and comments pointing at the retained target (which must itself be
+  keep or rewrite), and the duplicate's cancellation waits for the target's rewrite to be confirmed and applied.
+  Immutable tickets (human QA, another assignee, live dispatch, unmapped/no route) may only be kept or investigated.
+- The separate simplification brief is created only by a person, always unapproved, and refuses until every selected
+  write was actually applied (`status=confirmed` and `decision=apply`), a mirror moved, a source changed, or a source
+  became ineligible; it never creates a fake empty-source brief.
 
 The Strategy workspace gains a **Groom domain** section: a domain selector (current owned canonical domains with
 counts) plus optional focus/goal; starting a review is read-only until a two-tap **Approve ticket changes /
