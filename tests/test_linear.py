@@ -104,5 +104,37 @@ class SyncProjects(unittest.TestCase):
         self.assertEqual(self.c.execute("SELECT count(*) FROM domain_review WHERE domain_id='p1'").fetchone()[0], 1)
 
 
+class QueryRetry(unittest.TestCase):
+    def test_retries_timeout_then_succeeds(self):
+        calls = {"n": 0}
+
+        def gql(cfg, q, v=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("read timed out")
+            return {"ok": True}
+
+        with mock.patch("factory.linear.gql", side_effect=gql), mock.patch("factory.linear.time.sleep") as sleep:
+            self.assertEqual(linear.query(SimpleNamespace(), "query { x }"), {"ok": True})
+        self.assertEqual(calls["n"], 2)
+        sleep.assert_called_once()
+
+    def test_does_not_retry_http_error(self):
+        import urllib.error
+        err = urllib.error.HTTPError("https://api.linear.app/graphql", 401, "no", hdrs=None, fp=None)
+        with mock.patch("factory.linear.gql", side_effect=err) as gql, mock.patch("factory.linear.time.sleep") as sleep:
+            with self.assertRaises(urllib.error.HTTPError):
+                linear.query(SimpleNamespace(), "query { x }")
+        self.assertEqual(gql.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_gql_is_one_shot_so_mutations_are_never_retried(self):
+        with mock.patch("factory.linear.secret", return_value="x"), \
+                mock.patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")) as urlopen:
+            with self.assertRaises(TimeoutError):
+                linear.gql(SimpleNamespace(), "mutation { x }")
+        self.assertEqual(urlopen.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

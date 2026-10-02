@@ -176,6 +176,9 @@ One-time, by hand:
   **Emergency** (no review window, a one-ticket dispatch): the ticket is Urgent in Linear (a person set it) and its
   verdict evidence touches at most 3 files; ★ is taken at once and you get a push. It also hands off approved
   dispatches, takes ★ where it is due, and prints the push / digest (cron stdout goes to the Bot Chat).
+  One Linear/git/relationship failure is recorded and the rest of the tick continues on the last good cache
+  (query-only Linear retries; per-repo git fetch; relationship refresh is time-boxed). stderr is a one-line
+  JSON heartbeat also written to `~/.hermes/factory/propose-last.json` — not delivered to Hermex.
   Stop it with `hermes cron pause factory-propose`.
 - Jev (`factory/jev.py`): TypeSafe judgment guidance for open decisions, persisted in the `jev_advice` table (one
   replaceable payload per decision, never inside `detail_json` — `decision_answer_once` is untouched) and served

@@ -320,7 +320,7 @@ class AutoBriefs(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             for name in ("ingest", "decide.acknowledge_notifications", "decide.sweep", "jev.refresh",
                          "costs.sync", "learn.sync"):
-                stack.enter_context(mock.patch("factory.cli." + name, return_value=[]))
+                stack.enter_context(mock.patch("factory.cli." + name, return_value=[] if name != "ingest" else {}))
             stack.enter_context(mock.patch("factory.cli.dispatch.propose", return_value={}))
             stack.enter_context(mock.patch("factory.cli.decide.notify", side_effect=lambda *a, **kw: ["Existing notice"]))
             stack.enter_context(mock.patch("factory.cli.decide.notification_execution", return_value=None))

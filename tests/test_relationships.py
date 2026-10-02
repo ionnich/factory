@@ -227,7 +227,7 @@ class Relationships(unittest.TestCase):
         fake = FakeLinear(rels=rels, issues=[issue_a], conn=self.conn)
         with mock.patch("factory.linear.gql", side_effect=fake.gql):
             res = linear.ingest(self.cfg, self.conn)
-        self.assertEqual(res["relationships"], {"sources": 1, "replaced": 1, "removed": 0})
+        self.assertEqual(res["relationships"], {"sources": 1, "replaced": 1, "removed": 0, "skipped": []})
         raw = json.dumps(issue_a, sort_keys=True)
         self.assertEqual(self.conn.execute("SELECT raw_json FROM linear_snapshot WHERE issue_id='ia'").fetchone()[0], raw)
         self.assertEqual(relationships.snapshot(self.conn, "FIN-1")["edges"],
@@ -264,7 +264,7 @@ class Relationships(unittest.TestCase):
         fake.rels["ia"] = dict(EMPTY)
         with mock.patch("factory.linear.gql", side_effect=fake.gql):
             res = linear.ingest(self.cfg, self.conn)
-        self.assertEqual(res["relationships"], {"sources": 1, "replaced": 1, "removed": 0})
+        self.assertEqual(res["relationships"], {"sources": 1, "replaced": 1, "removed": 0, "skipped": []})
         self.assertTrue(relationships.snapshot(self.conn, "FIN-1")["complete"])
 
     def test_fingerprint_stable_for_descriptive_changes(self):
@@ -457,6 +457,45 @@ class Relationships(unittest.TestCase):
             relationships.refresh(self.cfg, self.conn)
         rows = {r[0] for r in self.conn.execute("SELECT identifier FROM linear_relationship")}
         self.assertEqual(rows, {"FIN-1"})
+
+    def test_budget_zero_skips_and_keeps_prior_graph(self):
+        insert_project(self.conn)
+        insert_snapshot(self.conn, raw_snapshot("FIN-1", iid="ia"))
+        self.refresh({"ia": dict(EMPTY)})
+        fp = relationships.snapshot(self.conn, "FIN-1")["fingerprint"]
+        insert_snapshot(self.conn, raw_snapshot("FIN-2", iid="ib"))
+        fake = FakeLinear(rels={"ia": dict(EMPTY), "ib": dict(EMPTY)}, conn=self.conn)
+        with mock.patch("factory.linear.gql", side_effect=fake.gql):
+            res = relationships.refresh(self.cfg, self.conn, budget_s=0)
+        self.assertEqual(res["replaced"], 0)
+        self.assertEqual(sorted(res["skipped"]), ["FIN-1", "FIN-2"])
+        self.assertEqual(relationships.snapshot(self.conn, "FIN-1")["fingerprint"], fp)
+        self.assertFalse(relationships.snapshot(self.conn, "FIN-2")["complete"])
+
+    def test_timeout_skips_one_batch_and_refreshes_the_rest(self):
+        insert_project(self.conn)
+        insert_snapshot(self.conn, raw_snapshot("FIN-1", iid="ia"))
+        self.refresh({"ia": dict(EMPTY)})
+        insert_snapshot(self.conn, raw_snapshot("FIN-2", iid="ib"))
+        n = {"c": 0}
+        fake = FakeLinear(rels={"ia": dict(EMPTY), "ib": dict(EMPTY)}, conn=self.conn)
+
+        def gql(cfg, query, variables=None):
+            n["c"] += 1
+            if n["c"] == 1:
+                raise TimeoutError("read timed out")
+            return fake.gql(cfg, query, variables)
+
+        with mock.patch("factory.linear.gql", side_effect=gql), \
+                mock.patch("factory.relationships.BATCH", 1), \
+                mock.patch("factory.linear.QUERY_ATTEMPTS", 1), \
+                mock.patch("factory.linear.time.sleep"):
+            res = relationships.refresh(self.cfg, self.conn)
+        self.assertEqual(len(res["skipped"]), 1)
+        self.assertEqual(res["replaced"], 1)
+        done = ({"FIN-1", "FIN-2"} - set(res["skipped"])).pop()
+        self.assertTrue(relationships.snapshot(self.conn, done)["complete"])
+        self.assertTrue(relationships.snapshot(self.conn, "FIN-1")["complete"])  # prior graph survives a skip
 
     def test_no_project_cache_is_explicit_error(self):
         insert_snapshot(self.conn, raw_snapshot("FIN-1", iid="i1"))  # no linear_project rows

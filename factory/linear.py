@@ -1,5 +1,8 @@
 """Linear GraphQL: read-only ingest. Mutations live only in reconcile."""
 import json
+import random
+import time
+import urllib.error
 import urllib.request
 
 from . import db
@@ -29,6 +32,7 @@ query($filter: IssueFilter, $after: String) {
 
 
 def gql(cfg: Config, query: str, variables: dict | None = None) -> dict:
+    """One-shot GraphQL. Reconcile mutations must use this; a timed-out mutate may have landed."""
     req = urllib.request.Request(
         API,
         data=json.dumps({"query": query, "variables": variables or {}}).encode(),
@@ -39,6 +43,27 @@ def gql(cfg: Config, query: str, variables: dict | None = None) -> dict:
     if body.get("errors"):
         raise RuntimeError(f"linear: {body['errors'][0].get('message')}")
     return body["data"]
+
+
+QUERY_ATTEMPTS = 3
+
+
+def query(cfg: Config, query: str, variables: dict | None = None) -> dict:
+    """Idempotent reads only. Bounded retries on timeout/transport; never HTTPError; never used to mutate."""
+    last: BaseException | None = None
+    for i in range(QUERY_ATTEMPTS):
+        try:
+            return gql(cfg, query, variables)
+        except TimeoutError as e:
+            last = e
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError as e:
+            last = e
+        if i + 1 == QUERY_ATTEMPTS:
+            break
+        time.sleep(0.4 * (2 ** i) + random.random() * 0.2)
+    raise last
 
 
 def scope_filter(cfg: Config) -> dict:
@@ -57,7 +82,7 @@ def in_scope(cfg: Config, issue: dict) -> bool:
 def fetch(cfg: Config, flt: dict):
     after = None
     while True:
-        page = gql(cfg, ISSUES_QUERY, {"filter": flt, "after": after})["issues"]
+        page = query(cfg, ISSUES_QUERY, {"filter": flt, "after": after})["issues"]
         yield from page["nodes"]
         if not page["pageInfo"]["hasNextPage"]:
             return
@@ -86,7 +111,7 @@ def sync_projects(cfg: Config, conn) -> int:
     """
     rows, after = [], None
     while True:
-        page = gql(cfg, PROJECTS_QUERY, {"after": after})["projects"]
+        page = query(cfg, PROJECTS_QUERY, {"after": after})["projects"]
         rows += page["nodes"]
         if not page["pageInfo"]["hasNextPage"]:
             break

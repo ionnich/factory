@@ -1018,7 +1018,7 @@ def _safety_check(cfg: Config, conn, run_id: str) -> None:
     d = conn.execute("SELECT repos_json FROM dispatch WHERE run_id=?", (run_id,)).fetchone()
     repos_set = {r["repo"] for r in json.loads(d["repos_json"])}
     if repos_set:
-        repos.sync_all(cfg, conn, only=repos_set)  # refresh code/data evidence trunks
+        repos.sync_all(cfg, conn, only=repos_set)  # refresh code/data evidence trunks; a stale repo keeps last SHA
     _tickets_for_render(cfg, conn, run_id, check=True)  # raises on stale ticket/verdict/superseded association
 
 

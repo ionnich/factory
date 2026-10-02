@@ -7,12 +7,13 @@ import os
 import re
 import sqlite3
 import statistics
+import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import ask, config, costs, db, decide, dispatch, jev, learn, linear, prune, reconcile, repos, witness
-from . import brief_propose, pr_reviews, strategy
+from . import brief_propose, pr_reviews, relationships, strategy
 
 
 def out(obj) -> None:
@@ -21,12 +22,27 @@ def out(obj) -> None:
 
 def ingest(cfg, conn, full=False, only: set[str] | None = None) -> dict:
     """Linear (incremental) and the trunk mirrors. `only`: just these repos and no project refresh, the fast path
-    before drafting or approving (the cron keeps everything else fresh)."""
-    projects = linear.sync_projects(cfg, conn) if only is None else None
-    res = linear.ingest(cfg, conn, full=full)
+    before drafting or approving (the cron keeps everything else fresh). One Linear/git/relationship failure is
+    recorded and the rest of the tick continues on the last good cache."""
+    res, errors = {}, []
     if only is None:
-        res["projects"] = projects
-    res["trunks"] = {r: sha[:12] for r, sha in repos.sync_all(cfg, conn, only).items()}
+        try:
+            res["projects"] = linear.sync_projects(cfg, conn)
+        except (OSError, TimeoutError) as e:
+            errors.append(f"projects: {type(e).__name__}: {e}")
+    try:
+        res.update(linear.ingest(cfg, conn, full=full))
+    except (OSError, TimeoutError, relationships.RelationError) as e:
+        errors.append(f"linear: {type(e).__name__}: {e}")
+    try:
+        shas, stale = repos.sync_all(cfg, conn, only)
+        res["trunks"] = {r: sha[:12] for r, sha in shas.items()}
+        if stale:
+            res["stale"] = stale
+    except (OSError, subprocess.TimeoutExpired) as e:
+        errors.append(f"trunks: {type(e).__name__}: {e}")
+    if errors:
+        res["errors"] = errors
     return res
 
 
@@ -87,7 +103,11 @@ def cmd_handoff(cfg, conn, a):
 
 def cmd_propose(cfg, conn, a):
     """Cron: ingest, move dispatches along, take ★ where its time came, and say what the user needs to hear."""
-    ingest(cfg, conn)
+    try:
+        ingest_res = ingest(cfg, conn)
+    except Exception as e:  # last resort: ingest already isolates network; never skip sweep/notify
+        ingest_res = {"errors": [f"{type(e).__name__}: {e}"]}
+        print(f"factory: ingest: {type(e).__name__}: {e}", file=sys.stderr)
     acknowledged = decide.acknowledge_notifications(cfg, conn)
     res = dispatch.propose(cfg, conn)
     res["acknowledged_notices"] = acknowledged
@@ -118,8 +138,21 @@ def cmd_propose(cfg, conn, a):
         res["brief_proposal"] = {"status": "failed", "error": f"{type(e).__name__}: {e}"}
         msgs.append(f"Automatic brief grooming failed: {type(e).__name__}: {e}")
         print(f"factory: brief grooming: {type(e).__name__}: {e}", file=sys.stderr)
+    ing = ingest_res if isinstance(ingest_res, dict) else {}
+    beat = {"factory": "propose", "fetched": ing.get("fetched"), "projects": ing.get("projects"),
+            "relationships": ing.get("relationships"), "trunks": sorted(ing.get("trunks") or []),
+            "stale": ing.get("stale") or {}, "errors": ing.get("errors") or [],
+            "swept": len(res.get("swept") or []), "messages": len(msgs)}
+    line = json.dumps(beat, default=str, separators=(",", ":"))
+    print(line, file=sys.stderr)  # cron log; not delivered (Hermex gets stdout only)
+    try:
+        path = cfg.db.parent / "factory" / "propose-last.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(line + "\n")
+    except OSError as e:
+        print(f"factory: heartbeat file: {type(e).__name__}: {e}", file=sys.stderr)
     if not a.announce:
-        return out({**res, "messages": msgs})
+        return out({**res, "ingest": ing, "messages": msgs})
     if msgs:  # cron stdout -> bot-chat:factory (Hermex); nothing to say = no message
         print("\n\n".join(msgs))
 
@@ -302,7 +335,7 @@ def cmd_archive(cfg, conn, a):
 
 
 def cmd_sync(cfg, conn, a):
-    out({r: sha for r, sha in repos.sync_all(cfg, conn).items()})
+    out({r: sha for r, sha in repos.sync_all(cfg, conn)[0].items()})
 
 
 def cmd_status(cfg, conn, a):

@@ -29,21 +29,38 @@ def fetch(cfg: Config, repo: str) -> str:
     return git(path, "rev-parse", "HEAD")
 
 
-def sync_all(cfg: Config, conn, only: set[str] | None = None) -> dict[str, str]:
+def sync_all(cfg: Config, conn, only: set[str] | None = None) -> tuple[dict[str, str], dict[str, str]]:
     """Fetch every mapped repo (or `only` these) in parallel, then record their trunk SHAs (no DB lock while git
-    runs)."""
+    runs). A timed-out or failed repo keeps its last recorded SHA and is returned in the errors dict; it does
+    not fail the rest."""
     # gh's git credential helper needs the token; cron/launchd envs don't carry it.
     os.environ.setdefault("GITHUB_TOKEN", secret(cfg, "GITHUB_TOKEN"))
     want = sorted(only if only is not None else {c.repo for c in cfg.contexts})
-    with ThreadPoolExecutor(max_workers=max(1, len(want))) as pool:
-        shas = dict(zip(want, pool.map(lambda r: fetch(cfg, r), want)))
+
+    def one(repo: str) -> tuple[str, str | None, str | None]:
+        try:
+            return repo, fetch(cfg, repo), None
+        except (subprocess.TimeoutExpired, RuntimeError, OSError) as e:
+            return repo, None, f"{type(e).__name__}: {e}"
+
+    with ThreadPoolExecutor(max_workers=max(1, len(want) or 1)) as pool:
+        results = list(pool.map(one, want))
+    shas, errors = {}, {}
+    now = db.now()
     with db.tx(conn):
-        for repo, sha in shas.items():
-            conn.execute(
-                "INSERT INTO repo_trunk VALUES (?,?,?,?) ON CONFLICT(repo) DO UPDATE SET "
-                "branch=excluded.branch, sha=excluded.sha, fetched_at=excluded.fetched_at",
-                (repo, cfg.trunk(repo), sha, db.now()))
-    return shas
+        for repo, sha, err in results:
+            if sha:
+                conn.execute(
+                    "INSERT INTO repo_trunk VALUES (?,?,?,?) ON CONFLICT(repo) DO UPDATE SET "
+                    "branch=excluded.branch, sha=excluded.sha, fetched_at=excluded.fetched_at",
+                    (repo, cfg.trunk(repo), sha, now))
+                shas[repo] = sha
+                continue
+            errors[repo] = err
+            prev = conn.execute("SELECT sha FROM repo_trunk WHERE repo=?", (repo,)).fetchone()
+            if prev:
+                shas[repo] = prev["sha"]
+    return shas, errors
 
 
 @cache

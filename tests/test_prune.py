@@ -91,7 +91,7 @@ class Ingest(unittest.TestCase):
         # relationship refresh refuses to run. Mock the independent relationship boundary
         # so the tests stay network-free.
         self.refresh = mock.patch("factory.relationships.refresh",
-                                  return_value={"sources": 0, "replaced": 0, "removed": 0})
+                                  return_value={"sources": 0, "replaced": 0, "removed": 0, "skipped": []})
         self.refresh.start()
         self.addCleanup(self.refresh.stop)
 

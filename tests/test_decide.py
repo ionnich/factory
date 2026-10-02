@@ -53,6 +53,15 @@ class Decisions(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.c.execute("UPDATE decision SET chosen='a', chosen_note=NULL WHERE id=?", (did,))
 
+    def test_ok_takes_star_on_each_and_keeps_going_on_errors(self):
+        a = decide.open_(self.c, "plan", "q?", OPTS, "a", "because", "t", run_id="d1")
+        b = decide.open_(self.c, "plan", "q2?", OPTS, "a", "because", "t", run_id="d1")
+        out = decide.ok(self.cfg, self.c, [a, 999, b], "user:dashboard")
+        self.assertEqual((out[0]["chosen"], out[2]["chosen"]), ("a", "a"))
+        self.assertIn("error", out[1])
+        self.assertTrue(decide.one(self.c, a)["chosen_note"].startswith("ok to ★:"))
+        self.assertEqual(decide.one(self.c, b)["chosen_by"], "user:dashboard")
+
     def plan(self, recommend="approve"):
         return dispatch.plan(self.cfg, self.c, "d1", [
             {"id": "root", "title": "theme", "recommend": recommend, "why": "small and safe", "result": "r"},

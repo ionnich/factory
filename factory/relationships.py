@@ -9,6 +9,8 @@ rewritten; linked endpoints never become snapshot rows.
 """
 import hashlib
 import json
+import time
+import urllib.error
 
 from . import db, linear
 
@@ -144,7 +146,7 @@ def _process_nodes(conn_name: str, ident: str, nodes: list, edges: set, node_map
 def _collect(cfg, batch, graphs: dict) -> None:
     """Fetch first pages for `batch` and walk required follow-up pages, mutating `graphs`."""
     variables = {f"id{i}": s["issue_id"] for i, s in enumerate(batch)}
-    data = linear.gql(cfg, _batch_query(len(batch)), variables)
+    data = linear.query(cfg, _batch_query(len(batch)), variables)
     if not isinstance(data, dict):
         raise RelationError("relationship fetch returned no data")
     for i, s in enumerate(batch):
@@ -176,7 +178,7 @@ def _collect(cfg, batch, graphs: dict) -> None:
             cursor = after
             seen = {cursor}
             while True:
-                page = linear.gql(cfg, _page_query(conn_name), {"id": s["issue_id"], "after": cursor})
+                page = linear.query(cfg, _page_query(conn_name), {"id": s["issue_id"], "after": cursor})
                 if not isinstance(page, dict) or not isinstance(page.get("issue"), dict):
                     raise RelationError(f"missing issue {ident} on {conn_name} page")
                 info, nodes = _check_connection(conn_name, ident, page["issue"].get(conn_name))
@@ -192,14 +194,15 @@ def _collect(cfg, batch, graphs: dict) -> None:
         graphs[ident] = (edges, node_map)
 
 
-def refresh(cfg, conn) -> dict:
+def refresh(cfg, conn, budget_s: float = 45) -> dict:
     """Replace the per-source relationship cache for current owned active sources.
 
     Scope is exactly the canonical Domain-project sources prune.owned() accepts, regardless
     of state, minus archived ones. Ownership is proven from linear_project; an empty project
     cache means the project sync has not run, so refresh refuses rather than silently keeping
-    a stale graph. All network runs before the single atomic write; any failure raises and
-    leaves the previous graph intact.
+    a stale graph. Malformed graphs still raise and leave the previous cache intact. A
+    transport timeout or exhausted `budget_s` skips the unfinished sources, upserts what
+    completed, and never deletes a still-owned source that was not re-fetched this tick.
     """
     from . import prune
 
@@ -212,25 +215,37 @@ def refresh(cfg, conn) -> dict:
              if json.loads(s["raw_json"]).get("archivedAt") is None and prune.owned(cfg, conn, s)]
 
     observed_at = db.now()
-    graphs = {}
+    graphs, skipped = {}, []
+    deadline = time.monotonic() + max(0, budget_s)
     for start in range(0, len(roots), BATCH):
-        _collect(cfg, roots[start:start + BATCH], graphs)
+        batch = roots[start:start + BATCH]
+        if time.monotonic() >= deadline:
+            skipped.extend(s["identifier"] for s in roots[start:])
+            break
+        try:
+            _collect(cfg, batch, graphs)
+        except (TimeoutError, urllib.error.URLError):
+            skipped.extend(s["identifier"] for s in batch)
 
     rows = []
     for s in roots:
         ident = s["identifier"]
+        if ident not in graphs:
+            if ident not in skipped:
+                skipped.append(ident)
+            continue
         edges, node_map = graphs[ident]
         sorted_edges = sorted(({"kind": k, "source": a, "target": b} for k, a, b in edges), key=_edge_key)
         sorted_nodes = sorted(node_map.values(), key=lambda n: n["identifier"])
         rows.append((ident, observed_at, json.dumps(sorted_edges, sort_keys=True),
                      json.dumps(sorted_nodes, sort_keys=True), _fingerprint(sorted_edges)))
 
+    owned = tuple(s["identifier"] for s in roots)
     with db.tx(conn):
-        if rows:
-            qmarks = ",".join("?" * len(rows))
+        if owned:
             removed = conn.execute(
-                f"DELETE FROM linear_relationship WHERE identifier NOT IN ({qmarks})",
-                tuple(r[0] for r in rows)).rowcount
+                f"DELETE FROM linear_relationship WHERE identifier NOT IN ({','.join('?' * len(owned))})",
+                owned).rowcount
         else:
             removed = conn.execute("DELETE FROM linear_relationship").rowcount
         conn.executemany(
@@ -239,4 +254,4 @@ def refresh(cfg, conn) -> dict:
             "observed_at=excluded.observed_at, edges_json=excluded.edges_json, "
             "nodes_json=excluded.nodes_json, fingerprint=excluded.fingerprint",
             rows)
-    return {"sources": len(roots), "replaced": len(rows), "removed": removed}
+    return {"sources": len(roots), "replaced": len(rows), "removed": removed, "skipped": skipped}
