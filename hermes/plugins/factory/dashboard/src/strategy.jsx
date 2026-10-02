@@ -869,10 +869,12 @@ function GroomTicket({ t, ctx, sel, disabled, onToggle }) {
   const [label, tone, mutate] = groomAction(t.action);
   const blocked = ctx?.mutable === false;
   const target = t.target || null;
-  const after = t.action === "rewrite"
-    ? { title: t.title, description: t.description }
-    : t.action === "merge" ? { title: target ? `merged into ${target}` : "merged into its retained target", description: null }
-    : t.action === "close" ? { title: "canceled (no longer necessary)", description: null } : null;
+  const isRewrite = t.action === "rewrite";
+  const isMerge = t.action === "merge";
+  const isClose = t.action === "close";
+  const showDiff = isRewrite || isMerge || isClose;
+  const oldTitle = ctx?.title || "";
+  const oldDesc = ctx?.description || "";
   const checked = mutate && sel.has(t.identifier);
   return (
     <div className="fx-groom-ticket">
@@ -885,7 +887,7 @@ function GroomTicket({ t, ctx, sel, disabled, onToggle }) {
         <div className="fx-grow">
           <div className="fx-row fx-row-status">
             <Tone tone={tone}>{label}</Tone>
-            {t.action === "merge" && target ? <Tone tone="amber">into {target}</Tone> : null}
+            {isMerge && target ? <Tone tone="amber">into {target}</Tone> : null}
             {blocked ? <Tone tone="red">not mutable</Tone> : null}
             {ctx?.state ? <Tone tone="gray">{ctx.state}</Tone> : null}
           </div>
@@ -902,13 +904,30 @@ function GroomTicket({ t, ctx, sel, disabled, onToggle }) {
               <ul className="fx-src">{t.evidence.map((e, i) => <li key={i}>{e}</li>)}</ul>
             </details>
           ) : null}
-          {after ? (
+          {showDiff ? (
             <details className="fx-fold">
               <summary>Before → after</summary>
               <div className="fx-diff">
-                <div className="fx-diff-line fx-diff-old">− {ctx?.title || "(untitled)"}</div>
-                <div className="fx-diff-line fx-diff-new">+ {after.title || "(untitled)"}</div>
-                {after.description ? <div className="fx-hint">{after.description}</div> : null}
+                {oldTitle || oldDesc ? (
+                  <>
+                    {oldTitle ? <div className="fx-diff-line fx-diff-old">− Title: {oldTitle}</div> : null}
+                    {oldDesc ? <div className="fx-diff-line fx-diff-old">− Description: {oldDesc}</div> : null}
+                  </>
+                ) : <div className="fx-diff-line fx-diff-old">− (no recorded title or description)</div>}
+                {isRewrite ? (
+                  <>
+                    <div className="fx-diff-line fx-diff-new">+ Title: {t.title || "(none)"}</div>
+                    <div className="fx-diff-line fx-diff-new">+ Description: {t.description || "(none)"}</div>
+                  </>
+                ) : null}
+                {isMerge ? (
+                  <div className="fx-diff-line fx-diff-new">+ merged into {target || "(retained target)"} — this ticket's title and
+                    description are unchanged; Linear marks it merged</div>
+                ) : null}
+                {isClose ? (
+                  <div className="fx-diff-line fx-diff-new">+ canceled — this ticket's title and description are unchanged; Linear
+                    marks it canceled</div>
+                ) : null}
               </div>
             </details>
           ) : null}
@@ -995,6 +1014,7 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
   const cutById = Object.fromEntries(cuts.map((c) => [c.id, c]));
   const writebacks = r.writebacks || [];
   const approved = !!r.approved_at;
+  const locked = approved || !!busy;  // selection is frozen once approved, or while a mutation write is in flight
   const primaryCutOf = (t) => (t.cut_ids || []).find((id) => cutById[id]) || null;
   const groups = cuts.map((c) => ({ cut: c, tickets: tickets.filter((t) => primaryCutOf(t) === c.id) }));
   const ungrouped = tickets.filter((t) => primaryCutOf(t) == null);
@@ -1049,7 +1069,7 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
               <div className="fx-k">Scope decisions ({cuts.length})</div>
               {groups.map((g) => (
                 <GroomCut key={g.cut.id} cut={g.cut} tickets={g.tickets} ctxById={ctxById} sel={sel}
-                          setSel={setSel} disabled={approved} />
+                          setSel={setSel} disabled={locked} />
               ))}
             </>
           ) : null}
@@ -1058,7 +1078,7 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
               <div className="fx-k">Dispositions without a specific cut ({ungrouped.length})</div>
               {ungrouped.map((t) => (
                 <GroomTicket key={t.identifier} t={t} ctx={ctxById[t.identifier]} sel={sel}
-                             disabled={approved} onToggle={() => toggle(t.identifier)} />
+                             disabled={locked} onToggle={() => toggle(t.identifier)} />
               ))}
             </div>
           ) : null}
@@ -1077,11 +1097,12 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
 
       {writebacks.length ? <WritebackList rows={writebacks} /> : null}
 
-      {result?.simplification && !approved ? (
+      {result?.simplification && !r.proposal_brief_id ? (
         <section className="fx-sec fx-stack-v">
           <div className="fx-k">Simplification brief</div>
           <div className="fx-hint">Draft an unapproved code-simplification brief from this review's retained sources. It is
-            never staged or executed automatically; create it, then review it in the normal brief flow.</div>
+            never staged or executed automatically; create it, then review it in the normal brief flow. Reconcile applies
+            the approved ticket changes first; a stale review or pending writes refuse this draft.</div>
           <div className="fx-row">
             <Button size="sm" disabled={!!busy} onClick={onBrief}>
               {busy === "domain-brief" ? "Creating…" : "Create simplification brief"}
@@ -1099,25 +1120,25 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
 
       {!approved && result && mutableTickets.length ? (
         <section className="fx-sec fx-stack-v">
-          <div className="fx-row">
-            <Button size="sm" disabled={!!busy || !sel.size} onClick={onApprove}>
-              {busy === "domain-approve" ? "Queuing…"
-                : armed ? `Confirm ticket changes (${sel.size})` : `Approve ticket changes${sel.size ? ` (${sel.size})` : ""}`}
-            </Button>
-            {!sel.size ? <span className="fx-hint">Select at least one change above to approve.</span> : null}
-          </div>
-          {armed ? (
+          {!armed ? (
+            <div className="fx-row">
+              <Button size="sm" disabled={!!busy || !sel.size} onClick={onApprove}>
+                {busy === "domain-approve" ? "Queuing…" : `Approve ticket changes${sel.size ? ` (${sel.size})` : ""}`}
+              </Button>
+              {!sel.size ? <span className="fx-hint">Select at least one change above to approve.</span> : null}
+            </div>
+          ) : (
             <div className="fx-sw">
               <div className="fx-sw-q">Queue these {sel.size} ticket change(s) for reconcile?</div>
               <div className="fx-sw-detail">This queues the exact reviewed edits — {countParts.join(", ") || "selected changes"} —
                 into the existing reconcile writeback run. Reconcile cron then edits Linear titles/descriptions and cancels
                 tickets, subject to fresh ownership and eligibility checks. Nothing is edited here.</div>
               <div className="fx-row">
-                <Button size="sm" disabled={!!busy || !sel.size} onClick={onApprove}>{busy === "domain-approve" ? "Queuing…" : "Confirm ticket changes"}</Button>
+                <Button size="sm" disabled={!!busy} onClick={onApprove}>{busy === "domain-approve" ? "Queuing…" : `Confirm ticket changes (${sel.size})`}</Button>
                 <Button size="sm" ghost disabled={!!busy} onClick={onDisarm}>Cancel</Button>
               </div>
             </div>
-          ) : null}
+          )}
         </section>
       ) : approved ? (
         <div className="fx-why">Approved {ago(r.approved_at)} — changes queued for reconcile. Watch Reconcile for the applied
@@ -1217,22 +1238,20 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   useEffect(() => { openReviewRef.current = openReview; }, [openReview]);
   const lastReview = useRef(null);
 
-  // The domain-review list is a pure cached read: fetched on mount and on every overview refresh, and polled only
-  // while a review is pending/running so a durable job's completion appears without a manual refresh.
+  // The domain-review list is a pure cached read, refetched on mount and on every overview refresh — the parent's
+  // /stream refresh changes `data`, so a durable job's completion and later reconcile writebacks appear without any
+  // polling loop here.
   useEffect(() => {
     let live = true;
-    let running = false;
-    const load = () => SDK.fetchJSON(`${API}/strategy/domain-reviews`)
-      .then((x) => { if (live) { setGroomList(x); setGroomListErr(null);
-                                 running = (x?.reviews || []).some((r) => r.status === "pending" || r.status === "running"); } },
+    SDK.fetchJSON(`${API}/strategy/domain-reviews`)
+      .then((x) => { if (live) { setGroomList(x); setGroomListErr(null); } },
             (e) => { if (live) setGroomListErr(errText(e)); });
-    load();
-    const timer = setInterval(() => { if (running) load(); }, 4000);
-    return () => { live = false; clearInterval(timer); };
+    return () => { live = false; };
   }, [data, groomMut]);
 
-  // The open review's full detail (context + result + writebacks), refetched on selection/actions and polled while
-  // pending/running. Switching reviews drops the old detail and resets the selection/arm so a late reply is rejected.
+  // The open review's full detail (context + result + writebacks), refetched on selection/actions and on every
+  // overview refresh (`data`) so approved writebacks refresh after reconcile too. Switching reviews drops the old
+  // detail and resets the selection/arm so a late reply is rejected.
   useEffect(() => {
     if (lastReview.current !== openReview) {
       lastReview.current = openReview;
@@ -1241,15 +1260,11 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
     }
     if (openReview == null) return;
     let live = true;
-    let running = false;
-    const load = () => SDK.fetchJSON(`${API}/strategy/domain-reviews/${openReview}`)
-      .then((x) => { if (live) { setGroomDetail(x); setGroomDetailErr(null);
-                                 running = x?.status === "pending" || x?.status === "running"; } },
+    SDK.fetchJSON(`${API}/strategy/domain-reviews/${openReview}`)
+      .then((x) => { if (live) { setGroomDetail(x); setGroomDetailErr(null); } },
             (e) => { if (live) setGroomDetailErr(errText(e)); });
-    load();
-    const timer = setInterval(() => { if (running) load(); }, 4000);
-    return () => { live = false; clearInterval(timer); };
-  }, [openReview, groomMut]);
+    return () => { live = false; };
+  }, [openReview, data, groomMut]);
 
   const call = async (path, body, what) => {  // one write at a time; busy/err live in the parent view (survive leaving)
     update({ busy: what, err: null });
@@ -1401,19 +1416,30 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
   // id; switching reviews resets the detail + selection, so a late reply can never mutate the wrong review.
   const groomStillHere = (atReview, atNav) => NAV_TOKEN === atNav && openReviewRef.current === atReview;
 
+  // Any selection change re-arms the confirmation, so a confirm never applies values the operator didn't just see.
+  const changeGroomSel = (next) => { setGroomSel(next); setGroomArm(false); };
+
   const startReview = async (domainId, goal) => {
+    const atNav = NAV_TOKEN, atReview = openReview;
     const r = await call("/strategy/domain-reviews", { domain_id: domainId, goal: (goal || "").trim() }, "domain-start");
     if (!r) return;
-    setGroomMut((m) => m + 1);
-    update({ domainReview: r.id, open: null, briefsOpen: false });
+    setGroomMut((m) => m + 1);  // refresh the list in the background regardless of where the operator is now
+    // Move into the new review only if the operator is still where they started it (mounted + same navigation + same
+    // review context); a background result must never hijack a newly selected view.
+    if (alive.current && NAV_TOKEN === atNav && openReviewRef.current === atReview) {
+      update({ domainReview: r.id, open: null, briefsOpen: false });
+    }
     onDone(r, null, `Started domain review #${r.id}`);
   };
 
   const retryReview = async (rv) => {
+    const atNav = NAV_TOKEN, atReview = openReview;
     const r = await call("/strategy/domain-reviews", { domain_id: rv.domain_id, goal: "" }, "domain-start");
     if (!r) return;
     setGroomMut((m) => m + 1);
-    update({ domainReview: r.id, open: null, briefsOpen: false });
+    if (alive.current && NAV_TOKEN === atNav && openReviewRef.current === atReview) {
+      update({ domainReview: r.id, open: null, briefsOpen: false });
+    }
     onDone(r, null, `Restarted domain review #${r.id}`);
   };
 
@@ -1642,7 +1668,7 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
             <div className="fx-row"><Button size="sm" ghost onClick={backFromGroom}>← Back to sources</Button></div>
           </div>
         ) : (
-          <DomainReviewDetail r={groomDetail} busy={busy} sel={groomSel} setSel={setGroomSel}
+          <DomainReviewDetail r={groomDetail} busy={busy} sel={groomSel} setSel={changeGroomSel}
                               armed={groomArm} onBack={backFromGroom} onApprove={approveReview}
                               onDisarm={() => setGroomArm(false)} onBrief={createGroomBrief} onOpenBrief={openGroomBrief} />
         )

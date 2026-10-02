@@ -588,7 +588,8 @@ ul.fx-ev { margin: 0 0 0 1rem; font-size: .78rem; color: var(--fx-muted); overfl
 .fx-groom-ungrouped { display: grid; gap: .3rem; min-width: 0; }
 .fx-groom-ungrouped .fx-groom-ticket { border: 0; border-bottom: 1px solid var(--fx-line); }
 .fx-diff { display: grid; gap: .1rem; font-family: var(--font-mono, ui-monospace, monospace); font-size: .78rem;
-           padding: .35rem .5rem; border-radius: var(--fx-r-sm); background: var(--fx-canvas); overflow-wrap: anywhere; }
+           padding: .35rem .5rem; border-radius: var(--fx-r-sm); background: var(--fx-canvas); overflow-wrap: anywhere;
+           white-space: pre-wrap; }
 .fx-diff-line.fx-diff-old { color: var(--r); }
 .fx-diff-line.fx-diff-new { color: var(--g); }
 
