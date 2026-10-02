@@ -368,6 +368,97 @@ source; hold/unhold as explicit readiness changes; the chat `list` folding a ful
 source list) into a compact, valid briefs+scheduler summary; and a refused `hold` paste command carrying its
 shell-quoted reason.
 
+## Domain grooming
+
+SEC Filings is the first groomed domain. Domain grooming is a durable, read-only DeepSeek review of one canonical
+Domain project's open tickets — identity is the `linear_project` row (`prune.domain_project`), never a freeform model
+invention. It proposes the minimum useful system, the current consumers, correctness invariants, a small set of scope
+**cuts**, and a keep/rewrite/merge/close/investigate disposition for every open ticket, with exact before/after
+title/description for a rewrite and a retained `target` for a merge. Completed sources and existing briefs are
+context only, never candidates to reopen/close. The review is a worker job (`pending/running/completed/failed`)
+reusing the `brief_investigate` durable pattern: a detached read-only agent (DeepSeek, `read,grep,glob` tools) reads
+the configured trunk mirrors and a written context file, and only the server validates and appends the result.
+Vanished/timed-out workers are visible and retryable; concurrent starts do not spawn duplicates. Recorded facts are
+distinguished from fresh production checks — the context carries snapshot/relationship timestamps and mirror trunk
+SHA + `fetched_at`, and limitations name what the recorded evidence cannot prove.
+
+API (all under `/api/plugins/factory`; the actor is always `user:dashboard` from the server, never the body):
+
+- `GET /strategy/domain-reviews` → `{domains:[{id,name,ticket_count,open_count}], reviews:[summary…]}`
+- `POST /strategy/domain-reviews` `{domain_id, goal?}` → pending/existing summary (goal bounded to 2000 chars)
+- `GET /strategy/domain-reviews/{id}` → summary plus `{context, result, writebacks}`; `result` is null until completed
+- `POST /strategy/domain-reviews/{id}/approve` `{identifiers:[…]}` → detail; nonempty mutation actions only
+- `POST /strategy/domain-reviews/{id}/brief` `{}` → `{brief: existing strategy brief}` (idempotent unapproved draft)
+
+CLI equivalent: `factory strategy domain-list|domain-show|domain-groom|domain-run|domain-approve|domain-brief`.
+The result object: `minimum_system` (string), `consumers`/`correctness`/`limitations` (string arrays), `cuts`
+(`{id,title,reason,evidence,risk,migration}`, unique slug ids), `tickets`
+(`{identifier,action,reason,evidence,cut_ids,title,description,target}`), and `simplification`
+(`{identifiers,body}` or null). The server enforces strict field types, bounded lengths, unique cut ids, exact
+per-open-ticket coverage, identifier provenance, and cut/target references — no client-supplied arbitrary bodies.
+
+Safety:
+
+- Only a person (never a review/model actor) approves. Approval freezes the exact selected rewrite/merge/close
+  dispositions into writeback rows (`run_id = domain-<id>`) for the normal reconcile cron, idempotently (a repeat
+  approval never duplicates writes). Stale reviews refuse approval: a mirror trunk moved, a selected ticket or its
+  relationships changed, or it left the reviewed domain.
+- Only `reconcile` writes Linear. It re-checks every gate against a live read immediately before each write
+  (assignee, freshness, already-closed, human QA, domain membership, live dispatch, and both merge endpoints) and
+  sends only the pinned payload — the reconcile agent cannot edit or hold a domain-groom write. Multi-write tickets
+  record each write's own `updatedAt` so one write never stales its own remaining writes or absorbs an external edit.
+- `keep`/`investigate` cause no Linear mutation. `close` cancels as unnecessary (never marks done). `merge` closes the
+  duplicate into a retained target, which must itself be keep or rewrite. Immutable tickets (human QA, another
+  assignee, live dispatch, unmapped/no route) may only be kept or investigated.
+- The separate simplification brief is created only by a person, always unapproved, and refuses pending writes,
+  changed evidence, or invalid membership; it never creates a fake empty-source brief.
+
+The Strategy workspace gains a **Groom domain** section: a domain selector (current owned canonical domains with
+counts) plus optional focus/goal; starting a review is read-only until a two-tap **Approve ticket changes /
+Confirm ticket changes** (with the exact previewed diffs and a warning about real Linear edits) freezes the selected
+actions for reconcile. **Create simplification brief** stays a separate unapproved action with its own Open brief
+link; existing approval/execution gates are unchanged.
+
+### Verification helpers (run by the parent, never a worker)
+
+Throwaway helpers in `/tmp` (not committed). All live verification after install is read-only; approved writes are
+exercised only against a fake Linear endpoint, never the real one.
+
+- `/tmp/domain-groom-api.py` — ASGI bridge: imports the backend worktree's real `plugin_api.py`, mounts its router at
+  `/api/plugins/factory`, and drives it with in-process ASGI messages (no listening server, no second backend, no
+  httpx). Hard-refuses the live DB: `FACTORY_DB` must be set and must not resolve to `~/.hermes/factory.db`.
+  Re-execs into Hermes's Python (which bundles FastAPI) when needed.
+- `/tmp/domain-groom-smoke.py` — snapshots the live DB read-only (SQLite backup API from `file:…?mode=ro`) and the
+  domain's mirrors (`git clone --local`, pinned to the recorded `repo_trunk` SHA), builds the isolated env, and runs
+  a real DeepSeek SEC Filings review to a terminal outcome through the bridge. Waits event-driven on kqueue
+  `NOTE_WRITE` events of the copied DB (no polling loop), re-reading status over the API. Fingerprints the live DB
+  before/after and fails if any operator row changed. Validates the real result and writes
+  `/tmp/domain-groom-smoke-result.json`.
+- `/tmp/domain-groom-reconcile-smoke.py` — opt-in, deterministic approval/reconcile smoke: a threaded fake Linear
+  GraphQL server (records every mutation, synthesizes issue/team reads from the copied DB) and a subprocess
+  `reconcile.apply` with `factory.linear.API` patched to the fake URL and a throwaway `LINEAR_API_KEY`. No real
+  Linear mutation can occur.
+- `/tmp/domain-groom-cutover.py` — live cutover: records the four writer jobs' enabled states (`factory-prune`,
+  `factory-reconcile`, `factory-propose`, `[bot:planner] Plan drafts`), pauses active ones, waits for in-flight runs
+  via `hermes cron runs`, briefly SIGSTOPs the dashboard, checks live checkout ownership, fast-forwards
+  `feat/domain-groom-integration`, runs `install.sh`, triggers the schema migration (which writes an
+  integrity-checked pre-version backup), verifies operator rows and dashboard theme/font preferences survived, then
+  restarts the dashboard and restores the jobs in `finally`.
+
+Commands (after the backend and UI land and are merged into `feat/domain-groom-integration`):
+
+```sh
+# 1. review smoke (real DeepSeek, read-only copy of the live DB; --keep retains the dir for step 2)
+python3 /tmp/domain-groom-smoke.py --backend ~/factory-wt/domain-groom-backend \
+    --domain "SEC Filings" --keep --timeout 1800
+
+# 2. opt-in reconcile smoke (reuses the kept dir; fake Linear only)
+python3 /tmp/domain-groom-reconcile-smoke.py --backend ~/factory-wt/domain-groom-backend --dir <kept-temp-dir>
+
+# 3. live cutover (only with installation permission; restores jobs/dashboard in finally)
+python3 /tmp/domain-groom-cutover.py
+```
+
 ## Runtime coder model selector
 
 - The supported selector is the `omp` harness flag `--model <provider>/<model>` (fuzzy match; `--provider` is
