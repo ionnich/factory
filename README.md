@@ -416,13 +416,17 @@ pass), `blocked` (required recorded evidence is unavailable), or `ready` (a vali
 on its first `ready`. **Agentic** never finalizes on its first `ready`: that pass is retained as a DRAFT candidate,
 and a later **critique** pass must re-examine it against the evidence; only a later `ready` after that critique
 finalizes the review. If the budget is consumed before a critique-finalized `ready`, the review records
-`outcome=limit_reached` — never a falsely-final result. Every round keeps its own assessment and the witness receipts
-it cites; earlier reviews and comments are retained in `history`. The model runs only through the configured
-read-only domain witnesses (`witness.py` runners plus the append-only `witness_log`) — it may ask for schema queries
-before business queries, and query bounds are explicit — never unrestricted shell or Linear. An unavailable
-witness/data result is shown as such, never substituted with a cached fact. Reruns are explicit user actions, never a
-periodic cron; a superseded unapproved review is never newly approved, already-approved writebacks stay pinned, and a
-healthy worker is never expired by the bounded multi-pass lifecycle.
+`outcome=limit_reached` — never a falsely-final result. Each pass carries its assessment, its witness queries and
+receipts, and (for `ready`) its validated review forward to the next pass; a child review's prompt receives the
+parent's exact committed result (or its latest retained draft candidate if the parent never finalized) plus the
+parent's passes and receipts, so nothing is re-asked from scratch. Earlier reviews and comments are retained in
+`history`. The model runs only through the configured read-only domain witnesses (`witness.py` runners plus the
+append-only `witness_log`) — it may ask for schema queries before business queries, and query bounds are explicit —
+never unrestricted shell or Linear. An unavailable witness/data result is shown as such, never substituted with a
+cached fact. A stopped review (`blocked` or `limit_reached`) is a terminal `failed` review with no result, but its
+page still offers **Request another round** (comment + mode), continuing from exactly where it stopped. Reruns are
+explicit user actions, never a periodic cron; a superseded unapproved review is never newly approved,
+already-approved writebacks stay pinned, and a healthy worker is never expired by the bounded multi-pass lifecycle.
 
 Safety:
 
@@ -431,6 +435,10 @@ Safety:
   approval never duplicates writes). Stale reviews refuse approval: a mirror trunk moved, a selected ticket or its
   relationships changed, or it left the reviewed domain. The reviewed result/context and the approved writeback
   payloads are SQL-frozen (triggers refuse any later edit).
+- A superseded review is frozen against new approvals and simplification briefs: even a partially-approved review
+  (its `approved_at` already set) cannot gain additional identifiers once a child review exists — `approve` re-checks
+  `superseded_by` under the lock and refuses, so a partial approval can only ever be a subset of the identifiers it
+  already froze. Its already-queued writebacks stay visible and pinned.
 - Only `reconcile` writes Linear. It re-checks every gate against a live read immediately before each write
   (assignee, freshness, already-closed, human QA, domain membership, live dispatch, and both merge endpoints) and
   sends only the pinned payload — the reconcile agent cannot edit or hold a domain-groom write. A rewrite's
@@ -451,11 +459,12 @@ Confirm ticket changes** (with the exact previewed diffs and a warning about rea
 actions for reconcile. **Create simplification brief** stays a separate unapproved action with its own Open brief
 link; existing approval/execution gates are unchanged.
 
-The top **Proposals failed** health indicator is a clickable, read-only button that opens a job-health dialog: each
-job's exact recorded failure (untruncated `last_error`) and its execution timestamp, plus a recent-runs history whose
-rows open a run detail showing the recorded error/status untruncated and an output preview honestly labeled
-"up to 180 characters" (the cron runs endpoint truncates it). There are no retry/run controls, no secret exposure,
-and it stays behind the dashboard auth and scoped job ids.
+The top **Proposals failed** health indicator is a clickable, read-only button that opens a single job-health dialog:
+each job's exact recorded failure (untruncated `last_error`) and its execution timestamp, plus a recent-runs history
+whose rows switch the same dialog to a run detail (a Back control returns to the job list, and Escape on a run detail
+steps back while Escape on the list closes) — never nested dialogs. The run detail shows the recorded error/status
+untruncated and an output preview honestly labeled "up to 180 characters" (the cron runs endpoint truncates it).
+There are no retry/run controls, no secret exposure, and it stays behind the dashboard auth and scoped job ids.
 
 ## Runtime coder model selector
 
