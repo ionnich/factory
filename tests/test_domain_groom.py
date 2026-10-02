@@ -529,6 +529,35 @@ class RecursiveGrooming(unittest.TestCase):
         expected = {"number": 1, "assessment": "FIRST_PASS_ASSESSMENT_MARKER", "outcome": "ready"}
         self.assertTrue(any(isinstance(v, list) and expected in v for v in decoded))
 
+    def test_agentic_confirmed_finalizes_with_exact_retained_candidate(self):
+        self.insert("FIN-1")
+        rid = domain_groom.request(self.cfg, self.c, "p1", mode="agentic", spawn=lambda argv, **kw: None)["id"]
+        candidate = result([disposition("FIN-1", "keep")], minimum_system="EXACT_CANDIDATE_MARKER")
+        first = self.envelope("ready", assessment="candidate pass", review=candidate)
+        confirm = self.envelope("confirmed", assessment="verified unchanged")
+        done = self._run(rid, [first, confirm])
+        self.assertEqual(done["outcome"], "ready")
+        self.assertEqual(done["round_count"], 2)
+        detail = domain_groom.detail(self.cfg, self.c, rid)
+        rounds = detail["rounds"]
+        self.assertEqual([(r["number"], r["outcome"]) for r in rounds], [(1, "ready"), (2, "ready")])
+        # the critique round records the EXACT retained candidate, never a regenerated/transcribed copy
+        self.assertEqual(rounds[1]["review"], rounds[0]["review"])
+        self.assertEqual(detail["result"], rounds[0]["review"])
+        self.assertEqual(detail["result"]["minimum_system"], "EXACT_CANDIDATE_MARKER")
+
+    def test_confirmed_rejected_without_retained_candidate(self):
+        self.insert("FIN-1")
+        # manual mode never retains a candidate, so confirmed cannot finalize
+        manual = domain_groom.request(self.cfg, self.c, "p1", spawn=lambda argv, **kw: None)["id"]
+        done = self._run(manual, [self.envelope("confirmed", assessment="unchanged")])
+        self.assertEqual(done["status"], "failed")
+        self.assertIsNone(domain_groom.detail(self.cfg, self.c, manual)["result"])
+        # agentic first pass has no candidate yet either
+        agentic = domain_groom.request(self.cfg, self.c, "p1", mode="agentic", spawn=lambda argv, **kw: None)["id"]
+        done = self._run(agentic, [self.envelope("confirmed", assessment="unchanged")])
+        self.assertEqual(done["status"], "failed")
+
     def test_agentic_candidate_without_critique_budget_is_limit_reached(self):
         self.insert("FIN-1")
         rid = domain_groom.request(self.cfg, self.c, "p1", mode="agentic", spawn=lambda argv, **kw: None)["id"]
@@ -739,6 +768,19 @@ class RecursiveGrooming(unittest.TestCase):
         # a bare review object (the legacy single-pass shape) is refused for NEW replies
         with self.assertRaises(StageError):
             domain_groom._parse_round_output(json.dumps(result([disposition("FIN-1", "keep")])))
+
+    def test_parse_round_output_confirmed_requires_null_review_and_no_queries(self):
+        with self.assertRaises(StageError):  # confirmed with a review is refused
+            domain_groom._parse_round_output(json.dumps(
+                {"outcome": "confirmed", "assessment": "x", "witness_queries": [],
+                 "review": result([disposition("FIN-1", "keep")])}))
+        with self.assertRaises(StageError):  # confirmed with witness queries is refused
+            domain_groom._parse_round_output('{"outcome": "confirmed", "assessment": "x", '
+                                             '"witness_queries": [{"witness": "ch", "query": "SELECT 1"}], '
+                                             '"review": null}')
+        parsed = domain_groom._parse_round_output('{"outcome": "confirmed", "assessment": "x", '
+                                                  '"witness_queries": [], "review": null}')
+        self.assertEqual(parsed, {"outcome": "confirmed", "assessment": "x", "witness_queries": [], "review": None})
 
     def test_witness_receipt_maps_truthfully_on_failure(self):
         def fail(cfg, conn, name, query):

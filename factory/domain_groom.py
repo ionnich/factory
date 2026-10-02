@@ -28,16 +28,7 @@ MODEL = "deepseek/deepseek-v4-pro"
 MAX_AGENTIC_ROUNDS = 3
 MANUAL_MAX_ROUNDS = 3
 MAX_WITNESS_QUERIES = 4
-_REVIEWER_SYSTEM_PROMPT = (
-    "You are a read-only Factory domain-grooming reviewer. Each run is exactly ONE pass: read the prompt, do only "
-    "targeted evidence checks with read/grep/glob, then return the required JSON envelope and stop — never edit, "
-    "write, execute, or run anything, and never continue into later passes.\n"
-    "Recorded inputs are authoritative facts to cite, not facts to re-verify: ticket identifiers, eligibility "
-    "(mutable/blocker), snapshot timestamps, witness receipts, and relationship edges are server-recorded. "
-    "Re-read the context file only where a specific claim needs it; do not re-inventory the domain or repeatedly "
-    "re-confirm already-established facts. Judge the recorded evidence, then finish promptly."
-)
-_ROUND_OUTCOMES = ("ready", "blocked", "evidence")
+_ROUND_OUTCOMES = ("ready", "blocked", "evidence", "confirmed")
 _ENVELOPE_KEYS = {"outcome", "assessment", "witness_queries", "review"}
 _WITNESS_QUERY_KEYS = {"witness", "query"}
 _ACTIONS = ("keep", "rewrite", "merge", "close", "investigate")
@@ -274,8 +265,8 @@ def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rou
     if mode == "agentic":
         intro = (f"You are grooming one canonical Factory Domain project (agentic mode, pass {number} of at most "
                  f"{max_rounds}). Inspect the open tickets and the code consumers they name. Your first `ready` is a "
-                 "DRAFT candidate the server retains; a later critique pass re-examines it, and only a later `ready` "
-                 "after that critique finalizes the review.")
+                 "DRAFT candidate the server retains; a later critique pass re-examines it, and a later `ready` (or "
+                 "`confirmed` when the candidate is unchanged) finalizes the review.")
     else:
         intro = (f"You are grooming one canonical Factory Domain project (manual mode, pass {number} of at most "
                  f"{max_rounds}). Inspect the open tickets and the code consumers they name.")
@@ -286,14 +277,17 @@ def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rou
         "them and starts a later pass. Never run, wait for, or simulate later passes yourself.",
         "Output ONLY one JSON object — no prose, no markdown fences, no commentary. The object must have exactly "
         "these keys and no others:",
-        "  outcome: one of ready|blocked|evidence",
+        "  outcome: one of ready|blocked|evidence|confirmed",
         "  assessment: string (1-4000 chars) — what this pass concludes, citing recorded provenance (witness ids, "
         "snapshot timestamps, repo file:line) or an explicit 'unknown'",
         "  witness_queries: array of {witness, query} — non-empty (max 4) ONLY when outcome is evidence, else []",
         "  review: the domain review object (shape below) ONLY when outcome is ready, else null",
         "Outcome rules:",
         "  evidence — request read-only witness queries; the server runs them and returns the results next pass.",
-        "  ready — the review is substantiated; provide review.",
+        "  ready — the review is substantiated; provide the full review.",
+        "  confirmed — ONLY in a critique pass (a DRAFT candidate already exists): its claims all hold and it needs "
+        "no revision; return review null with a substantive assessment naming what you verified. The server keeps "
+        "the exact retained candidate.",
         "  blocked — you cannot substantiate because required recorded evidence is unavailable; never guess or "
         "substitute cached facts; explain exactly what is missing in assessment.",
         "A witness query is {\"witness\": <name>, \"query\": <read-only SQL or GraphQL>}. You may ask a schema/"
@@ -308,9 +302,11 @@ def _round_prompt(ctx: dict, tmpdir: str, *, parent_feed: dict | None, prior_rou
                   "evidence and the person's feedback: confirm only what the cited evidence genuinely supports, "
                   "flag contradictions and missing evidence, and re-read only the files a specific claim actually "
                   "needs (the full context file remains available). Server-recorded identifiers, eligibility, and "
-                  "snapshot timestamps are input facts to cite, not facts to re-verify. Then confirm (ready with "
-                  "the same or a revised review), request more evidence, or block — never finalize without "
-                  "genuinely testing the candidate's evidence:",
+                  "snapshot timestamps are input facts to cite, not facts to re-verify.",
+                  "If every claim holds and the candidate needs NO revision, return outcome `confirmed` with "
+                  "`review: null` and a substantive assessment — do NOT reprint the candidate. Only if it needs "
+                  "changes return `ready` with the FULL revised review; otherwise request more evidence or block. "
+                  "Never finalize without genuinely testing the candidate's evidence. The DRAFT candidate:",
                   json.dumps(candidate, indent=2)]
     if parent_feed is not None:
         lines += ["Parent review (a person reviewed it and left feedback; address it). `result` is the parent's "
@@ -500,6 +496,10 @@ def _parse_round_output(raw: str) -> dict:
         if not isinstance(review, dict):
             raise StageError("ready outcome needs a review object")
         return {"outcome": "ready", "assessment": assessment, "witness_queries": [], "review": review}
+    if outcome == "confirmed":
+        if review is not None:
+            raise StageError("confirmed outcome cannot include a review")
+        return {"outcome": "confirmed", "assessment": assessment, "witness_queries": [], "review": None}
     if review is not None:
         raise StageError("blocked outcome cannot include a review")
     return {"outcome": "blocked", "assessment": assessment, "witness_queries": [], "review": None}
@@ -666,7 +666,6 @@ def _model_turn(prompt: str, runner) -> dict:
             handle.write(prompt)
         proc = runner([strategy.OMP, "--model", MODEL, "--thinking", "high", "--tools", "read,grep,glob",
                        "--no-extensions", "--no-session", "--no-prewalk", "--no-pty", "--approval-mode", "yolo",
-                       "--no-skills", "--no-rules", "--system-prompt", _REVIEWER_SYSTEM_PROMPT,
                        "-p", f"@{path}"],
                       capture_output=True, text=True, timeout=TIMEOUT)
     finally:
@@ -717,6 +716,13 @@ def run(cfg, conn, review_id: int, runner=subprocess.run) -> dict:
             if env["outcome"] == "blocked":
                 _record_round(conn, review_id, number, env["assessment"], "blocked", [], None)
                 return _commit_stop(conn, review_id, "blocked", env["assessment"], number)
+            if env["outcome"] == "confirmed":
+                # only the critique pass may confirm an already-retained candidate unchanged: the envelope carries
+                # no review, so the exact validated candidate is re-recorded and finalized (never auto-approved).
+                if candidate is None:
+                    raise StageError("confirmed outcome is only valid after a retained candidate in an agentic review")
+                _record_round(conn, review_id, number, env["assessment"], "ready", [], candidate)
+                return _commit(conn, review_id, candidate, outcome="ready", round_count=number)
             # ready: validate and retain the candidate; manual (or the critique pass in agentic) finalizes it.
             result = _validate_output(env["review"], ctx, conn)
             _record_round(conn, review_id, number, env["assessment"], "ready", [], result)
