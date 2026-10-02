@@ -413,8 +413,12 @@ Recursive rounds: a review is the first round. From the review page a person can
 round, or explicitly start an **agentic** round. Both modes run a bounded pass loop (at most 3 passes): a pass either
 reports `evidence` (asking for read-only domain-witness queries, up to 4, which the server runs and feeds back next
 pass), `blocked` (required recorded evidence is unavailable), or `ready` (a validated review). **Manual** finalizes
-on its first `ready`. **Agentic** never finalizes on its first `ready`: that pass is retained as a DRAFT candidate,
-and a later **critique** pass must re-examine it against the evidence. A revised review returns `ready`; an unchanged
+on its first `ready`. An **agentic** review without a prior candidate retains its first `ready` as a DRAFT; a later
+**critique** must re-examine it against the evidence. An agentic child instead starts with the nearest ancestor's
+committed result or retained draft, revalidated against its newly captured ticket context. A failed parent with no
+completed pass does not hide an older draft. If that candidate is incompatible, the model must draft a fresh one;
+otherwise the child's first actual pass is already the critique and can finalize. A revised review returns `ready`;
+an unchanged
 candidate returns the model-only `confirmed` envelope with a substantive assessment and no copied review object.
 The server rejects confirmation before a candidate exists; a valid confirmation records the exact retained candidate
 as a `ready` critique round and final result, never as ticket approval. This avoids regenerating an identical large
@@ -423,8 +427,9 @@ not the server-recorded snapshot metadata again. Each pass still has a 600-secon
 If the budget is consumed before a critique-finalized `ready`, the review records
 `outcome=limit_reached` — never a falsely-final result. Each pass carries its assessment, its witness queries and
 receipts, and (for `ready`) its validated review forward to the next pass; a child review's prompt receives the
-parent's exact committed result (or its latest retained draft candidate if the parent never finalized) plus the
-parent's passes and receipts, so nothing is re-asked from scratch. Earlier reviews and comments are retained in
+nearest ancestor's exact committed result or retained draft, plus intervening passes and receipts tagged with their
+source review ids. Distinct prior results remain available; identical candidates appear only once in the prompt.
+The current child's comment is preserved. Earlier reviews and comments are retained in
 `history`. The model runs only through the configured read-only domain witnesses (`witness.py` runners plus the
 append-only `witness_log`) — it may ask for schema queries before business queries, and query bounds are explicit —
 never unrestricted shell or Linear. An unavailable witness/data result is shown as such, never substituted with a
