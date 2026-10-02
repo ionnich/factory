@@ -148,6 +148,12 @@
    panel's base text to the theme's card text so titles and inherited text stay readable. */
 .fx-dialog[data-slot="dialog-content"] { color: var(--fx-fg); }
 .fx-dialog-body { display: grid; gap: .6rem; padding: .8rem; }
+.fx-health-list, .fx-run-view { display: grid; gap: .6rem; }
+.fx-back { justify-self: start; background: none; border: 0; padding: .15rem .45rem; font: inherit; font-size: .875rem;
+           color: var(--fx-muted); cursor: pointer; min-height: 44px; display: inline-flex; align-items: center;
+           border-radius: var(--fx-r-sm); }
+.fx-back:hover { color: var(--fx-fg); background: var(--fx-fill); }
+.fx-back:focus-visible { outline: 2px solid var(--fx-lavender); outline-offset: 2px; }
 /* The SDK dialog's built-in close (X) is 24px; give it a 44px hit target while keeping the icon in place. */
 .fx-dialog [data-slot="dialog-close"] { width: 44px; height: 44px; top: 2px; right: 2px; }
 /* A run's recorded error/status and its output preview, opened from a run row (read-only). */
