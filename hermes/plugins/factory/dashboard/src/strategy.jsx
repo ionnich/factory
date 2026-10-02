@@ -943,7 +943,7 @@ function RoundPass({ round }) {
   );
 }
 
-// The status/meta summary shared by the review list row and the read-only lineage list.
+// The latest review per domain; earlier revisions live in its detail history.
 function ReviewSummaryMeta({ r }) {
   const [label, tone] = GROOM_STATUS[r.status] || [r.status || "unknown", "gray"];
   return (
@@ -957,11 +957,10 @@ function ReviewSummaryMeta({ r }) {
         {r.proposal_brief_id ? <Tone tone="blue">brief #{r.proposal_brief_id}</Tone> : null}
       </div>
       <div className="fx-row-title fx-ttitle clamp">{r.domain_name || r.domain_id || `Review #${r.id}`}</div>
-      <div className="fx-row-meta fx-hint">#{r.id} · requested {ago(r.requested_at)}
-        {r.completed_at ? ` · completed ${ago(r.completed_at)}` : ""}{r.run_id ? ` · run ${r.run_id}` : ""}
-        {r.round_count ? ` · ${r.round_count} round${r.round_count === 1 ? "" : "s"}` : ""}
-        {r.parent_review_id ? ` · child of #${r.parent_review_id}` : ""}</div>
-      {r.feedback ? <div className="fx-hint">“{clip(r.feedback, 140)}”</div> : null}
+      <div className="fx-row-meta fx-hint">Latest review #{r.id} · {r.superseded_by != null ? "superseded" : r.approved_at ? "approved for reconcile" : r.status === "pending" ? "queued" : r.status === "running" ? "reviewing" : r.status === "completed" ? "ready for your decision" : "stopped — open for details"}
+        {r.round_count ? ` · ${r.round_count} model pass${r.round_count === 1 ? "" : "es"}` : ""}
+        {r.completed_at ? ` · ${ago(r.completed_at)}` : ""}</div>
+      {r.feedback ? <div className="fx-hint">Request: “{clip(r.feedback, 140)}”</div> : null}
       {r.error ? <div className="fx-err">{clip(r.error, 160)}</div> : null}
       {r.blocker ? <div className="fx-hint">{r.blocker}</div> : null}
     </>
@@ -992,7 +991,7 @@ function DomainReviewRow({ r, busy, onOpen, onRetry }) {
       <div className="fx-tc-ne">
         {r.status === "failed"
           ? <Button size="sm" disabled={!!busy} onClick={(e) => { stop(e); onRetry(); }}>Retry</Button>
-          : <span className="fx-hint">›</span>}
+          : <span className="fx-hint">Open ›</span>}
       </div>
     </div>
   );
@@ -1005,6 +1004,16 @@ function DomainGroomSection({ domains, reviews, listErr, loading, busy, domainId
   return (
     <section className="fx-sec fx-stack-v" aria-label="Groom domain">
       <div className="fx-k">Groom domain</div>
+      {listErr ? <div className="fx-err" role="alert">Domain reviews unavailable: {listErr}</div> : null}
+      {loading
+        ? <div className="fx-hint">Loading latest reviews…</div>
+        : reviews.length
+          ? <div className="fx-k">Revision progress · latest per domain ({reviews.length})</div>
+          : <div className="fx-empty">No domain reviews yet.</div>}
+      <div className="fx-list">
+        {sorted.map((r) => <DomainReviewRow key={r.id} r={r} busy={busy} onOpen={() => onOpen(r.id)} onRetry={() => onRetry(r)} />)}
+      </div>
+      <div className="fx-k">Start new review</div>
       <div className="fx-hint">A read-only DeepSeek review of one owned domain's open tickets against cached snapshots and
         repository mirrors. It proposes a minimum system and per-ticket dispositions — it changes no code and no ticket.
         Approving a change queues it into reconcile; the actual Linear edit happens later in reconcile cron.</div>
@@ -1026,15 +1035,6 @@ function DomainGroomSection({ domains, reviews, listErr, loading, busy, domainId
         <ModeToggle mode={mode} onChange={onMode} disabled={!!busy} label="Review mode" />
         {mode === "agentic" ? <span className="fx-hint">Agent-led: up to 3 automatic passes.</span> : null}
         {active ? <span className="fx-hint">A review is running; this list refreshes itself.</span> : null}
-      </div>
-      {listErr ? <div className="fx-err" role="alert">Domain reviews unavailable: {listErr}</div> : null}
-      {loading
-        ? <div className="fx-hint">Loading domain reviews…</div>
-        : reviews.length
-          ? <div className="fx-k">Past reviews ({reviews.length})</div>
-          : <div className="fx-empty">No domain reviews yet.</div>}
-      <div className="fx-list">
-        {sorted.map((r) => <DomainReviewRow key={r.id} r={r} busy={busy} onOpen={() => onOpen(r.id)} onRetry={() => onRetry(r)} />)}
       </div>
     </section>
   );
@@ -1193,8 +1193,7 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
   const supersededBy = r.superseded_by ?? null;
   const superseded = supersededBy != null;
   const result = r.result || null;
-  // v2 history is root -> latest and includes the current row; lineage shows only true earlier rounds so the current
-  // review is never offered a misleading self-open.
+  // Detail history is root-first and includes this review; keep older revisions available without burying the result.
   const history = (r.history || []).filter((p) => p.id !== r.id);
   const rounds = r.rounds || [];
   const tickets = result?.tickets || [];
@@ -1234,9 +1233,7 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
         </div>
         <Button size="sm" ghost onClick={onBack}>← Back to sources</Button>
       </div>
-      <div className="fx-hint">Requested {ago(r.requested_at)}{r.completed_at ? ` · completed ${ago(r.completed_at)}` : ""}{r.run_id ? ` · run ${r.run_id}` : ""}
-        {r.round_count ? ` · ${r.round_count} round${r.round_count === 1 ? "" : "s"}` : ""}
-        {r.parent_review_id ? ` · child of #${r.parent_review_id}` : ""}</div>
+      <div className="fx-hint">Requested {ago(r.requested_at)}{r.completed_at ? ` · completed ${ago(r.completed_at)}` : ""}{r.run_id ? ` · run ${r.run_id}` : ""}</div>
       {superseded ? (
         <>
           <div className="fx-err" role="status">Superseded — a newer review round (#{supersededBy}) exists. This round is
@@ -1246,7 +1243,17 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
           </div>
         </>
       ) : null}
-      {r.feedback ? <div className="fx-why">Comment: {r.feedback}</div> : null}
+      <section className="fx-sec fx-stack-v" aria-label="Revision progress">
+        <div className="fx-k">Revision {history.length + 1} · review #{r.id}</div>
+        <div>{superseded ? `Superseded by #${supersededBy}.` : approved ? "Approved changes queued for reconcile." :
+          active ? r.status === "pending" ? "Queued; no model pass recorded yet." : "Reviewing; this page updates when progress is saved." :
+          r.status === "completed" ? "Proposal ready for your decision. No ticket edits applied." :
+          "Review stopped. See error and request another revision below."}</div>
+        <div className="fx-hint">{r.round_count || 0} model pass{r.round_count === 1 ? "" : "es"} recorded in this revision.
+          {history.length ? ` ${plural(history.length, "earlier revision")} retained.` : ""}</div>
+        {r.feedback ? <div className="fx-why">Your request: {r.feedback}</div> : null}
+        {rounds.length ? <div className="fx-hint">Latest assessment: {clip(rounds[rounds.length - 1].assessment, 260)}</div> : null}
+      </section>
       {r.outcome === "blocked" ? <div className="fx-hint">Stopped on missing data — unavailable evidence is shown below, never substituted with cached facts.</div> : null}
       {r.outcome === "limit_reached" ? <div className="fx-hint">Evidence budget (max 3 agent-led passes) consumed before the review was substantiated; request another round to continue.</div> : null}
       {active ? (
@@ -1257,25 +1264,33 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
       {r.blocker ? <div className="fx-hint">{r.blocker}</div> : null}
 
       {history.length ? (
-        <section className="fx-sec fx-stack-v" aria-label="Review lineage">
-          <div className="fx-k">Lineage ({history.length} earlier round{history.length === 1 ? "" : "s"})</div>
+        <details className="fx-fold" aria-label="Earlier revisions">
+          <summary>Earlier revisions ({history.length}) · open history</summary>
           <div className="fx-list">
-            {history.map((p) => (
+            {history.map((p, i) => (
               <div key={p.id} className="fx-trow">
-                <div className="fx-grow"><ReviewSummaryMeta r={p} /></div>
+                <div className="fx-grow">
+                  <div className="fx-row fx-row-status">
+                    <span className="fx-k">Revision {i + 1} · #{p.id}</span>
+                    <Tone tone={GROOM_STATUS[p.status]?.[1] || "gray"}>{GROOM_STATUS[p.status]?.[0] || p.status}</Tone>
+                    <OutcomeTone outcome={p.outcome} showReady />
+                  </div>
+                  {p.feedback ? <div className="fx-hint">Request: “{clip(p.feedback, 140)}”</div> : null}
+                  {p.error ? <div className="fx-err">{clip(p.error, 120)}</div> : null}
+                </div>
                 <div className="fx-tc-ne">
-                  <Button size="sm" ghost onClick={() => onOpenReview(p.id)} aria-label={`Open review #${p.id}`}>Open review ›</Button>
+                  <Button size="sm" ghost onClick={() => onOpenReview(p.id)} aria-label={`Open review #${p.id}`}>Open ›</Button>
                 </div>
               </div>
             ))}
           </div>
-        </section>
+        </details>
       ) : null}
       {rounds.length ? (
-        <section className="fx-sec fx-stack-v" aria-label="Review rounds">
-          <div className="fx-k">Rounds ({rounds.length})</div>
+        <details className="fx-fold" aria-label="Model passes">
+          <summary>Model passes ({rounds.length}) · assessments and evidence</summary>
           {rounds.map((rd, i) => <RoundPass key={i} round={rd} />)}
-        </section>
+        </details>
       ) : null}
 
       {result ? (

@@ -469,6 +469,11 @@ Confirm ticket changes** (with the exact previewed diffs and a warning about rea
 actions for reconcile. **Create simplification brief** stays a separate unapproved action with its own Open brief
 link; existing approval/execution gates are unchanged.
 
+Strategy shows the latest review for each domain above the new-review form, with current status, request, and
+recorded model-pass count. Opening a review shows its revision number, current decision state and latest assessment
+first; older revisions and full model-pass evidence remain available in collapsible history. Review revisions and
+model passes are distinct. A ready proposal still requires explicit human approval before any reconcile write.
+
 The top **Proposals failed** health indicator is a clickable, read-only button that opens a single job-health dialog:
 each job's exact recorded failure (untruncated `last_error`) and its execution timestamp, plus a recent-runs history
 whose rows switch the same dialog to a run detail (a Back control returns to the job list, and Escape on a run detail
