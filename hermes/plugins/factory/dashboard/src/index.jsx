@@ -704,27 +704,51 @@ function Health({ jobs }) {
 }
 
 function HealthPanel({ jobs, onClose, openerRef }) {
-  const [openRun, setOpenRun] = useState(null);   // the run whose detail is open (nested dialog)
-  const rowRef = useRef(null);                     // the run row that opened it; focus returns there
-  const openRunRef = useRef(null);                 // read by event handlers after this render
-  openRunRef.current = openRun;
+  const [selectedRun, setSelectedRun] = useState(null);  // null = job list, run = detail view
+  const rowRef = useRef(null);                            // the run row that opened the detail; focus returns there
+  const backRef = useRef(null);                           // the Back button, focused when the detail opens
+  const returnFocusToRow = useRef(false);                 // focus the row once the list is shown again
+  useEffect(() => {  // focus follows the view swap, after React re-shows/hides the list
+    if (selectedRun !== null) backRef.current?.focus();
+    else if (returnFocusToRow.current) { returnFocusToRow.current = false; rowRef.current?.focus(); }
+  }, [selectedRun]);
+  const viewingRun = selectedRun !== null;
+  const when = selectedRun && (selectedRun.started_at || selectedRun.last_active);
   const sorted = [...jobs].sort((a, b) => (badJob(b) ? 1 : 0) - (badJob(a) ? 1 : 0) || (a.name < b.name ? -1 : 1));
-  return (<>
-    <Dialog open onOpenChange={(v) => { if (!v && !openRunRef.current) onClose(); }}>
+  return (
+    <Dialog open onOpenChange={(v) => !v && onClose()}>
       <DialogContent className="fx-dialog"
-        onEscapeKeyDown={(e) => { if (openRunRef.current) e.preventDefault(); }}
-        onCloseAutoFocus={(e) => { e.preventDefault(); openerRef.current?.focus(); }}>
+        onCloseAutoFocus={(e) => { e.preventDefault(); openerRef.current?.focus(); }}
+        onEscapeKeyDown={(e) => {
+          if (viewingRun) {  // Escape while reading a run: stay open, go back to the job list
+            e.preventDefault();
+            returnFocusToRow.current = true;
+            setSelectedRun(null);
+          }
+        }}>
         <DialogHeader>
-          <DialogTitle>Job health</DialogTitle>
-          <DialogDescription>Each cron job's own last run, exactly as its store records it — the whole job, never one ticket or dispatch.</DialogDescription>
+          <DialogTitle>{viewingRun ? "Run detail" : "Job health"}</DialogTitle>
+          <DialogDescription>{viewingRun
+            ? (when != null ? `${epochAgoS(when)} · ${epochLocal(when)}` : "time unknown")
+            : "Each cron job's own last run, exactly as its store records it — the whole job, never one ticket or dispatch."}</DialogDescription>
         </DialogHeader>
         <div className="fx-dialog-body">
-          {sorted.map((j) => <JobHealth key={j.name} j={j} rowRef={rowRef} onOpenRun={setOpenRun} />)}
+          <div className="fx-health-list" style={viewingRun ? { display: "none" } : undefined}>
+            {sorted.map((j) => <JobHealth key={j.name} j={j} rowRef={rowRef} onOpenRun={setSelectedRun} />)}
+          </div>
+          {viewingRun ? (
+            <div className="fx-run-view">
+              <button type="button" ref={backRef} className="fx-back"
+                      onClick={() => { returnFocusToRow.current = true; setSelectedRun(null); }}>
+                ← Back to job health
+              </button>
+              <RunDetail run={selectedRun} />
+            </div>
+          ) : null}
         </div>
       </DialogContent>
     </Dialog>
-    {openRun ? <RunDetail run={openRun} onClose={() => setOpenRun(null)} rowRef={rowRef} /> : null}
-  </>);
+  );
 }
 
 function JobHealth({ j, rowRef, onOpenRun }) {
@@ -779,32 +803,19 @@ function RunHistory({ id, profile, rowRef, onOpenRun }) {
 }
 
 // A run's recorded error/status (title, untruncated) and its output preview (the cron runs endpoint truncates
-// preview to 180 chars). Read-only; Escape closes only this nested dialog and focus returns to the row that opened it.
-function RunDetail({ run, onClose, rowRef }) {
-  const when = run.started_at || run.last_active;
+// preview to 180 chars). Content only — rendered inside HealthPanel's single dialog, never a nested modal.
+function RunDetail({ run }) {
   const title = run.title, preview = run.preview;
-  return (
-    <Dialog open onOpenChange={(v) => !v && onClose()}>
-      <DialogContent className="fx-dialog"
-        onEscapeKeyDown={(e) => { e.preventDefault(); onClose(); }}
-        onCloseAutoFocus={(e) => { e.preventDefault(); rowRef.current?.focus(); }}>
-        <DialogHeader>
-          <DialogTitle>Run detail</DialogTitle>
-          <DialogDescription>{when != null ? `${epochAgoS(when)} · ${epochLocal(when)}` : "time unknown"}</DialogDescription>
-        </DialogHeader>
-        <div className="fx-dialog-body">
-          {title ? <pre className="fx-run-out">{title}</pre> : null}
-          {preview && !(title && title.includes(preview)) ? (
-            <>
-              <div className="fx-k">Output preview (up to 180 characters)</div>
-              <pre className="fx-run-out muted">{preview}</pre>
-            </>
-          ) : null}
-          {!title && !preview ? <div className="fx-hint">No output recorded for this run.</div> : null}
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
+  return (<>
+    {title ? <pre className="fx-run-out">{title}</pre> : null}
+    {preview && !(title && title.includes(preview)) ? (
+      <>
+        <div className="fx-k">Output preview (up to 180 characters)</div>
+        <pre className="fx-run-out muted">{preview}</pre>
+      </>
+    ) : null}
+    {!title && !preview ? <div className="fx-hint">No output recorded for this run.</div> : null}
+  </>);
 }
 
 // A cron job's own last run, as its store records it. The job covers every ticket or draft: its status and error are
