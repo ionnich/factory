@@ -821,8 +821,8 @@ const OutcomeTone = ({ outcome, showReady = false, map = GROOM_OUTCOME }) => {
 };
 
 // Witness receipts are the backend's truthfully-mapped read-only witness output: {id,name,query,at,ok,result,error}.
-// An ok receipt shows its result; a failed one shows its error. Nothing is synthesized here. Contract: round.witness_receipts.
-const roundReceipts = (round) => (round?.witness_receipts || []);
+// An ok receipt shows its result; a failed one shows its error. Nothing is synthesized here. Contract: round.receipts.
+const roundReceipts = (round) => (round?.receipts || []);
 
 function WitnessReceipts({ receipts }) {
   if (!receipts || !receipts.length) return null;
@@ -854,7 +854,80 @@ function WitnessReceipts({ receipts }) {
   );
 }
 
-// One recorded pass: its number, truthful outcome, the model's assessment text, and its witness receipts.
+// A read-only, folded view of a pass's retained candidate review (round.review): the validated proposal that pass
+// recorded. It is never the human-facing result — no approval or selection lives here.
+function CandidateTicket({ t }) {
+  const [label, tone] = groomAction(t.action);
+  return (
+    <div className="fx-groom-ticket">
+      <div className="fx-row fx-row-status">
+        <Tone tone={tone}>{label}</Tone>
+        {t.action === "merge" && t.target ? <Tone tone="amber">into {t.target}</Tone> : null}
+        <span className="fx-id">{t.identifier}</span>
+      </div>
+      {t.reason ? <div className="fx-hint">{t.reason}</div> : null}
+      {t.action === "rewrite" && t.title != null
+        ? <div className="fx-hint">Title: {t.title || "(unchanged)"}{t.description ? ` · ${clip(t.description, 100)}` : ""}</div>
+        : null}
+      {t.evidence?.length ? (
+        <details className="fx-fold"><summary>Evidence ({t.evidence.length})</summary>
+          <ul className="fx-src">{t.evidence.map((e, i) => <li key={i}>{e}</li>)}</ul>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+function CandidateReview({ review }) {
+  if (!review) return null;
+  const tickets = review.tickets || [];
+  const cuts = review.cuts || [];
+  const cutById = Object.fromEntries(cuts.map((c) => [c.id, c]));
+  const primaryCutOf = (t) => (t.cut_ids || []).find((id) => cutById[id]) || null;
+  const ungrouped = tickets.filter((t) => primaryCutOf(t) == null);
+  const groups = cuts.map((c) => ({ cut: c, tickets: tickets.filter((t) => primaryCutOf(t) === c.id) }));
+  return (
+    <details className="fx-fold">
+      <summary>Recorded candidate proposal ({tickets.length} disposition{tickets.length === 1 ? "" : "s"}
+        {cuts.length ? ` · ${cuts.length} cut${cuts.length === 1 ? "" : "s"}` : ""})</summary>
+      <div className="fx-stack-v">
+        {review.minimum_system ? <div className="fx-why">{review.minimum_system}</div> : null}
+        {review.consumers?.length ? (
+          <details className="fx-fold"><summary>Consumers ({review.consumers.length})</summary>
+            <ul className="fx-src">{review.consumers.map((c, i) => <li key={i}>{c}</li>)}</ul>
+          </details>
+        ) : null}
+        {review.correctness?.length ? (
+          <details className="fx-fold"><summary>Correctness ({review.correctness.length})</summary>
+            <ul className="fx-src">{review.correctness.map((c, i) => <li key={i}>{c}</li>)}</ul>
+          </details>
+        ) : null}
+        {groups.map((g) => (
+          <div key={g.cut.id} className="fx-stack-v">
+            <div className="fx-hint"><strong>{g.cut.title || g.cut.id}</strong>{g.cut.reason ? ` — ${g.cut.reason}` : ""}</div>
+            {g.cut.evidence?.length ? (
+              <details className="fx-fold"><summary>Evidence ({g.cut.evidence.length})</summary>
+                <ul className="fx-src">{g.cut.evidence.map((e, i) => <li key={i}>{e}</li>)}</ul>
+              </details>
+            ) : null}
+            {g.cut.risk ? <div className="fx-hint">Risk: {g.cut.risk}</div> : null}
+            {g.cut.migration ? <div className="fx-hint">Migration: {g.cut.migration}</div> : null}
+            {g.tickets.map((t) => <CandidateTicket key={t.identifier} t={t} />)}
+          </div>
+        ))}
+        {ungrouped.map((t) => <CandidateTicket key={t.identifier} t={t} />)}
+        {review.limitations?.length ? (
+          <details className="fx-fold"><summary>Limitations ({review.limitations.length})</summary>
+            <ul className="fx-src">{review.limitations.map((l, i) => <li key={i}>{l}</li>)}</ul>
+          </details>
+        ) : null}
+      </div>
+    </details>
+  );
+}
+
+// One recorded pass: its number, truthful outcome, the model's assessment text, its witness receipts, and (for a ready
+// pass) its retained candidate proposal.
 function RoundPass({ round }) {
   return (
     <section className="fx-sec fx-stack-v">
@@ -865,6 +938,7 @@ function RoundPass({ round }) {
       </div>
       {round?.assessment ? <div className="fx-why">{round.assessment}</div> : null}
       <WitnessReceipts receipts={roundReceipts(round)} />
+      <CandidateReview review={round?.review} />
     </section>
   );
 }
@@ -950,6 +1024,7 @@ function DomainGroomSection({ domains, reviews, listErr, loading, busy, domainId
           {busy === "domain-start" ? "Starting…" : "Start review"}
         </Button>
         <ModeToggle mode={mode} onChange={onMode} disabled={!!busy} label="Review mode" />
+        {mode === "agentic" ? <span className="fx-hint">Agent-led: up to 3 automatic passes.</span> : null}
         {active ? <span className="fx-hint">A review is running; this list refreshes itself.</span> : null}
       </div>
       {listErr ? <div className="fx-err" role="alert">Domain reviews unavailable: {listErr}</div> : null}
@@ -1116,7 +1191,9 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
   const supersededBy = r.superseded_by ?? null;
   const superseded = supersededBy != null;
   const result = r.result || null;
-  const history = r.history || [];
+  // v2 history is root -> latest and includes the current row; lineage shows only true earlier rounds so the current
+  // review is never offered a misleading self-open.
+  const history = (r.history || []).filter((p) => p.id !== r.id);
   const rounds = r.rounds || [];
   const tickets = result?.tickets || [];
   const cuts = result?.cuts || [];
@@ -1169,7 +1246,7 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
       ) : null}
       {r.feedback ? <div className="fx-why">Comment: {r.feedback}</div> : null}
       {r.outcome === "blocked" ? <div className="fx-hint">Stopped on missing data — unavailable evidence is shown below, never substituted with cached facts.</div> : null}
-      {r.outcome === "limit_reached" ? <div className="fx-hint">Evidence budget consumed before the review was substantiated; request another round to continue.</div> : null}
+      {r.outcome === "limit_reached" ? <div className="fx-hint">Evidence budget (max 3 agent-led passes) consumed before the review was substantiated; request another round to continue.</div> : null}
       {active ? (
         <div className="fx-hint" role="status">{r.status === "pending" ? "Queued" : "Reviewing"} — a read-only analysis over cached
           snapshots and mirrors. It changes nothing; this refreshes itself.</div>
@@ -1273,8 +1350,8 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
         <section className="fx-sec fx-stack-v" aria-label="Request another round">
           <div className="fx-k">Request another round</div>
           <div className="fx-hint">Leave a comment and ask for a revised review. Manual runs one human-facing revision;
-            agent-led runs bounded automatic critique/evidence/revision passes that stop when substantiated or blocked on
-            missing data. The parent result and your comment feed the next review.</div>
+            agent-led runs up to 3 bounded automatic critique/evidence/revision passes that stop when substantiated or
+            blocked on missing data. The parent result and your comment feed the next review.</div>
           <ModeToggle mode={mode} onChange={onMode} disabled={!!busy} label="Next round mode" />
           <textarea className="fx-ta" rows={3} maxLength={4000} value={feedback} disabled={!!busy}
                     aria-label="Review comment" placeholder="Comment for the next review (optional)"
@@ -1284,7 +1361,7 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
               {busy === "domain-rerun" ? "Requesting…" : "Request next round"}
             </Button>
             {mode === "agentic"
-              ? <span className="fx-hint">Agent-led: read-only witnesses only; may stop blocked or at the pass limit.</span>
+              ? <span className="fx-hint">Agent-led: up to 3 automatic passes over read-only witnesses; may stop blocked or at the pass limit.</span>
               : <span className="fx-hint">Manual: one revised review.</span>}
           </div>
         </section>
