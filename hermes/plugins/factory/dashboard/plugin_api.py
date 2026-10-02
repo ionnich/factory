@@ -299,6 +299,12 @@ async def strategy_approve(brief_id: int):
     return await factory("strategy", "approve", str(brief_id), "--actor", "user:dashboard")
 
 
+@router.post("/strategy/{brief_id}/dismiss")
+async def strategy_dismiss(brief_id: int, body: StrategyHold):
+    return await factory("strategy", "dismiss", str(brief_id), f"--reason={text_ok(body.reason, 'reason')}",
+                         "--actor", "user:dashboard")
+
+
 @router.post("/strategy/{brief_id}/hold")
 async def strategy_hold(brief_id: int, body: StrategyHold):
     return await factory("strategy", "hold", str(brief_id), f"--reason={text_ok(body.reason, 'reason')}",

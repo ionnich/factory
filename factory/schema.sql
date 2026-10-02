@@ -176,6 +176,29 @@ BEGIN SELECT RAISE(ABORT, 'hold audit is append-only'); END;
 CREATE TRIGGER work_brief_hold_append_only_d BEFORE DELETE ON work_brief_hold
 BEGIN SELECT RAISE(ABORT, 'hold audit is append-only'); END;
 
+-- Human dismissal preserves draft intent and suppresses automatic reproposal of its captured sources.
+CREATE TABLE brief_dismissal (
+  brief_id INTEGER PRIMARY KEY REFERENCES work_brief(id),
+  reason TEXT NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 2000),
+  actor TEXT NOT NULL CHECK (length(trim(actor)) > 0 AND actor NOT GLOB 'agent:*' AND actor NOT GLOB 'factory:*'),
+  at TEXT NOT NULL
+);
+CREATE TRIGGER brief_dismissal_guard BEFORE INSERT ON brief_dismissal
+WHEN (SELECT state FROM work_brief WHERE id = NEW.brief_id) <> 'draft'
+  OR EXISTS (SELECT 1 FROM work_brief WHERE parent_id = NEW.brief_id)
+  OR EXISTS (SELECT 1 FROM brief_dismissal WHERE brief_id = NEW.brief_id)
+BEGIN SELECT RAISE(ABORT, 'only an undismissed latest draft may be dismissed'); END;
+CREATE TRIGGER brief_dismissal_append_only_u BEFORE UPDATE ON brief_dismissal
+BEGIN SELECT RAISE(ABORT, 'brief dismissal is append-only'); END;
+CREATE TRIGGER brief_dismissal_append_only_d BEFORE DELETE ON brief_dismissal
+BEGIN SELECT RAISE(ABORT, 'brief dismissal is append-only'); END;
+CREATE TRIGGER work_brief_dismissed_frozen BEFORE UPDATE ON work_brief
+WHEN EXISTS (SELECT 1 FROM brief_dismissal WHERE brief_id = OLD.id)
+BEGIN SELECT RAISE(ABORT, 'a dismissed brief cannot be changed or approved'); END;
+CREATE TRIGGER work_brief_dismissed_insert BEFORE INSERT ON work_brief
+WHEN EXISTS (SELECT 1 FROM brief_dismissal WHERE brief_id IN (NEW.id, NEW.parent_id))
+BEGIN SELECT RAISE(ABORT, 'a dismissed brief cannot be replaced or revised'); END;
+
 -- Durable read-only agent investigations. Active work is unique per parent; a successful investigation may append
 -- one unapproved child revision, while no-work outcomes retain only their structured explanation.
 CREATE TABLE brief_investigation (

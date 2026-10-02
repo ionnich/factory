@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 # Upgrades for existing DBs; schema.sql always holds the full current schema for fresh ones.
 MIGRATIONS = {
@@ -651,6 +651,27 @@ BEGIN SELECT RAISE(ABORT, 'dispatch is immutable once staged'); END;""",
   CHECK (status <> 'failed' OR error IS NOT NULL));
 CREATE UNIQUE INDEX brief_investigation_active ON brief_investigation(brief_id)
 WHERE status IN ('pending', 'running');""",
+    # v25: append-only human dismissals; no state enum rebuild or loss of captured intent.
+    25: """CREATE TABLE brief_dismissal (
+  brief_id INTEGER PRIMARY KEY REFERENCES work_brief(id),
+  reason TEXT NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 2000),
+  actor TEXT NOT NULL CHECK (length(trim(actor)) > 0 AND actor NOT GLOB 'agent:*' AND actor NOT GLOB 'factory:*'),
+  at TEXT NOT NULL);
+CREATE TRIGGER brief_dismissal_guard BEFORE INSERT ON brief_dismissal
+WHEN (SELECT state FROM work_brief WHERE id = NEW.brief_id) <> 'draft'
+  OR EXISTS (SELECT 1 FROM work_brief WHERE parent_id = NEW.brief_id)
+  OR EXISTS (SELECT 1 FROM brief_dismissal WHERE brief_id = NEW.brief_id)
+BEGIN SELECT RAISE(ABORT, 'only an undismissed latest draft may be dismissed'); END;
+CREATE TRIGGER brief_dismissal_append_only_u BEFORE UPDATE ON brief_dismissal
+BEGIN SELECT RAISE(ABORT, 'brief dismissal is append-only'); END;
+CREATE TRIGGER brief_dismissal_append_only_d BEFORE DELETE ON brief_dismissal
+BEGIN SELECT RAISE(ABORT, 'brief dismissal is append-only'); END;
+CREATE TRIGGER work_brief_dismissed_frozen BEFORE UPDATE ON work_brief
+WHEN EXISTS (SELECT 1 FROM brief_dismissal WHERE brief_id = OLD.id)
+BEGIN SELECT RAISE(ABORT, 'a dismissed brief cannot be changed or approved'); END;
+CREATE TRIGGER work_brief_dismissed_insert BEFORE INSERT ON work_brief
+WHEN EXISTS (SELECT 1 FROM brief_dismissal WHERE brief_id IN (NEW.id, NEW.parent_id))
+BEGIN SELECT RAISE(ABORT, 'a dismissed brief cannot be replaced or revised'); END;""",
 }
 
 

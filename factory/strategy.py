@@ -287,6 +287,11 @@ def _row(conn, brief_id):
     return row
 
 
+def _dismissal(conn, brief_id) -> dict | None:
+    row = conn.execute("SELECT reason, actor, at FROM brief_dismissal WHERE brief_id=?", (brief_id,)).fetchone()
+    return dict(row) if row else None
+
+
 def _brief(conn, row) -> dict:
     sources = json.loads(row["sources_json"])
     return {"id": row["id"], "revision": row["revision"], "parent_id": row["parent_id"], "state": row["state"],
@@ -294,7 +299,8 @@ def _brief(conn, row) -> dict:
             "relationship_warnings": _relationship_warnings(sources),
             "created_at": row["created_at"], "created_by": row["created_by"],
             "approved_at": row["approved_at"], "approved_by": row["approved_by"],
-            "amendment_reason": row["amendment_reason"], "hold_reason": row["hold_reason"]}
+            "amendment_reason": row["amendment_reason"], "hold_reason": row["hold_reason"],
+            "dismissal": _dismissal(conn, row["id"])}
 
 
 def _idents(identifiers) -> list[str]:
@@ -413,6 +419,17 @@ def _run_groom(sources: list[dict]) -> dict:
 
 
 # --------------------------------------------------------------------------- public API
+def brief_reviews(conn) -> list[dict]:
+    """Latest undismissed drafts only: a small review inbox, not the full Strategy workspace."""
+    return [{"id": row["id"], "title": json.loads(row["body_json"])["title"],
+             "sources": [s["identifier"] for s in json.loads(row["sources_json"])],
+             "created_at": row["created_at"], "created_by": row["created_by"]}
+            for row in conn.execute(
+                "SELECT b.* FROM work_brief b WHERE state='draft' "
+                "AND NOT EXISTS (SELECT 1 FROM work_brief child WHERE child.parent_id=b.id) "
+                "AND NOT EXISTS (SELECT 1 FROM brief_dismissal d WHERE d.brief_id=b.id) ORDER BY b.id")]
+
+
 def overview(cfg: Config, conn) -> dict:
     """Pure cached-DB read: every brief version, the Strategy source list, deterministic relationship workgroups,
     the relationship capture summary, policy and active scheduling. No model/network. Prior versions stay readable;
@@ -433,6 +450,7 @@ def overview(cfg: Config, conn) -> dict:
         link = conn.execute(f"SELECT run_id, state, {PHASE} AS phase FROM dispatch WHERE brief_id=?",
                             (row["id"],)).fetchone()
         item = ready_by_id.get(row["id"])
+        dismissal = _dismissal(conn, row["id"])
         if item is not None:  # current published, unconsumed: exact readiness/blockers from ready()
             readiness = ("held" if item["state"] == "held"
                          else "needs-amendment" if changed
@@ -444,7 +462,7 @@ def overview(cfg: Config, conn) -> dict:
             deps = item["dependencies"]
             facts, replacement = item["readiness_facts"], item["replacement"]
         elif row["state"] == "draft":
-            readiness = "superseded" if row["id"] in children else "draft"
+            readiness = "dismissed" if dismissal else "superseded" if row["id"] in children else "draft"
             blockers, intent_ready, deps, facts, replacement = [], False, [], None, None
         elif row["id"] in current:  # current published but already dispatched
             readiness, blockers, intent_ready, deps, facts, replacement = "dispatched", [], None, [], None, None
@@ -458,6 +476,7 @@ def overview(cfg: Config, conn) -> dict:
                        "approved_at": row["approved_at"], "intent_ready": intent_ready,
                        "source_changed": changed, "verified": verified, "readiness": readiness,
                        "blockers": blockers, "dependencies": deps,
+                       "dismissal": dismissal,
                        "readiness_facts": facts, "replacement": replacement,
                        "dispatch": {"run_id": link["run_id"], "state": link["state"], "phase": link["phase"]}
                        if link else None, "investigation": investigations.get(row["id"])})
@@ -491,16 +510,21 @@ def create(cfg: Config, conn, identifiers, actor, body=None) -> dict:
     return _insert_draft(conn, sources, norm, actor)
 
 
+def _groom_body(sources: list[dict]) -> dict:
+    norm = _normalize_body(_run_groom(sources), sources, False)
+    candidates = set(_dependency_candidates(sources))
+    if bad := sorted(set(norm["dependencies"]) - candidates):
+        raise StageError("model-named dependency is not a recorded prerequisite: " + ", ".join(bad))
+    return norm
+
+
 def groom(cfg: Config, conn, identifiers, actor) -> dict:
     """Draft from a real DeepSeek V4 Pro subprocess (source/evidence only, tools disabled). Append-only draft result;
     model-named resources are never trusted (global:* default until a human reviews). Model-named dependencies are
     accepted only against the recorded dependency_candidates — never the model's own free text."""
     identifiers = _idents(identifiers)
     sources = _sources_for(cfg, conn, identifiers)
-    norm = _normalize_body(_run_groom(sources), sources, False)
-    candidates = set(_dependency_candidates(sources))
-    if bad := sorted(set(norm["dependencies"]) - candidates):
-        raise StageError("model-named dependency is not a recorded prerequisite: " + ", ".join(bad))
+    norm = _groom_body(sources)
     _ensure_acyclic(conn, {s["identifier"] for s in sources}, norm["dependencies"], None)
     return _insert_draft(conn, sources, norm, actor)
 
@@ -518,6 +542,8 @@ def revise(cfg: Config, conn, brief_id, body, reason, actor) -> dict:
     norm = _normalize_body(body, sources, _is_human(actor))
     _ensure_acyclic(conn, {s["identifier"] for s in sources}, norm["dependencies"], brief_id)
     with db.tx(conn):
+        if _dismissal(conn, brief_id):
+            raise StageError(f"brief #{brief_id} is dismissed; it cannot be revised")
         if conn.execute("SELECT 1 FROM work_brief WHERE parent_id=?", (brief_id,)).fetchone():
             raise StageError(f"brief #{brief_id} already has a newer revision; revise the latest version")
         cur = conn.execute(
@@ -534,6 +560,8 @@ def approve(cfg: Config, conn, brief_id, actor) -> dict:
     _require_human(actor)
     with db.tx(conn):  # BEGIN IMMEDIATE: validation + write are atomic against concurrent revisions
         row = _row(conn, brief_id)
+        if _dismissal(conn, brief_id):
+            raise StageError(f"brief #{brief_id} is dismissed; it cannot be approved")
         if row["state"] != "draft":
             raise StageError(f"brief #{brief_id} is {row['state']}, not a draft")
         if conn.execute("SELECT 1 FROM work_brief WHERE parent_id=?", (brief_id,)).fetchone():
@@ -548,6 +576,23 @@ def approve(cfg: Config, conn, brief_id, actor) -> dict:
         _ensure_acyclic(conn, {s["identifier"] for s in sources}, norm["dependencies"], brief_id)
         conn.execute("UPDATE work_brief SET state='approved', body_json=?, approved_at=?, approved_by=? WHERE id=?",
                      (json.dumps(norm), db.now(), actor, brief_id))
+    return get(conn, brief_id)
+
+
+def dismiss(cfg: Config, conn, brief_id, reason, actor) -> dict:
+    """A person retires a latest draft without changing its captured body or sources."""
+    _require_human(actor)
+    reason = _str("dismissal reason", reason)
+    with db.tx(conn):
+        row = _row(conn, brief_id)
+        if row["state"] != "draft":
+            raise StageError(f"brief #{brief_id} is {row['state']}, not a draft")
+        if conn.execute("SELECT 1 FROM work_brief WHERE parent_id=?", (brief_id,)).fetchone():
+            raise StageError(f"brief #{brief_id} already has a newer revision; dismiss the latest version")
+        if _dismissal(conn, brief_id):
+            raise StageError(f"brief #{brief_id} is already dismissed")
+        conn.execute("INSERT INTO brief_dismissal(brief_id,reason,actor,at) VALUES (?,?,?,?)",
+                     (brief_id, reason, actor, db.now()))
     return get(conn, brief_id)
 
 
