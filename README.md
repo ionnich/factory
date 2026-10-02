@@ -395,10 +395,12 @@ API (all under `/api/plugins/factory`; the actor is always `user:dashboard` from
 - `POST /strategy/domain-reviews/{id}/approve` `{identifiers:[…]}` → detail; nonempty mutation actions only
 - `POST /strategy/domain-reviews/{id}/brief` `{}` → `{brief: existing strategy brief}` (idempotent unapproved draft)
 
-Review summaries add `parent_review_id`, `feedback`, `mode`, `round_count` and `outcome`
-(`ready|blocked|limit_reached|null`). Detail adds `history` (chronological lineage summaries) and `rounds`
-(ordered pass records `{number, assessment, outcome, receipts}`), where each witness receipt is
-`{id,name,query,at,ok,result,error}` mapped truthfully from the append-only `witness_log` rows that round produced.
+Review summaries add `parent_review_id`, `feedback`, `mode`, `round_count`, `outcome`
+(`ready|blocked|limit_reached|null`) and `superseded_by` (the id of the latest child review that supersedes this
+one, or null). Detail adds `history` (chronological lineage summaries) and `rounds` (ordered pass records
+`{number, assessment, outcome, completed_at, receipts, review}`; a pass `outcome` is `ready|blocked|evidence`, and a
+`ready` pass carries its validated `review`), where each witness receipt is `{id,name,query,at,ok,result,error}`
+mapped truthfully from the append-only `witness_log` rows that pass produced.
 
 CLI equivalent: `factory strategy domain-list|domain-show|domain-groom|domain-run|domain-approve|domain-brief`.
 The result object: `minimum_system` (string), `consumers`/`correctness`/`limitations` (string arrays), `cuts`
@@ -408,16 +410,19 @@ The result object: `minimum_system` (string), `consumers`/`correctness`/`limitat
 per-open-ticket coverage, identifier provenance, and cut/target references — no client-supplied arbitrary bodies.
 
 Recursive rounds: a review is the first round. From the review page a person can leave a comment and request another
-round — **manual** is one human-facing revision (it may gather requested witness evidence before returning) — or
-explicitly start an **agentic** round: bounded automatic critique/evidence/revision passes (default max 3) carrying
-prior findings, stopping when the review is substantiated or blocked, and recording `outcome=limit_reached` when the
-budget is consumed. Every round keeps its own assessment and the witness receipts it cites; earlier reviews and
-comments are retained in `history`. The model runs only through the configured read-only domain witnesses
-(`witness.py` runners plus the append-only `witness_log`) — it may ask for schema queries before business queries,
-and query bounds are explicit — never unrestricted shell or Linear. An unavailable witness/data result is shown as
-such, never substituted with a cached fact. Reruns are explicit user actions, never a periodic cron; a superseded
-unapproved review is never newly approved, already-approved writebacks stay pinned, and a healthy worker is never
-expired by the bounded multi-pass lifecycle.
+round, or explicitly start an **agentic** round. Both modes run a bounded pass loop (at most 3 passes): a pass either
+reports `evidence` (asking for read-only domain-witness queries, up to 4, which the server runs and feeds back next
+pass), `blocked` (required recorded evidence is unavailable), or `ready` (a validated review). **Manual** finalizes
+on its first `ready`. **Agentic** never finalizes on its first `ready`: that pass is retained as a DRAFT candidate,
+and a later **critique** pass must re-examine it against the evidence; only a later `ready` after that critique
+finalizes the review. If the budget is consumed before a critique-finalized `ready`, the review records
+`outcome=limit_reached` — never a falsely-final result. Every round keeps its own assessment and the witness receipts
+it cites; earlier reviews and comments are retained in `history`. The model runs only through the configured
+read-only domain witnesses (`witness.py` runners plus the append-only `witness_log`) — it may ask for schema queries
+before business queries, and query bounds are explicit — never unrestricted shell or Linear. An unavailable
+witness/data result is shown as such, never substituted with a cached fact. Reruns are explicit user actions, never a
+periodic cron; a superseded unapproved review is never newly approved, already-approved writebacks stay pinned, and a
+healthy worker is never expired by the bounded multi-pass lifecycle.
 
 Safety:
 
@@ -446,9 +451,11 @@ Confirm ticket changes** (with the exact previewed diffs and a warning about rea
 actions for reconcile. **Create simplification brief** stays a separate unapproved action with its own Open brief
 link; existing approval/execution gates are unchanged.
 
-The top **Proposals failed** health indicator is clickable and read-only: it shows the exact recorded failure (e.g.
-the cron job's `last_error`), its execution timestamp, and a route/link to the detailed log, with no retry/run
-controls and no secret exposure. It stays behind the dashboard auth and scoped job ids.
+The top **Proposals failed** health indicator is a clickable, read-only button that opens a job-health dialog: each
+job's exact recorded failure (untruncated `last_error`) and its execution timestamp, plus a recent-runs history whose
+rows open a run detail showing the recorded error/status untruncated and an output preview honestly labeled
+"up to 180 characters" (the cron runs endpoint truncates it). There are no retry/run controls, no secret exposure,
+and it stays behind the dashboard auth and scoped job ids.
 
 ## Runtime coder model selector
 
