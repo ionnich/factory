@@ -806,18 +806,23 @@ const GROOM_OUTCOME = {
   blocked: ["blocked", "amber"],
   limit_reached: ["limit reached", "amber"],
 };
-const groomOutcome = (o) => (o ? GROOM_OUTCOME[o] || [o, "gray"] : null);
+// A single pass's own outcome is a narrower enum: ready, blocked, or evidence (gathered read-only witness receipts).
+const GROOM_ROUND_OUTCOME = {
+  ready: ["ready", "green"],
+  blocked: ["blocked", "amber"],
+  evidence: ["evidence", "blue"],
+};
 
 // The outcome badge: hidden for null, and in compact rows for the default "ready" so stopped outcomes stand out.
-const OutcomeTone = ({ outcome, showReady = false }) => {
-  const oc = groomOutcome(outcome);
+const OutcomeTone = ({ outcome, showReady = false, map = GROOM_OUTCOME }) => {
+  const oc = outcome ? map[outcome] || [outcome, "gray"] : null;
   if (!oc || (!showReady && outcome === "ready")) return null;
   return <Tone tone={oc[1]}>{oc[0]}</Tone>;
 };
 
 // Witness receipts are the backend's truthfully-mapped read-only witness output: {id,name,query,at,ok,result,error}.
-// An ok receipt shows its result; a failed one shows its error. Nothing is synthesized here.
-const roundReceipts = (round) => (round?.receipts || round?.witness_receipts || []);
+// An ok receipt shows its result; a failed one shows its error. Nothing is synthesized here. Contract: round.witness_receipts.
+const roundReceipts = (round) => (round?.witness_receipts || []);
 
 function WitnessReceipts({ receipts }) {
   if (!receipts || !receipts.length) return null;
@@ -855,7 +860,8 @@ function RoundPass({ round }) {
     <section className="fx-sec fx-stack-v">
       <div className="fx-row fx-row-title">
         <span className="fx-k">Round {round?.number ?? "?"}</span>
-        <OutcomeTone outcome={round?.outcome} showReady />
+        <OutcomeTone outcome={round?.outcome} showReady map={GROOM_ROUND_OUTCOME} />
+        {round?.completed_at ? <span className="fx-hint">{localTime(round.completed_at)}</span> : null}
       </div>
       {round?.assessment ? <div className="fx-why">{round.assessment}</div> : null}
       <WitnessReceipts receipts={roundReceipts(round)} />
@@ -872,6 +878,7 @@ function ReviewSummaryMeta({ r }) {
         <Tone tone={tone}>{label}</Tone>
         {r.mode === "agentic" ? <Tone tone="blue">agent-led</Tone> : null}
         <OutcomeTone outcome={r.outcome} />
+        {r.superseded_by != null ? <Tone tone="gray">superseded</Tone> : null}
         {r.approved_at ? <Tone tone="green">approved {ago(r.approved_at)}</Tone> : null}
         {r.proposal_brief_id ? <Tone tone="blue">brief #{r.proposal_brief_id}</Tone> : null}
       </div>
@@ -1102,10 +1109,12 @@ function WritebackList({ rows }) {
 }
 
 function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, onDisarm, onBrief, onOpenBrief,
-                              mode, feedback, onFeedback, onMode, onRerun }) {
+                              mode, feedback, onFeedback, onMode, onRerun, onOpenReview }) {
   const [label, tone] = GROOM_STATUS[r.status] || [r.status || "unknown", "gray"];
   const active = r.status === "pending" || r.status === "running";
   const completed = r.status === "completed";
+  const supersededBy = r.superseded_by ?? null;
+  const superseded = supersededBy != null;
   const result = r.result || null;
   const history = r.history || [];
   const rounds = r.rounds || [];
@@ -1116,7 +1125,7 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
   const cutById = Object.fromEntries(cuts.map((c) => [c.id, c]));
   const writebacks = r.writebacks || [];
   const approved = !!r.approved_at;
-  const locked = approved || !!busy;  // selection is frozen once approved, or while a mutation write is in flight
+  const locked = approved || superseded || !!busy;  // frozen once approved/superseded, or while a mutation write is in flight
   const primaryCutOf = (t) => (t.cut_ids || []).find((id) => cutById[id]) || null;
   const groups = cuts.map((c) => ({ cut: c, tickets: tickets.filter((t) => primaryCutOf(t) === c.id) }));
   const ungrouped = tickets.filter((t) => primaryCutOf(t) == null);
@@ -1149,6 +1158,15 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
       <div className="fx-hint">Requested {ago(r.requested_at)}{r.completed_at ? ` · completed ${ago(r.completed_at)}` : ""}{r.run_id ? ` · run ${r.run_id}` : ""}
         {r.round_count ? ` · ${r.round_count} round${r.round_count === 1 ? "" : "s"}` : ""}
         {r.parent_review_id ? ` · child of #${r.parent_review_id}` : ""}</div>
+      {superseded ? (
+        <>
+          <div className="fx-err" role="status">Superseded — a newer review round (#{supersededBy}) exists. This round is
+            read-only for new approvals and simplification briefs; its already queued writes remain visible below.</div>
+          <div className="fx-row">
+            <Button size="sm" ghost onClick={() => onOpenReview(supersededBy)}>Open newer review #{supersededBy} ›</Button>
+          </div>
+        </>
+      ) : null}
       {r.feedback ? <div className="fx-why">Comment: {r.feedback}</div> : null}
       {r.outcome === "blocked" ? <div className="fx-hint">Stopped on missing data — unavailable evidence is shown below, never substituted with cached facts.</div> : null}
       {r.outcome === "limit_reached" ? <div className="fx-hint">Evidence budget consumed before the review was substantiated; request another round to continue.</div> : null}
@@ -1166,6 +1184,9 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
             {history.map((p) => (
               <div key={p.id} className="fx-trow">
                 <div className="fx-grow"><ReviewSummaryMeta r={p} /></div>
+                <div className="fx-tc-ne">
+                  <Button size="sm" ghost onClick={() => onOpenReview(p.id)} aria-label={`Open review #${p.id}`}>Open review ›</Button>
+                </div>
               </div>
             ))}
           </div>
@@ -1221,11 +1242,13 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
             </details>
           ) : null}
         </>
-      ) : active ? null : <div className="fx-err">No result recorded.</div>}
+      ) : active ? null
+        : r.outcome === "blocked" && r.error ? <div className="fx-why">{r.error}</div>
+        : <div className="fx-err">No result recorded.</div>}
 
       {writebacks.length ? <WritebackList rows={writebacks} /> : null}
 
-      {result?.simplification && !r.proposal_brief_id ? (
+      {result?.simplification && !r.proposal_brief_id && !superseded ? (
         <section className="fx-sec fx-stack-v">
           <div className="fx-k">Simplification brief</div>
           <div className="fx-hint">Draft an unapproved code-simplification brief from this review's retained sources. It is
@@ -1267,7 +1290,7 @@ function DomainReviewDetail({ r, busy, sel, setSel, armed, onBack, onApprove, on
         </section>
       ) : null}
 
-      {!approved && result && mutableTickets.length ? (
+      {!approved && !superseded && result && mutableTickets.length ? (
         <section className="fx-sec fx-stack-v">
           {!armed ? (
             <div className="fx-row">
@@ -1844,8 +1867,8 @@ export function StrategyTab({ data, view, onViewChange, onDone, onNavigate }) {
           <DomainReviewDetail r={groomDetail} busy={busy} sel={groomSel} setSel={changeGroomSel}
                               armed={groomArm} onBack={backFromGroom} onApprove={approveReview}
                               onDisarm={() => setGroomArm(false)} onBrief={createGroomBrief} onOpenBrief={openGroomBrief}
-                              mode={groomMode} feedback={groomFeedback} onFeedback={setGroomFeedback}
-                              onMode={setGroomMode} onRerun={rerunReview} />
+                              onOpenReview={openGroomReview} mode={groomMode} feedback={groomFeedback}
+                              onFeedback={setGroomFeedback} onMode={setGroomMode} onRerun={rerunReview} />
         )
       ) : open != null ? (
         <>
