@@ -678,14 +678,124 @@ function Dispatches({ stage, rows, byRun, titles, needsOf, sel, onGo, detail }) 
 const JOB_NAME = { "factory-prune": "Verification", "[bot:planner] Plan drafts": "Planning",
                    "factory-propose": "Proposals", "factory-reconcile": "Write-back", "factory-backup": "Backup" };
 const JOB_OK = ["ok", "success", "succeeded"];
+const badJob = (j) => !!(j.last_status && !JOB_OK.includes(j.last_status));
+// The cron run history carries epoch seconds; the overview's last_run_at is an ISO string.
+const epochLocal = (v) => (v == null ? "never" : new Date((typeof v === "number" ? v : Number(v)) * 1000)
+  .toLocaleString([], { hour: "2-digit", minute: "2-digit", month: "short", day: "numeric" }));
+const epochAgoS = (v) => (v == null ? "never" : SDK.utils.timeAgo((typeof v === "number" ? v : Number(v)) * 1000));
+
+// Job health: a tap opens a sheet with each job's own last run — its exact recorded error and time — plus the
+// run history read from the dashboard's existing cron endpoint (never a second log backend). The overview carries
+// name/status/error but not the cron id; the sheet resolves id/profile from the cron list (the same store the
+// overview reads) so history works without a backend change, and prefers id/profile on the job once plugin_api adds them.
 function Health({ jobs }) {
   const name = (j) => JOB_NAME[j.name] || j.name;
-  const bad = jobs.filter((j) => j.last_status && !JOB_OK.includes(j.last_status));
-  return (
-    <span className={`fx-health ${bad.length ? "bad" : "ok"}`} title={jobs.map((j) => `${name(j)}: ${j.last_status || "not run"}, ${epochAgo(j.last_run_at)}`).join("\n")}>
+  const bad = jobs.filter(badJob);
+  const [open, setOpen] = useState(false);
+  return (<>
+    <button type="button" className={`fx-health${bad.length ? " bad" : ""}`} aria-haspopup="dialog"
+            aria-expanded={open} onClick={() => setOpen((o) => !o)}
+            title={bad.length ? "Jobs failed — tap for errors and logs" : "Job health"}>
       <i />{bad.length ? bad.map((j) => `${name(j)} failed`).join(" · ") : "all jobs fine"}
-    </span>
+    </button>
+    {open ? <HealthPanel jobs={jobs} onClose={() => setOpen(false)} /> : null}
+  </>);
+}
+
+function HealthPanel({ jobs, onClose }) {
+  const [cron, setCron] = useState(null);  // null=loading, [..]=jobs, {err}=unavailable
+  useEffect(() => {  // Escape closes, like the ticket sheet
+    const k = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", k);
+    return () => window.removeEventListener("keydown", k);
+  }, [onClose]);
+  useEffect(() => {  // cron identities by name (id + owning profile) for the run-history endpoint
+    let live = true;
+    SDK.fetchJSON("/api/cron/jobs?profile=all")
+      .then((rows) => { if (live) setCron(Array.isArray(rows) ? rows : []); },
+            (e) => { if (live) setCron({ err: errText(e) }); });
+    return () => { live = false; };
+  }, []);
+  const byName = useMemo(() => {
+    const m = {};
+    if (Array.isArray(cron)) cron.forEach((c) => { if (c && c.name && !(c.name in m)) m[c.name] = c; });
+    return m;
+  }, [cron]);
+  const ident = (j) => {
+    if (j.id) return { id: j.id, profile: j.profile };
+    const c = byName[j.name];
+    return c ? { id: c.id, profile: c.profile || c.profile_name } : null;
+  };
+  const sorted = [...jobs].sort((a, b) => (badJob(b) ? 1 : 0) - (badJob(a) ? 1 : 0) || (a.name < b.name ? -1 : 1));
+  return (
+    <div className="fx-sheet-bg" onClick={onClose}>
+      <div className="fx-sheet" role="dialog" aria-modal="true" aria-label="Job health" onClick={stop}>
+        <div className="fx-row between">
+          <div className="fx-title small">Job health</div>
+          <Button size="sm" ghost onClick={onClose} aria-label="Close">✕</Button>
+        </div>
+        <div className="fx-hint">Each cron job's own last run, exactly as its store records it — the whole job, never one ticket or dispatch.</div>
+        {sorted.map((j) => <JobHealth key={j.name} j={j} ident={ident(j)} />)}
+        <CronLink />
+      </div>
+    </div>
   );
+}
+
+function JobHealth({ j, ident }) {
+  const name = JOB_NAME[j.name] || j.name;
+  const bad = badJob(j);
+  return (
+    <section className={`fx-health-job${bad ? " bad" : ""}`}>
+      <div className="fx-row">
+        <span className="fx-row-title">{name}</span>
+        <Tone tone={bad ? "red" : j.last_status ? "green" : "gray"}>{j.last_status || "not run"}</Tone>
+        {j.paused_at || j.enabled === false ? <Tone tone="amber">paused</Tone> : null}
+      </div>
+      <div className="fx-hint">
+        {j.last_run_at ? `last ran ${epochAgo(j.last_run_at)} (${localTime(j.last_run_at)})` : "not run yet"}
+        {j.schedule_display ? ` · ${j.schedule_display}` : ""}
+      </div>
+      {bad && j.last_error ? <div className="fx-health-err">{j.last_error}</div> : null}
+      {bad ? <RunHistory ident={ident} /> : null}
+    </section>
+  );
+}
+
+function RunHistory({ ident }) {
+  const id = ident && ident.id, profile = ident && ident.profile;
+  const [state, setState] = useState(null);  // null=loading, {runs,err}=settled
+  useEffect(() => {
+    if (!id) { setState({ runs: [], err: null }); return; }
+    let live = true;
+    const q = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+    SDK.fetchJSON(`/api/cron/jobs/${encodeURIComponent(id)}/runs${q}`)
+      .then((r) => { if (live) setState({ runs: (r && r.runs) || [], err: null }); },
+            (e) => { if (live) setState({ runs: null, err: errText(e) }); });
+    return () => { live = false; };
+  }, [id, profile]);
+  if (!id) return <div className="fx-hint">Run history needs the cron job id, which this overview does not carry.</div>;
+  return (
+    <details className="fx-health-runs">
+      <summary>{state && state.runs ? `Recent runs (${state.runs.length})` : "Recent runs"}</summary>
+      {state && state.err ? <div className="fx-err">Run history unavailable: {state.err}</div>
+        : state && state.runs ? (state.runs.length ? <ul className="fx-health-runs-list">{state.runs.map((r) => (
+            <li key={r.id} className={r.source === "cron_output" ? "r-script" : "r-session"}>
+              <span className="fx-hint">{epochAgoS(r.started_at || r.last_active)} · {epochLocal(r.started_at || r.last_active)}</span>
+              <span className="t">{r.title || r.preview || r.id}</span>
+            </li>))}</ul> : <div className="fx-hint">No completed runs recorded.</div>)
+        : <div className="fx-hint">Loading…</div>}
+    </details>
+  );
+}
+
+function CronLink() {
+  const open = () => {
+    if (typeof SDK.navigate === "function") { SDK.navigate("/cron"); return; }
+    const base = (window.__HERMES_BASE_PATH__ || "").replace(/\/+$/, "");
+    window.open(base + "/cron", "_blank", "noopener");
+  };
+  return <button type="button" className="fx-link-btn" onClick={open}>Open in Cron ›</button>;
 }
 
 // A cron job's own last run, as its store records it. The job covers every ticket or draft: its status and error are

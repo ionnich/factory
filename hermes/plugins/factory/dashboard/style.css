@@ -99,9 +99,26 @@
 .fx-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0 .75rem; margin: 0 0 .5rem; }
 .fx-hello { font-size: 1rem; font-weight: 600; line-height: 1.35; letter-spacing: 0; margin: 0; }
 .fx-hello.you { color: var(--a); }
-.fx-health { display: inline-flex; align-items: center; gap: .35rem; cursor: help; }
+.fx-health { display: inline-flex; align-items: center; gap: .35rem; cursor: pointer; background: none; border: 0;
+             padding: .15rem .45rem; border-radius: var(--fx-r-sm); font: inherit; color: var(--fx-muted); }
+.fx-health:hover { color: var(--fx-fg); background: var(--fx-fill); }
+.fx-health:focus-visible { outline: 2px solid var(--fx-lavender); outline-offset: 2px; }
 .fx-health i { width: .5rem; height: .5rem; border-radius: 999px; background: var(--g); }
 .fx-health.bad { color: var(--r); } .fx-health.bad i { background: var(--r); }
+/* Job health sheet: one block per job, its exact error, and the run history from the dashboard's cron endpoint. */
+.fx-health-job { display: grid; gap: .3rem; padding: .55rem .6rem; border: 1px solid var(--fx-line);
+                 border-radius: var(--fx-r); background: var(--fx-panel); }
+.fx-health-job.bad { border-color: color-mix(in srgb, var(--r) 45%, var(--fx-line)); }
+.fx-health-err { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .82rem; color: var(--r);
+                 background: color-mix(in srgb, var(--r) 9%, transparent); border-radius: var(--fx-r-sm);
+                 padding: .4rem .55rem; }
+.fx-health-runs > summary { cursor: pointer; font-weight: 600; min-height: 44px; padding: .25rem 0; list-style: none; }
+.fx-health-runs > summary::-webkit-details-marker { display: none; }
+.fx-health-runs-list { list-style: none; margin: .2rem 0 0; padding: 0 0 0 .55rem; border-left: 2px solid var(--e);
+                       display: grid; gap: .35rem; font-size: .82rem; }
+.fx-health-runs-list li { display: grid; gap: .1rem; }
+.fx-health-runs-list .t { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fx-fg); }
+.fx-health-runs-list li.r-script .t { color: var(--fx-muted); }
 .fx-live { display: inline-block; width: .45rem; height: .45rem; border-radius: 999px; margin-right: .3rem;
            background: var(--n); vertical-align: middle; }
 .fx-live.on { background: var(--g); animation: fx-pulse 2.4s ease-in-out infinite; }
