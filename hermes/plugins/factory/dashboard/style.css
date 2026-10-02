@@ -122,7 +122,29 @@
 .fx-health-runs-list .fx-run:hover { background: var(--fx-fill); }
 .fx-health-runs-list .fx-run:focus-visible { outline: 2px solid var(--fx-lavender); outline-offset: 2px; }
 .fx-health-runs-list .t { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--fx-fg); }
-/* A run's full recorded output/error, opened from a run row (read-only). */
+/* The SDK Dialog portals its content outside .fx, so the skin's tokens must travel with the panel (they mirror
+   the .fx token block; the host's global theme tokens fill every fallback). */
+.fx-dialog {
+  max-height: 88vh; overflow-y: auto;
+  --fx-canvas: var(--background-base, #282828);
+  --fx-fg: var(--theme-terminal-foreground, var(--midground-base, #ebdbb2));
+  --fx-panel: var(--color-card, color-mix(in srgb, var(--midground-base, #ebdbb2) 5%, var(--background-base, #282828)));
+  --fx-muted: color-mix(in srgb, var(--fx-fg) 78%, var(--fx-canvas));
+  --fx-dim: var(--fx-muted);
+  --fx-border: var(--color-border, color-mix(in srgb, var(--midground-base, #ebdbb2) 18%, transparent));
+  --fx-line: color-mix(in srgb, var(--fx-border) 68%, transparent);
+  --fx-fill: color-mix(in srgb, var(--midground-base, #ebdbb2) 7%, transparent);
+  --a: color-mix(in srgb, var(--fx-amber, var(--color-warning, #f59e0b)) 50%, var(--fx-fg));
+  --g: color-mix(in srgb, var(--fx-green, var(--color-success, #10b981)) 50%, var(--fx-fg));
+  --b: var(--fx-blue, var(--color-ring, #a78bfa));
+  --r: color-mix(in srgb, var(--fx-red, var(--color-destructive, #ef4444)) 60%, var(--fx-fg));
+  --n: var(--fx-gray, #8b8b8b);
+  --e: var(--fx-edge, var(--color-border, #504945));
+  --fx-lavender: var(--b);
+  --fx-r-sm: 6px; --fx-r: 8px;
+}
+.fx-dialog-body { display: grid; gap: .6rem; padding: .8rem; }
+/* A run's recorded error/status and its output preview, opened from a run row (read-only). */
 .fx-run-out { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font: inherit; font-size: .82rem;
               color: var(--fx-fg); background: var(--fx-panel); border: 1px solid var(--fx-line);
               border-radius: var(--fx-r-sm); padding: .5rem .6rem; max-height: 40vh; overflow: auto; }

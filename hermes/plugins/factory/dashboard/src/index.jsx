@@ -685,9 +685,9 @@ const epochLocal = (v) => (v == null ? "never" : new Date((typeof v === "number"
   .toLocaleString([], { hour: "2-digit", minute: "2-digit", month: "short", day: "numeric" }));
 const epochAgoS = (v) => (v == null ? "never" : SDK.utils.timeAgo((typeof v === "number" ? v : Number(v)) * 1000));
 
-// Job health: a tap opens a sheet with each job's own last run — its exact recorded error and time — plus the
+// Job health: a tap opens a dialog with each job's own last run — its exact recorded error and time — plus the
 // run history read from the dashboard's existing cron endpoint (never a second log backend). The overview carries
-// each job's canonical cron id/profile; a run row opens its full recorded output/error in a dialog.
+// each job's canonical cron id/profile; a run row opens its recorded error/status and output preview in a dialog.
 function Health({ jobs }) {
   const name = (j) => JOB_NAME[j.name] || j.name;
   const bad = jobs.filter(badJob);
@@ -703,23 +703,19 @@ function Health({ jobs }) {
 }
 
 function HealthPanel({ jobs, onClose }) {
-  useEffect(() => {  // Escape closes, like the ticket sheet
-    const k = (e) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", k);
-    return () => window.removeEventListener("keydown", k);
-  }, [onClose]);
   const sorted = [...jobs].sort((a, b) => (badJob(b) ? 1 : 0) - (badJob(a) ? 1 : 0) || (a.name < b.name ? -1 : 1));
   return (
-    <div className="fx-sheet-bg" onClick={onClose}>
-      <div className="fx-sheet" role="dialog" aria-modal="true" aria-label="Job health" onClick={stop}>
-        <div className="fx-row between">
-          <div className="fx-title small">Job health</div>
-          <Button size="sm" ghost onClick={onClose} aria-label="Close">✕</Button>
+    <Dialog open onOpenChange={(v) => !v && onClose()}>
+      <DialogContent className="fx-dialog">
+        <DialogHeader>
+          <DialogTitle>Job health</DialogTitle>
+          <DialogDescription>Each cron job's own last run, exactly as its store records it — the whole job, never one ticket or dispatch.</DialogDescription>
+        </DialogHeader>
+        <div className="fx-dialog-body">
+          {sorted.map((j) => <JobHealth key={j.name} j={j} />)}
         </div>
-        <div className="fx-hint">Each cron job's own last run, exactly as its store records it — the whole job, never one ticket or dispatch.</div>
-        {sorted.map((j) => <JobHealth key={j.name} j={j} />)}
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -745,7 +741,7 @@ function JobHealth({ j }) {
 
 function RunHistory({ id, profile }) {
   const [state, setState] = useState(null);  // null=loading, {runs,err}=settled
-  const [openRun, setOpenRun] = useState(null);  // the run whose full output/error is open
+  const [openRun, setOpenRun] = useState(null);  // the run whose error/status and output preview are open
   useEffect(() => {
     if (!id) { setState({ runs: [], err: null }); return; }
     let live = true;
@@ -775,21 +771,29 @@ function RunHistory({ id, profile }) {
   </>);
 }
 
-// A run's full recorded output/error, exactly as the cron runs endpoint returns it (title = status + error/summary,
-// preview = the raw output doc). Read-only; the SDK dialog traps focus, focuses on open and returns it to the row that
+// A run's recorded error/status (title, untruncated) and its output preview (the cron runs endpoint truncates
+// preview to 180 chars). Read-only; the SDK dialog traps focus, focuses on open and returns it to the row that
 // opened it on close.
 function RunDetail({ run, onClose }) {
   const when = run.started_at || run.last_active;
   const title = run.title, preview = run.preview;
   return (
     <Dialog open onOpenChange={(v) => !v && onClose()}>
-      <DialogContent>
+      <DialogContent className="fx-dialog">
         <DialogHeader>
           <DialogTitle>Run detail</DialogTitle>
           <DialogDescription>{when != null ? `${epochAgoS(when)} · ${epochLocal(when)}` : "time unknown"}</DialogDescription>
         </DialogHeader>
-        <pre className="fx-run-out">{title || preview || "(no output recorded)"}</pre>
-        {title && preview && !title.includes(preview) ? <pre className="fx-run-out muted">{preview}</pre> : null}
+        <div className="fx-dialog-body">
+          {title ? <pre className="fx-run-out">{title}</pre> : null}
+          {preview && !(title && title.includes(preview)) ? (
+            <>
+              <div className="fx-k">Output preview (up to 180 characters)</div>
+              <pre className="fx-run-out muted">{preview}</pre>
+            </>
+          ) : null}
+          {!title && !preview ? <div className="fx-hint">No output recorded for this run.</div> : null}
+        </div>
       </DialogContent>
     </Dialog>
   );
