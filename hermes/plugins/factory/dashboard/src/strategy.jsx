@@ -875,13 +875,16 @@ function GroomTicket({ t, ctx, sel, disabled, onToggle }) {
   const showDiff = isRewrite || isMerge || isClose;
   const oldTitle = ctx?.title || "";
   const oldDesc = ctx?.description || "";
+  const resTitle = t.title ?? oldTitle;  // null means unchanged: the resulting ticket keeps the original captured field
+  const resDesc = t.description ?? oldDesc;
   const checked = mutate && sel.has(t.identifier);
   return (
     <div className="fx-groom-ticket">
       <div className="fx-row fx-row-title">
         {mutate ? (
-          <label className="fx-check-target" aria-label={`Select ${t.identifier}`}>
-            <input type="checkbox" className="fx-pick" checked={checked} disabled={disabled || blocked} onChange={onToggle} />
+          <label className="fx-check-target">
+            <input type="checkbox" className="fx-pick" aria-label={`Select ${t.identifier}`}
+                   checked={checked} disabled={disabled || blocked} onChange={onToggle} />
           </label>
         ) : <span className="fx-check-target fx-groom-noop" aria-hidden="true">–</span>}
         <div className="fx-grow">
@@ -916,13 +919,15 @@ function GroomTicket({ t, ctx, sel, disabled, onToggle }) {
                 ) : <div className="fx-diff-line fx-diff-old">− (no recorded title or description)</div>}
                 {isRewrite ? (
                   <>
-                    <div className="fx-diff-line fx-diff-new">+ Title: {t.title || "(none)"}</div>
-                    <div className="fx-diff-line fx-diff-new">+ Description: {t.description || "(none)"}</div>
+                    <div className="fx-diff-line fx-diff-new">+ Title: {resTitle || "(none)"}</div>
+                    <div className="fx-diff-line fx-diff-new">+ Description: {resDesc || "(none)"}</div>
                   </>
                 ) : null}
                 {isMerge ? (
-                  <div className="fx-diff-line fx-diff-new">+ merged into {target || "(retained target)"} — this ticket's title and
-                    description are unchanged; Linear marks it merged</div>
+                  <>
+                    <div className="fx-diff-line fx-diff-new">+ canceled (state → Canceled)</div>
+                    <div className="fx-diff-line fx-diff-new">+ comment: points to retained target {target || "(retained target)"}</div>
+                  </>
                 ) : null}
                 {isClose ? (
                   <div className="fx-diff-line fx-diff-new">+ canceled — this ticket's title and description are unchanged; Linear
