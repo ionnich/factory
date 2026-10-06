@@ -9,6 +9,69 @@ ingest (cron) -> Strategy (groom briefs) -> publish brief -> prune verdicts (cro
 propose (cron) drafts for `auto` repos, takes ★ on decisions whose time came, and tells you (push / digest)
 ```
 
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph ext[External]
+    linear[(Linear)]
+    gh[(GitHub repos + PRs)]
+    witness[(Read-only witnesses<br/>dagster-prod, clickhouse-serving)]
+    typesafe[TypeSafe Jev API]
+  end
+
+  subgraph hermes[Hermes]
+    cron["Cron jobs<br/>factory-propose (ingest + sync), factory-prune,<br/>factory-reconcile, factory-backup"]
+    planner["Planner bot<br/>(planner profile, plans + why?)"]
+    dash["Factory plugin<br/>dashboard tab + /stream API"]
+    chat["Factory chat profile<br/>Hermex Bot Chat: push / digest"]
+    kanban[Kanban board 'factory'<br/>mirror only]
+  end
+
+  subgraph core[factory control plane]
+    cli["factory CLI<br/>(factory/*.py)"]
+    db[("~/.hermes/factory.db<br/>authoritative tracker")]
+    mirrors[("Trunk mirrors<br/>~/.hermes/factory/mirrors")]
+    dispatch[["dispatches/&lt;run_id&gt;/dispatch.md<br/>immutable, sha256 in db"]]
+    backups[(Backups)]
+  end
+
+  subgraph fleet[factory-fleet]
+    primary["factory-primary<br/>(herdr workspace 'factory')"]
+    leads["Domain leads fx-*<br/>dispatch-intake skill"]
+    crew["Ship workers<br/>no-mistakes pipeline"]
+  end
+
+  you((Captain))
+
+  linear -->|ingest snapshots + relationships| cli
+  gh -->|fetch trunk| mirrors
+  cron --> cli
+  planner -->|plan trees| cli
+  cli <--> db
+  cli --> mirrors
+  cli -->|verdict / domain evidence| witness
+  cli <-->|judgments| typesafe
+  db --> dash
+  db --> chat
+  you <-->|notes, decisions, approve| dash
+  you <-->|ok / answers| chat
+  cli -->|approve renders| dispatch
+  cli --> backups
+  cli -.->|card writes| kanban
+  cli -->|handoff| leads
+  cli -->|no single owner / no live lead| primary
+  primary -->|route + supervise| leads
+  dispatch --> leads
+  leads --> crew
+  crew -->|PRs| gh
+  leads -->|factory card / decide ask| cli
+  cli -->|reconcile writeback| linear
+```
+
+`factory.db` holds every state transition; Hermes jobs, the dashboard and chat are clients of the `factory` CLI.
+Only reconcile writes Linear; executors report solely through `factory card` and `factory decide ask`.
+
 ## Install
 
 `./install.sh` (idempotent): venv, `factory` on PATH, Hermes scripts/skills/cron jobs (`factory-prune`,
